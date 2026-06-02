@@ -56,8 +56,9 @@ class JobConfig:
     write_mets: bool
     write_plaintext: bool
     with_checksums: bool = True
-    # Engine selection
-    engine: str = "tesseract"  # "tesseract" | "glmocr"
+    # Engine selection. Default matches the CLI + CLAUDE.md (GLMOCR is the
+    # default engine for all material); the GUI radio also defaults to glmocr.
+    engine: str = "glmocr"  # "glmocr" | "tesseract"
     tesseract_path: Optional[Path] = None
     # Advanced — mirror the upstream dataclasses they configure.
     preprocess_config: PreprocessConfig = field(default_factory=PreprocessConfig)

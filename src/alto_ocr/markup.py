@@ -79,6 +79,16 @@ def _flatten_markdown_tables(text: str) -> str:
     return "\n".join(out)
 
 
+# --- Markdown code fences --------------------------------------------------
+# glm-ocr sometimes wraps a whole page (or a stretch of it) in a Markdown code
+# fence — ``` ```text `` ... `` ``` `` — and the bare fence delimiters then leak
+# into the plain-text transcript. Strip any line that is *only* a fence
+# delimiter (3+ backticks or tildes, optional language tag), keeping the content
+# between the fences so it can still be normalized as prose/table/math. Matches
+# whole lines only, so an inline backtick in body text is left untouched.
+_CODE_FENCE_RE = re.compile(r"(?m)^[ \t]*(?:`{3,}|~{3,})[ \t]*[\w+.#-]*[ \t]*$")
+
+
 # --- LaTeX -----------------------------------------------------------------
 # Common symbol commands -> Unicode. Matched with a trailing non-letter
 # lookahead so e.g. ``\pi`` does not fire inside ``\partial``.
@@ -184,6 +194,8 @@ def normalize_markup(text: str) -> str:
     if not text:
         return text
     text = html.unescape(text)
+    if "```" in text or "~~~" in text:   # drop code-fence delimiter lines, keep content
+        text = _CODE_FENCE_RE.sub("", text)
     text = _TABLE_RE.sub(_table_to_text, text)
     text = _strip_tags(text)              # any stray non-table tags (<b>, <br>, ...)
     if "|" in text:                       # cheap guard; skip on the common no-pipe case
