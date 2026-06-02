@@ -15,17 +15,27 @@ Pipeline (a light XY-cut, the classic document-layout decomposition):
   2. Vertical ink projection → column x-ranges. A run of near-empty columns
      wider than a gutter separates columns; any number of columns is found,
      and a single-column page yields one range.
-  3. For multi-column pages, separate **full-width bands** (titles / section
-     headers that cross the gutters) from the column body, so a spanning
-     title is its own block rather than being sliced across columns.
-  4. Within each single-column block, a smoothed horizontal projection +
+  3. Within each single-column block, a smoothed horizontal projection +
      peak detection yields one bbox per text line (clean, because the block
      is a single column — the earlier full-width projection could not
      separate columns, and connected-component smearing merged adjacent
      lines / dropped isolated words).
 
-Reading order falls out of the decomposition: bands top-to-bottom, columns
-left-to-right within a band, lines top-to-bottom within a column.
+Blocks span the full page height, so a full-width title or section header is
+*not* a separate block — it is split across whichever columns its words overlap
+(each fragment lands in the column whose x-range covers it, which is correct for
+word highlighting). **Known limitation:** a title that overhangs *past* the
+outermost body column — e.g. a wide header over a narrow, offset left column on
+some transcript forms ("PURDUE UNIVERSITY" → "RDUE") — loses the overhang, since
+it falls outside every column's x-range. The body transcribes fine; only the
+header overhang clips. Automatic separation of such spanning titles (carving the
+band off as its own block) was prototyped and removed: these layouts' titles
+don't reliably cross the body gutters (their word-spacing aligns *with* the
+gutters), so the signal needed to detect them isn't present — see the GLMOCR
+word-box handoff for the full diagnosis.
+
+Reading order falls out of the decomposition: columns left-to-right, lines
+top-to-bottom within a column.
 
 Validated against single-column cursive (handwritten technical notes) and a
 three-column printed page ("Canons of Ethics for Engineers": full-width
