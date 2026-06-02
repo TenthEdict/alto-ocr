@@ -31,6 +31,7 @@ import base64
 import json
 import logging
 import os
+import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -145,6 +146,56 @@ def _looks_like_image_description(text: str) -> bool:
         if any(rest.startswith(p) for p in _IMAGE_DESCRIPTION_LEADS):
             return True
     return False
+
+
+# Chat-style commentary glm-ocr appends AFTER (or interleaves with) a real
+# transcription — a separate, more pervasive failure than the whole-page
+# descriptions ``_looks_like_image_description`` catches. Observed on
+# MSA00005 front-matter / photo / title / cover pages: the model transcribes
+# the page, then adds meta lines like "The image is a title page…", "The text
+# in the image reads: …" (often re-quoting the real text, which is where the
+# duplicate content comes from), "The text provided does not contain…", "Wait,
+# let me re-read…", "I'll just output the text." We delete such lines, keeping
+# everything else (so interleaved real text survives). The patterns are
+# model-voice phrasings that essentially never start a line in real archival
+# prose — verified zero false positives across the clean pages of a 39-page
+# batch. Anchored at line start; the continuation words keep it from matching
+# ordinary sentences like "The image quality was poor".
+_CHAT_COMMENTARY_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:the|this)\s+(?:image|photograph|photo|picture|illustration|drawing|graphic|scene)\s+"
+    r"(?:is|was|shows?|depicts?|appears?|contains?|displays?|presents?|features?|portrays?|seems?|provides?|reads?|states?)\b"
+    r"|the\s+text\s+(?:provided|in\s+the\s+image|on\s+the\s|is\s+clear|is\s+legible|is\s+as\s+follows|is:|reads?|states?|appears?)"
+    r"|the\s+document\s+(?:is\s+about|describes|discusses)"
+    r"|(?:wait|okay|hmm|hold\s+on)\b[,.\s]"
+    r"|let\s+me\s+(?:re-?read|re-?examine|look|check|try|provide|transcribe)"
+    r"|i(?:'ll|\s+will)\s+(?:just\s+)?(?:output|provide|transcribe|re-?read)"
+    r"|i(?:'m|\s+am)\s+(?:unable|sorry)"
+    r"|i\s+(?:cannot|can't|am\s+unable)"
+    r"|(?:sorry|unfortunately)\s*[,:]"
+    r"|here(?:'s|\s+is)\s+the\s+(?:text|transcription)"
+    r"|it's:\s*$"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _strip_chat_commentary(text: str) -> str:
+    """Remove glm-ocr's chat-style meta-commentary lines, keeping real text.
+
+    Drops any line matching ``_CHAT_COMMENTARY_RE`` (a description of the
+    page, a self-correction, or a "the text reads:" re-quote of the content)
+    and returns the rest. Removing whole lines — rather than truncating at the
+    first one — preserves real transcription that the model interleaves after
+    a commentary aside. If a page is *entirely* commentary, returns "".
+    """
+    if not text:
+        return text
+    kept = [ln for ln in text.split("\n") if not _CHAT_COMMENTARY_RE.match(ln)]
+    n_removed = text.count("\n") + 1 - len(kept)
+    if n_removed:
+        logger.debug("glm-ocr: stripped %d chat-commentary line(s)", n_removed)
+    return "\n".join(kept).strip()
 
 
 # Fallback resize edges to try when the model returns GGML_ASSERT.
@@ -357,8 +408,12 @@ def transcribe(image: np.ndarray, config: GLMOCRConfig) -> str:
         logger.warning("glm-ocr stopped with reason=%s (length=%d)",
                        payload["done_reason"], len(text))
 
-    # Collapse degenerate repetition loops (sparse-page failure mode). No-op on
-    # healthy pages; see _collapse_repetition_loops.
+    # Strip chat-style commentary the model appends/interleaves after a real
+    # transcription ("The image shows…", "The text reads: …", "Wait, …"), then
+    # collapse any degenerate repetition loop. Both no-op on clean pages.
+    text = _strip_chat_commentary(text)
+    if not text:
+        return ""
     return _collapse_repetition_loops(text)
 
 
