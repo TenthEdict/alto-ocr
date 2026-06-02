@@ -14,7 +14,9 @@ from rich.console import Console
 from rich.logging import RichHandler
 from rich.table import Table
 
-from .glmocr import GLMOCRConfig, GLMOCRError, check_endpoint, resolve_endpoint
+from .glmocr import (
+    DEFAULT_NUM_PREDICT, GLMOCRConfig, GLMOCRError, check_endpoint, resolve_endpoint,
+)
 from .line_detect import DetectParams
 from .ocr import (
     GLMOCREngine,
@@ -93,6 +95,7 @@ def _build_engine(
     glmocr_endpoint: str | None,
     glmocr_model: str,
     glmocr_timeout: int,
+    glmocr_num_predict: int = DEFAULT_NUM_PREDICT,
 ) -> OCREngine:
     """Resolve an engine name into a concrete OCREngine. Errors are reported
     to the user via typer.Exit so the message is actionable."""
@@ -108,6 +111,7 @@ def _build_engine(
             endpoint=endpoint,
             model=glmocr_model,
             timeout_s=glmocr_timeout,
+            num_predict=glmocr_num_predict,
         )
         try:
             check_endpoint(config)
@@ -192,6 +196,11 @@ GLMOCRModelOpt = typer.Option("glm-ocr:q8_0", "--glmocr-model",
                               help="Ollama model tag for the glm-ocr engine.")
 GLMOCRTimeoutOpt = typer.Option(120, "--glmocr-timeout",
                                 help="Per-page glm-ocr request timeout in seconds.")
+GLMOCRNumPredictOpt = typer.Option(
+    DEFAULT_NUM_PREDICT, "--glmocr-num-predict",
+    help="Max tokens glm-ocr may generate per block (default 8192). Raise (e.g. "
+         "16384) if dense pages truncate — look for 'stopped with reason=length' "
+         "in the log; costs proportionally more time only on those dense pages.")
 LangOpt = typer.Option("eng", "--ocr-lang", help="Tesseract language code, e.g. 'eng', 'fra', 'eng+lat'.")
 PsmOpt = typer.Option(3, "--psm", help="Tesseract page segmentation mode (3=auto, 4=column, 6=block).")
 OemOpt = typer.Option(3, "--oem", help="Tesseract OCR engine mode (3=default LSTM).")
@@ -226,6 +235,7 @@ def process(
     glmocr_endpoint: Optional[str] = GLMOCREndpointOpt,
     glmocr_model: str = GLMOCRModelOpt,
     glmocr_timeout: int = GLMOCRTimeoutOpt,
+    glmocr_num_predict: int = GLMOCRNumPredictOpt,
     ocr_lang: str = LangOpt,
     psm: int = PsmOpt,
     oem: int = OemOpt,
@@ -258,6 +268,7 @@ def process(
         glmocr_endpoint=glmocr_endpoint,
         glmocr_model=glmocr_model,
         glmocr_timeout=glmocr_timeout,
+        glmocr_num_predict=glmocr_num_predict,
     )
 
     cfg = _build_preprocess_config(min_dpi, no_deskew, no_denoise, no_clahe, no_binarize, no_border_crop)
@@ -309,6 +320,7 @@ def batch(
     glmocr_endpoint: Optional[str] = GLMOCREndpointOpt,
     glmocr_model: str = GLMOCRModelOpt,
     glmocr_timeout: int = GLMOCRTimeoutOpt,
+    glmocr_num_predict: int = GLMOCRNumPredictOpt,
     ocr_lang: str = LangOpt,
     psm: int = PsmOpt,
     oem: int = OemOpt,
@@ -343,6 +355,7 @@ def batch(
         glmocr_endpoint=glmocr_endpoint,
         glmocr_model=glmocr_model,
         glmocr_timeout=glmocr_timeout,
+        glmocr_num_predict=glmocr_num_predict,
     )
 
     cfg = _build_preprocess_config(min_dpi, no_deskew, no_denoise, no_clahe, no_binarize, no_border_crop)
