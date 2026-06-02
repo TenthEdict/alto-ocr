@@ -190,6 +190,64 @@ def _post_generate(img_b64: str, config: GLMOCRConfig) -> dict:
         raise GLMOCRError(f"glm-ocr returned non-JSON: {e}") from None
 
 
+# Repetition-loop collapse. glm-ocr — like many small OCR models — falls into
+# degenerate loops on SPARSE pages (figure/photo/schematic captions, title
+# pages): it latches onto the little real text present and repeats it, verbatim
+# or lightly rephrased, until it exhausts the token budget. Verified on this
+# collection: a one-line figure caption emitted 160×; a 4-line title block 38×.
+# Left alone, the repeats land in the .txt transcript AND split into hundreds of
+# bogus per-word <String> boxes. We collapse this deterministically.
+#
+# Why not Ollama's generation-time ``repeat_penalty``: tested at 1.3/1.5 it
+# corrupts LEGITIMATELY repeated text (a radio-comms page's "Friendship Seven,
+# Friendship Seven" became "Friendship Seven, F friendship Seen") and silently
+# drops ~10% of real content on clean pages — undetectable at 4,241-page scale.
+# So we never touch generation; we only collapse output that is *provably*
+# degenerate, leaving every healthy page byte-identical.
+_LOOP_MIN_LINES = 6          # too few lines to judge repetition reliably
+_LOOP_DEGENERATE_RATIO = 0.5  # unique/total non-blank lines at/above this = healthy
+_LOOP_MIN_REPEAT = 3          # some line must recur >= this often to count as a loop
+
+
+def _collapse_repetition_loops(text: str) -> str:
+    """Collapse a degenerate repetition loop to its unique lines, in order.
+
+    Fires ONLY when the output is dominated by repetition — fewer than
+    ``_LOOP_DEGENERATE_RATIO`` unique non-blank lines AND some line repeated
+    at least ``_LOOP_MIN_REPEAT`` times. Both conditions are required so a
+    healthy page (≈100% unique lines in practice) — including a data table
+    with a few incidentally-equal rows — is returned untouched. On a loop,
+    we keep each distinct line's first occurrence in original order, which
+    preserves the real content (the loop's first cycle) and discards the rest.
+    """
+    if "\n" not in text:
+        return text
+    lines = text.split("\n")
+    nonblank = [s for s in (ln.strip() for ln in lines) if s]
+    if len(nonblank) < _LOOP_MIN_LINES:
+        return text
+    distinct = set(nonblank)
+    if len(distinct) / len(nonblank) >= _LOOP_DEGENERATE_RATIO:
+        return text  # healthy page — leave byte-identical
+    # Need a genuinely repeated line, not just many distinct short lines.
+    if len(nonblank) - len(distinct) < _LOOP_MIN_REPEAT - 1:
+        return text
+    max_repeat = max(nonblank.count(s) for s in distinct)
+    if max_repeat < _LOOP_MIN_REPEAT:
+        return text
+    seen: set[str] = set()
+    kept: list[str] = []
+    for ln in lines:
+        key = ln.strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        kept.append(ln.rstrip())
+    logger.debug("glm-ocr: collapsed repetition loop (%d lines -> %d unique)",
+                 len(lines), len(kept))
+    return "\n".join(kept)
+
+
 def transcribe(image: np.ndarray, config: GLMOCRConfig) -> str:
     """Send one page image to glm-ocr; return the transcribed text.
 
@@ -252,7 +310,9 @@ def transcribe(image: np.ndarray, config: GLMOCRConfig) -> str:
         logger.warning("glm-ocr stopped with reason=%s (length=%d)",
                        payload["done_reason"], len(text))
 
-    return text
+    # Collapse degenerate repetition loops (sparse-page failure mode). No-op on
+    # healthy pages; see _collapse_repetition_loops.
+    return _collapse_repetition_loops(text)
 
 
 def check_endpoint(config: GLMOCRConfig) -> str:
