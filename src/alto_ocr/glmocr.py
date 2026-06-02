@@ -1,7 +1,13 @@
 """Ollama HTTP client for the local glm-ocr vision model.
 
-Empirically derived behavior on Ollama 0.21.2 + glm-ocr:latest, captured
-in scripts/probe_*.py:
+Empirically derived behavior on Ollama 0.21.2 + glm-ocr, captured in
+scripts/probe_*.py. The constraints below were characterized on the
+``glm-ocr:latest`` (F16) build; the default model tag is now
+``glm-ocr:q8_0`` (Q8_0 quantization of the same 1.1B base), which shares
+the same architecture and exhibits the same constraints (the GGML_ASSERT
+projector quirk, the ``"---"`` blank sentinel, prompt sensitivity, and the
+absence of structured/bbox output are all architecture-level, not
+quantization-level):
 
   * Image input: must be a PNG (TIFs return degenerate output) and the
     longest edge must be <= 1024 px or the model raises GGML_ASSERT.
@@ -36,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_HOST = "http://localhost:11434"
-DEFAULT_MODEL = "glm-ocr:latest"
+DEFAULT_MODEL = "glm-ocr:q8_0"
 DEFAULT_TIMEOUT_S = 120
 DEFAULT_MAX_EDGE_PX = 1024
 DEFAULT_NUM_PREDICT = 8192

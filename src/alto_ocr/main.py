@@ -188,7 +188,7 @@ TesseractOpt = typer.Option(None, "--tesseract-path",
 GLMOCREndpointOpt = typer.Option(None, "--glmocr-endpoint",
                                  help="Ollama HTTP endpoint for the glm-ocr engine. "
                                       "Default: $OLLAMA_HOST or http://localhost:11434.")
-GLMOCRModelOpt = typer.Option("glm-ocr:latest", "--glmocr-model",
+GLMOCRModelOpt = typer.Option("glm-ocr:q8_0", "--glmocr-model",
                               help="Ollama model tag for the glm-ocr engine.")
 GLMOCRTimeoutOpt = typer.Option(120, "--glmocr-timeout",
                                 help="Per-page glm-ocr request timeout in seconds.")

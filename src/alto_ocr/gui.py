@@ -64,7 +64,7 @@ class JobConfig:
     debug_preprocessed_dir: Optional[Path] = None
     ocr_options: OCROptions = field(default_factory=OCROptions)
     glmocr_endpoint: Optional[str] = None
-    glmocr_model: str = "glm-ocr:latest"
+    glmocr_model: str = "glm-ocr:q8_0"
     glmocr_timeout: int = 120
 
 
@@ -393,7 +393,7 @@ class AltoOcrApp:
         ttk.Entry(gl, textvariable=self.var_glmocr_model, width=24).grid(
             row=2, column=1, sticky="w", pady=(6, 0))
         ttk.Label(
-            gl, text="Ollama model tag, e.g. 'glm-ocr:latest'.",
+            gl, text="Ollama model tag, e.g. 'glm-ocr:q8_0'.",
             foreground="#888",
         ).grid(row=2, column=2, sticky="w", padx=(8, 0), pady=(6, 0))
 

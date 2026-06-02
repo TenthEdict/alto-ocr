@@ -41,6 +41,7 @@ from dataclasses import replace as dc_replace
 
 from .glmocr import GLMOCRConfig, transcribe
 from .line_detect import DetectParams, LineBox, TextBlock, detect_blocks
+from .markup import normalize_markup
 from .preprocess import PreprocessConfig
 
 logger = logging.getLogger(__name__)
@@ -562,26 +563,71 @@ class TesseractEngine:
 _WORD_TOKEN_RE = re.compile(r"\S+|\s+")
 
 
-def _assign_block_text(block_text: str, lines: list[LineBox]) -> list[tuple[LineBox, str]]:
-    """Spread a block's transcript across its line boxes as a word stream.
+# Two regimes for spreading a block's transcript over its line boxes. Tables
+# and forms survive ``normalize_markup`` as one text row per visual row (HTML
+# ``<tr>`` / Markdown pipe rows become newline-separated lines), so the block's
+# newline count tracks its real row count. Flowing prose is the opposite:
+# glm-ocr collapses a column's many visual lines into a few paragraph rows. A
+# block is treated as row-structured — and mapped onto line boxes positionally
+# rather than as a width-weighted word stream — only when it has several rows
+# AND roughly as many rows as the block has detected line boxes. The ratio is
+# deliberately loose (a clean table sits near 1.0; ordinary prose near 0.1) so
+# detection over/under-segmenting a few rows still trips it, while normal prose
+# never does.
+_ROW_MODE_MIN_ROWS = 3
+_ROW_MODE_RATIO = 0.5
 
-    glm-ocr flattens a column into flowing paragraphs, not one string per
-    visual line, so there are far fewer text "lines" than detected line boxes.
-    Bucketing text-lines onto boxes would cram a whole paragraph into a single
-    box (and overflow its width). Instead the block's words are distributed
-    across the boxes in reading order, each box getting a share proportional to
-    its width (a wider line holds more words). Because the block was transcribed
-    on its own, top to bottom, glm-ocr's word order matches the boxes'
-    top-to-bottom order, so each word lands on roughly its real line; within a
-    line, ``_split_line_words`` places it by character offset.
 
-    Word placement is therefore approximate (the model supplies no geometry)
-    but ordered and width-weighted — enough to highlight the right word near its
-    real spot. Boxes that receive no words are dropped by the ALTO builder.
+def _looks_row_structured(rows: list[str], lines: list[LineBox]) -> bool:
+    """True when ``rows`` should map onto ``lines`` positionally (tables/forms).
+
+    Row-structured text (a table or a form, where ``normalize_markup`` kept one
+    line per visual row) has roughly as many rows as the block has detected line
+    boxes. Flowing prose has far fewer rows (paragraphs) than line boxes, so it
+    stays on the width-proportional word path.
     """
-    words = block_text.split()
-    if not lines:
-        return []
+    n_rows, n_lines = len(rows), len(lines)
+    if n_rows < _ROW_MODE_MIN_ROWS or n_lines < _ROW_MODE_MIN_ROWS:
+        return False
+    return n_rows >= _ROW_MODE_RATIO * n_lines
+
+
+def _assign_rows_to_lines(
+    rows: list[str], lines: list[LineBox],
+) -> list[tuple[LineBox, str]]:
+    """Map text rows onto line boxes positionally, preserving reading order.
+
+    When the counts match (the clean table case) this is a 1:1 row→box map, so
+    each row's cells land in their own line box and a short row's values never
+    bleed into the next row's box — the failure mode width-proportional
+    distribution has on tabular data. When the counts differ (detection split or
+    merged a band, or a row wrapped) rows are bucketed across boxes
+    monotonically: extra boxes stay empty, extra rows pack into the nearest box,
+    so text keeps its vertical order and rough position without dropping or
+    duplicating any row. Within a box, ``_split_line_words`` then spreads the
+    row's cells left-to-right by character offset.
+    """
+    n, m = len(rows), len(lines)
+    if n == m:
+        return list(zip(lines, rows))
+    buckets = [""] * m
+    for j, row in enumerate(rows):
+        k = min(m - 1, (j * m) // n)
+        buckets[k] = f"{buckets[k]} {row}".strip() if buckets[k] else row
+    return list(zip(lines, buckets))
+
+
+def _assign_words_to_lines(
+    words: list[str], lines: list[LineBox],
+) -> list[tuple[LineBox, str]]:
+    """Spread a word stream across line boxes, each box's share proportional to
+    its width.
+
+    For flowing prose, where glm-ocr's flattened paragraphs give no per-line
+    structure to align to: a wider line holds more words. Because the block was
+    transcribed on its own, top to bottom, the word order matches the boxes'
+    top-to-bottom order, so each word lands on roughly its real line.
+    """
     if not words:
         return [(lb, "") for lb in lines]
     widths = [max(1, lb.w) for lb in lines]
@@ -595,6 +641,39 @@ def _assign_block_text(block_text: str, lines: list[LineBox]) -> list[tuple[Line
         out.append((lb, " ".join(words[start:end])))
         start = end
     return out
+
+
+def _assign_block_text(block_text: str, lines: list[LineBox]) -> list[tuple[LineBox, str]]:
+    """Spread a block's transcript across its detected line boxes.
+
+    glm-ocr supplies no per-word geometry, so both paths are positional
+    approximations laid over the exact line-box geometry. The placement strategy
+    depends on the block's shape:
+
+    * **Row-structured** (tables, forms): ``normalize_markup`` keeps one text row
+      per visual row, so rows map onto line boxes positionally — 1:1 when the
+      counts match. This keeps each row's cells in their own line band instead of
+      letting a short row's values bleed down into the next row's box.
+    * **Prose**: glm-ocr flattens a column into a few paragraph rows, far fewer
+      than the detected line boxes, so the block's words are distributed across
+      the boxes in reading order, each box's share proportional to its width.
+
+    Within whichever line box it lands in, ``_split_line_words`` then places each
+    word by character offset. Boxes that receive no words are dropped by the
+    ALTO builder.
+    """
+    if not lines:
+        return []
+    rows = [r.strip() for r in block_text.splitlines() if r.strip()]
+    if not rows:
+        return [(lb, "") for lb in lines]
+    if _looks_row_structured(rows, lines):
+        logger.debug(
+            "glmocr: row-structured block (%d rows, %d line boxes) -> positional map",
+            len(rows), len(lines),
+        )
+        return _assign_rows_to_lines(rows, lines)
+    return _assign_words_to_lines(block_text.split(), lines)
 
 
 def _split_line_words(box: LineBox, text: str) -> list[tuple[str, int, int]]:
@@ -741,14 +820,17 @@ class GLMOCREngine:
          layout analysis (``line_detect.detect_blocks`` — vertical projection
          for columns, horizontal projection for lines; no Tesseract, whose
          layout analysis fails on the cursive material glm-ocr exists for).
-      2. Transcribe each block's crop through glm-ocr (Ollama). Transcribing
-         per block means a block's text pairs with that block's own geometry,
-         so we never have to guess glm-ocr's cross-column reading order — which
-         also makes the .txt (blocks joined in reading order) correct on
-         multi-column pages.
-      3. Within each block, distribute its text over its line boxes, then split
-         each line into per-word ``<String>`` boxes (+ ``<SP>``) so a search
-         highlights the individual word, not the whole line.
+      2. Transcribe each block's crop through glm-ocr (Ollama), then flatten
+         the markup it emits (HTML tables, LaTeX math) to plain text via
+         ``markup.normalize_markup``. Transcribing per block means a block's
+         text pairs with that block's own geometry, so we never have to guess
+         glm-ocr's cross-column reading order — which also makes the .txt
+         (blocks joined in reading order) correct on multi-column pages.
+      3. Within each block, distribute its text over its line boxes — table/
+         form rows map onto line boxes positionally (1:1 when counts match),
+         prose is spread as a width-weighted word stream — then split each line
+         into per-word ``<String>`` boxes (+ ``<SP>``) so a search highlights
+         the individual word, not the whole line.
 
     Word x-positions are proportional (the model gives no word geometry), so
     they are approximate but ordered — the right word highlights at roughly the
@@ -815,7 +897,10 @@ class GLMOCREngine:
         texts: list[str] = []
         for blk in blocks:
             crop = image[blk.y : blk.y + blk.h, blk.x : blk.x + blk.w]
-            block_text = transcribe(crop, self.config)
+            # glm-ocr renders tables as HTML and math as LaTeX; flatten that to
+            # plain text so the .txt stays plain and word-splitting yields real
+            # word tokens (not <td>/$ fragments). See markup.normalize_markup.
+            block_text = normalize_markup(transcribe(crop, self.config))
             if block_text.strip():
                 texts.append(block_text)
             assigned.append((blk, _assign_block_text(block_text, list(blk.lines))))
@@ -824,7 +909,7 @@ class GLMOCREngine:
             # No detectable layout: try one whole-page pass so a sparse page
             # still yields searchable text under a single page-spanning line; a
             # truly blank page leaves an empty Layout, matching Tesseract.
-            full = transcribe(image, self.config)
+            full = normalize_markup(transcribe(image, self.config))
             if full.strip():
                 span = LineBox(0, 0, page_w, page_h)
                 assigned = [(TextBlock(0, 0, page_w, page_h, (span,)), [(span, full)])]

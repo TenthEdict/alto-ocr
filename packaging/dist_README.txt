@@ -20,7 +20,7 @@ One-time setup (per machine)
    engine — used for everything unless you explicitly pick Tesseract):
 
        https://ollama.com/download
-       ollama pull glm-ocr:latest
+       ollama pull glm-ocr:q8_0
 
    By default Alto OCR talks to http://localhost:11434. The Advanced
    settings tab has an "Endpoint" field if Ollama runs on a different
@@ -88,7 +88,7 @@ Troubleshooting
 ---------------
   "GLMOCR endpoint check failed"
     The default engine couldn't reach Ollama. Make sure Ollama is
-    running and the glm-ocr:latest model is pulled (see step 1 above).
+    running and the glm-ocr:q8_0 model is pulled (see step 1 above).
     The Advanced tab's Endpoint field accepts a remote URL like
     http://other-machine:11434 if Ollama runs elsewhere.
 
