@@ -512,27 +512,51 @@ def reformat(
 @app.command()
 def doctor(
     tesseract_path: Optional[Path] = TesseractOpt,
+    glmocr_endpoint: Optional[str] = GLMOCREndpointOpt,
+    glmocr_model: str = GLMOCRModelOpt,
 ) -> None:
-    """Verify the runtime environment (Tesseract, Python deps)."""
+    """Verify the runtime environment: Python deps + both OCR engines."""
     _setup_logging(False)
     console.print("[bold]alto_ocr — environment check[/bold]")
-    try:
-        binary = find_tesseract(tesseract_path)
-        console.print(f"[green]OK[/green] tesseract: {binary} ({check_tesseract_version(binary)})")
-    except Exception as e:
-        console.print(f"[red]FAIL[/red] tesseract: {e}")
-        raise typer.Exit(code=1)
 
-    deps = ["cv2", "PIL", "numpy", "lxml", "typer", "rich"]
-    failed = False
-    for dep in deps:
+    # Python deps are the only hard requirement.
+    dep_failed = False
+    for dep in ("cv2", "PIL", "numpy", "lxml", "typer", "rich"):
         try:
             __import__(dep)
             console.print(f"[green]OK[/green] {dep}")
         except ImportError as e:
             console.print(f"[red]FAIL[/red] {dep}: {e}")
-            failed = True
-    raise typer.Exit(code=1 if failed else 0)
+            dep_failed = True
+
+    # glm-ocr is the DEFAULT engine: confirm Ollama is reachable and the model
+    # is pulled. A miss is a warning, not a hard fail — the user may start
+    # Ollama later or run with --engine tesseract.
+    endpoint = resolve_endpoint(glmocr_endpoint)
+    try:
+        model = check_endpoint(GLMOCRConfig(endpoint=endpoint, model=glmocr_model))
+        console.print(f"[green]OK[/green] glm-ocr (default engine): {endpoint}, model {model!r}")
+        glmocr_ok = True
+    except GLMOCRError as e:
+        console.print(f"[yellow]WARN[/yellow] glm-ocr (default engine): {e}")
+        glmocr_ok = False
+
+    # Tesseract is the optional fallback engine — absence is a warning, not a
+    # failure (it is only needed for --engine tesseract).
+    try:
+        binary = find_tesseract(tesseract_path)
+        console.print(f"[green]OK[/green] tesseract (fallback engine): {binary} "
+                      f"({check_tesseract_version(binary)})")
+        tesseract_ok = True
+    except Exception as e:
+        console.print(f"[yellow]WARN[/yellow] tesseract (fallback engine): {e}")
+        tesseract_ok = False
+
+    if not (glmocr_ok or tesseract_ok):
+        console.print("[red]FAIL[/red] no usable OCR engine "
+                      "(need Ollama + glm-ocr, or Tesseract).")
+
+    raise typer.Exit(code=1 if (dep_failed or not (glmocr_ok or tesseract_ok)) else 0)
 
 
 if __name__ == "__main__":
