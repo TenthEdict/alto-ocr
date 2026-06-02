@@ -569,27 +569,39 @@ _WORD_TOKEN_RE = re.compile(r"\S+|\s+")
 # newline count tracks its real row count. Flowing prose is the opposite:
 # glm-ocr collapses a column's many visual lines into a few paragraph rows. A
 # block is treated as row-structured — and mapped onto line boxes positionally
-# rather than as a width-weighted word stream — only when it has several rows
-# AND roughly as many rows as the block has detected line boxes. The ratio is
-# deliberately loose (a clean table sits near 1.0; ordinary prose near 0.1) so
-# detection over/under-segmenting a few rows still trips it, while normal prose
-# never does.
+# rather than as a width-weighted word stream — only when it has several rows,
+# roughly as many rows as the block has detected line boxes, AND those rows are
+# short. The ratio is deliberately loose (a clean table sits near 1.0; ordinary
+# prose near 0.1) so detection over/under-segmenting a few rows still trips it.
+# The shortness gate is what separates genuine flowing prose from tabular data:
+# table/form/list rows are short (cells, labels, list items) while prose rows
+# are full sentences — without it, a block whose paragraph count happens to
+# approach the line-box count (a short multi-paragraph column) would be wrongly
+# pinned 1:1 and its words misplaced.
 _ROW_MODE_MIN_ROWS = 3
 _ROW_MODE_RATIO = 0.5
+_ROW_MODE_MAX_MEDIAN_WORDS = 8
 
 
 def _looks_row_structured(rows: list[str], lines: list[LineBox]) -> bool:
     """True when ``rows`` should map onto ``lines`` positionally (tables/forms).
 
-    Row-structured text (a table or a form, where ``normalize_markup`` kept one
-    line per visual row) has roughly as many rows as the block has detected line
-    boxes. Flowing prose has far fewer rows (paragraphs) than line boxes, so it
+    Row-structured text (a table, form, or list, where ``normalize_markup`` kept
+    one line per visual row) has roughly as many rows as the block has detected
+    line boxes AND those rows are short (cells/labels, not sentences). Flowing
+    prose has far fewer, much longer rows (paragraphs) than line boxes, so it
     stays on the width-proportional word path.
     """
     n_rows, n_lines = len(rows), len(lines)
     if n_rows < _ROW_MODE_MIN_ROWS or n_lines < _ROW_MODE_MIN_ROWS:
         return False
-    return n_rows >= _ROW_MODE_RATIO * n_lines
+    if n_rows < _ROW_MODE_RATIO * n_lines:
+        return False
+    # Short rows => tabular/list; long rows => flowing prose. Use the median so
+    # one long row (a wrapped table caption) doesn't flip a real table to prose.
+    words_per_row = sorted(len(r.split()) for r in rows)
+    median_words = words_per_row[len(words_per_row) // 2]
+    return median_words <= _ROW_MODE_MAX_MEDIAN_WORDS
 
 
 def _assign_rows_to_lines(
@@ -610,6 +622,15 @@ def _assign_rows_to_lines(
     n, m = len(rows), len(lines)
     if n == m:
         return list(zip(lines, rows))
+    # Counts differ: detection split/merged a band or a row wrapped. Placement
+    # degrades to approximate here (n>m packs several rows into one box; n<m
+    # leaves gaps), so log it — a collection that trips this a lot wants its
+    # DetectParams tuned rather than silently producing mis-aligned hit-boxes.
+    logger.debug(
+        "glmocr: row/line-box mismatch (%d rows, %d boxes) — %s; per-row "
+        "placement approximate for this block",
+        n, m, "packing rows" if n > m else "spreading rows (some boxes empty)",
+    )
     buckets = [""] * m
     for j, row in enumerate(rows):
         k = min(m - 1, (j * m) // n)
@@ -673,7 +694,9 @@ def _assign_block_text(block_text: str, lines: list[LineBox]) -> list[tuple[Line
             len(rows), len(lines),
         )
         return _assign_rows_to_lines(rows, lines)
-    return _assign_words_to_lines(block_text.split(), lines)
+    # Reuse the already-split rows for the word stream (same words, same order
+    # as block_text.split()) so both paths read one consistent view of the text.
+    return _assign_words_to_lines([w for r in rows for w in r.split()], lines)
 
 
 def _split_line_words(box: LineBox, text: str) -> list[tuple[str, int, int]]:

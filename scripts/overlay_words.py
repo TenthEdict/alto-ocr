@@ -42,48 +42,15 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from xml.etree import ElementTree as ET
 
 from PIL import Image, ImageDraw
 
-# Archival scans are huge; don't trip Pillow's decompression-bomb guard.
-Image.MAX_IMAGE_PIXELS = None
+# Allow running as `python scripts/overlay_words.py` from the repo root. The
+# shared ALTO helpers live in the package but are pure stdlib + Pillow (no
+# OpenCV/lxml), so this stays a light standalone QA aid.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# Post-conversion ALTO is v2; accept v3 as well so the tool also works on raw
-# engine output during debugging.
-_ALTO_NAMESPACES = (
-    "http://www.loc.gov/standards/alto/ns-v2#",
-    "http://www.loc.gov/standards/alto/ns-v3#",
-)
-
-
-def _find_first(root: ET.Element, tag: str) -> ET.Element | None:
-    for ns in _ALTO_NAMESPACES:
-        el = root.find(f".//{{{ns}}}{tag}")
-        if el is not None:
-            return el
-    return None
-
-
-def _find_all(root: ET.Element, tag: str) -> list[ET.Element]:
-    for ns in _ALTO_NAMESPACES:
-        found = root.findall(f".//{{{ns}}}{tag}")
-        if found:
-            return found
-    return []
-
-
-def _box(el: ET.Element) -> tuple[int, int, int, int] | None:
-    """(HPOS, VPOS, WIDTH, HEIGHT) as ints, or None if any is non-numeric."""
-    try:
-        return (
-            int(el.get("HPOS", "")),
-            int(el.get("VPOS", "")),
-            int(el.get("WIDTH", "")),
-            int(el.get("HEIGHT", "")),
-        )
-    except ValueError:
-        return None
+from src.alto_ocr.alto_parse import box_of, find_all, load_image_and_scale  # noqa: E402
 
 
 def overlay_words(
@@ -107,24 +74,7 @@ def overlay_words(
     usable ``<Page>`` geometry (e.g. a failure-stub ALTO with an empty
     ``<Layout/>``).
     """
-    im = Image.open(image_path).convert("RGB")
-    img_w, img_h = im.size
-
-    root = ET.parse(str(alto_path)).getroot()
-    page = _find_first(root, "Page")
-    if page is None:
-        raise SystemExit(f"No <Page> element in {alto_path} - nothing to overlay.")
-    try:
-        page_w = int(page.get("WIDTH", "0"))
-        page_h = int(page.get("HEIGHT", "0"))
-    except ValueError:
-        raise SystemExit(f"<Page> WIDTH/HEIGHT are not integers in {alto_path}.")
-    if page_w <= 0 or page_h <= 0:
-        raise SystemExit(f"<Page> has non-positive dimensions in {alto_path}.")
-
-    # ALTO frame (mm10 or pixel) -> image pixel frame.
-    sx = img_w / page_w
-    sy = img_h / page_h
+    im, root, sx, sy = load_image_and_scale(alto_path, image_path)
 
     needle = search.lower() if search else None
 
@@ -136,8 +86,8 @@ def overlay_words(
     draw = ImageDraw.Draw(im, "RGBA")
 
     if line_boxes:
-        for ln in _find_all(root, "TextLine"):
-            b = _box(ln)
+        for ln in find_all(root, "TextLine"):
+            b = box_of(ln)
             if b is None:
                 continue
             x, y, w, h = b
@@ -148,8 +98,8 @@ def overlay_words(
 
     words_drawn = 0
     matches = 0
-    for st in _find_all(root, "String"):
-        b = _box(st)
+    for st in find_all(root, "String"):
+        b = box_of(st)
         if b is None:
             continue
         x, y, w, h = b

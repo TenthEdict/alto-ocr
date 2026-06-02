@@ -27,7 +27,9 @@ from pathlib import Path
 # Allow running as `python scripts/ocr_one.py` from the repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.alto_ocr.glmocr import GLMOCRConfig, resolve_endpoint  # noqa: E402
+from src.alto_ocr.glmocr import (  # noqa: E402
+    GLMOCRConfig, GLMOCRError, check_endpoint, resolve_endpoint,
+)
 from src.alto_ocr.line_detect import DetectParams  # noqa: E402
 from src.alto_ocr.ocr import GLMOCREngine, OCROptions, TesseractEngine, find_tesseract  # noqa: E402
 from src.alto_ocr.preprocess import PreprocessConfig, preprocess  # noqa: E402
@@ -52,6 +54,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.engine == "glmocr":
         cfg = GLMOCRConfig(endpoint=resolve_endpoint(None),
                            **({"model": args.glmocr_model} if args.glmocr_model else {}))
+        # Fail fast with a clear message if Ollama/the model isn't reachable,
+        # mirroring main._build_engine — otherwise a down endpoint surfaces as a
+        # cryptic per-page timeout deep in the OCR loop.
+        try:
+            check_endpoint(cfg)
+        except GLMOCRError as e:
+            print(f"glmocr endpoint check failed: {e}", file=sys.stderr)
+            return 2
         engine = GLMOCREngine(config=cfg, detect_params=DetectParams())
     else:
         engine = TesseractEngine(binary=find_tesseract(None), options=OCROptions())
