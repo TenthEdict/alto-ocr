@@ -1,0 +1,27 @@
+For every set of images (Ref ID) that require OCR, three associated folders exist together:
+
+[TIFF Images folder]              -- preservation copy; canonical, NOT produced by the OCR tool
+[METS/ALTO folder]                -- produced by the OCR tool
+[Plain text transcript folder]    -- produced by the OCR tool
+
+Each folder contains the exact same number of files, and each set of files is named identically except for the file extension. Like this:
+
+[TIFF Images folder]
+image001.tif
+image002.tif
+image003.tif
+...etc.
+[METS/ALTO folder]
+image001.xml
+image002.xml
+image003.xml
+...etc.
+[Plain text transcript folder]
+image001.txt
+image002.txt
+image003.txt
+...etc.
+
+The TIFF folder lives in the preservation tree at preservation-files/preservation/<RefID>/. The OCR tool reads these TIFs but does not copy them anywhere; duplicating them onto the documentation tree would waste storage on the network drive.
+
+The METS/ALTO and Plain text folders are produced by the OCR tool at documentation/ALTOS-Plain Text/<RefID>/ALTO/ and .../Text/. The OCR tool also writes one <RefID>.mets.xml file alongside those two folders, describing the ALTO + Text outputs. The METS does not reference the preservation TIFs -- LibNova pairs the two trees by Ref ID externally.

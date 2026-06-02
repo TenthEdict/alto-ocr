@@ -1,0 +1,36 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+CorrectPageSequencing/
+.claude/
+ZeffPapers/
+docs/
+build.log
+build/
+
+# Local outputs from smoke tests — keep schema, not data
+output/*/
+!output/.gitkeep
+
+# Editor / OS junk
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# The reference repo — keep cloned locally but don't track it here
+ePubs_Main/
+
+# PyInstaller build artifacts
+build/
+dist/
+build.log
+
+# Local Claude settings (keep shared config, drop machine-local perms)
+.claude/settings.local.json
+CLAUDE.md
+
