@@ -131,7 +131,20 @@ def _looks_like_image_description(text: str) -> bool:
     if not text:
         return False
     head = text.lstrip().lower()
-    return any(head.startswith(p) for p in _IMAGE_DESCRIPTION_LEADS)
+    if any(head.startswith(p) for p in _IMAGE_DESCRIPTION_LEADS):
+        return True
+    # glm-ocr sometimes prefixes a short chat-style section header
+    # ("OVERVIEW", "ANALYSIS", "DESCRIPTION", …) before the description proper,
+    # which dodges the leading-phrase match. Skip a single short leading line
+    # and re-check, so e.g. "OVERVIEW\n\nThe image provided is a blank page…"
+    # is still caught. Kept conservative (one line, <=3 words) so a real short
+    # title above a body paragraph isn't given extra license to false-positive.
+    first, sep, rest = head.partition("\n")
+    if sep and len(first.split()) <= 3:
+        rest = rest.lstrip()
+        if any(rest.startswith(p) for p in _IMAGE_DESCRIPTION_LEADS):
+            return True
+    return False
 
 
 # Fallback resize edges to try when the model returns GGML_ASSERT.

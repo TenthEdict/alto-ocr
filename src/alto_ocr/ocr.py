@@ -40,7 +40,7 @@ from lxml import etree
 from dataclasses import replace as dc_replace
 
 from .glmocr import GLMOCRConfig, transcribe
-from .line_detect import DetectParams, LineBox, TextBlock, detect_blocks
+from .line_detect import DetectParams, LineBox, TextBlock, _clean_mask, detect_blocks
 from .markup import normalize_markup
 from .preprocess import PreprocessConfig
 
@@ -828,6 +828,31 @@ def _build_alto_words(
     )
 
 
+# glm-ocr fabricates a plausible-looking fake transcript when handed a crop that
+# is mostly blank or noise — it does NOT reliably return "" or the "---" blank
+# sentinel, and the fabrication is indistinguishable from real text downstream
+# (observed: a blank page yielding an invented paragraph about "sunlight and
+# plant growth"). The only robust defense is to gate on image ink BEFORE
+# transcribing: a real text line band runs ~10-35% ink while a blank/noise band
+# is well under 1% (a >10x gap). Skip any block whose median line-band density
+# is below this floor; prefer an empty page over fabricated content.
+_MIN_LINE_INK_DENSITY = 0.03
+
+
+def _block_has_real_text(cleaned: np.ndarray, block: TextBlock) -> bool:
+    """True if a block's detected line bands are dense enough to be real text
+    (not the near-empty/noise crops that make glm-ocr hallucinate)."""
+    dens: list[float] = []
+    for ln in block.lines:
+        crop = cleaned[ln.y : ln.y2 + 1, ln.x : ln.x2 + 1]
+        if crop.size:
+            dens.append(float((crop > 0).mean()))
+    if not dens:
+        return False
+    dens.sort()
+    return dens[len(dens) // 2] >= _MIN_LINE_INK_DENSITY
+
+
 @dataclass
 class GLMOCREngine:
     """OCR engine for typewritten + handwritten material, via local glm-ocr.
@@ -857,9 +882,10 @@ class GLMOCREngine:
 
     Word x-positions are proportional (the model gives no word geometry), so
     they are approximate but ordered — the right word highlights at roughly the
-    right spot. Column and line placement are exact. Pages with no detectable
-    layout fall back to a single whole-page transcription under one line; truly
-    blank pages emit an empty Layout, matching Tesseract.
+    right spot. Column and line placement are exact. Blank or noise pages — where
+    glm-ocr would otherwise fabricate a plausible fake transcript — are caught by
+    an ink-density gate and emit an empty Layout; a page with real text that
+    block detection missed still gets a whole-page fallback.
     """
 
     config: GLMOCRConfig = field(default_factory=GLMOCRConfig)
@@ -916,9 +942,18 @@ class GLMOCREngine:
         # glm-ocr's cross-column reading order). Per-word String boxes come from
         # splitting each line box proportionally. See line_detect.detect_blocks.
         blocks = detect_blocks(gray, self.detect_params)
+        # Ink-density gate (load-bearing): only transcribe blocks that actually
+        # contain dense text — glm-ocr hallucinates a fake transcript from a
+        # blank/noise crop. See _block_has_real_text / _MIN_LINE_INK_DENSITY.
+        cleaned = _clean_mask(gray, self.detect_params)
+        real_blocks = [b for b in blocks if _block_has_real_text(cleaned, b)]
+        if len(real_blocks) != len(blocks):
+            logger.debug("glmocr: skipped %d near-empty block(s) (blank/noise) of %d",
+                         len(blocks) - len(real_blocks), len(blocks))
+
         assigned: list[tuple[TextBlock, list[tuple[LineBox, str]]]] = []
         texts: list[str] = []
-        for blk in blocks:
+        for blk in real_blocks:
             crop = image[blk.y : blk.y + blk.h, blk.x : blk.x + blk.w]
             # glm-ocr renders tables as HTML and math as LaTeX; flatten that to
             # plain text so the .txt stays plain and word-splitting yields real
@@ -928,18 +963,29 @@ class GLMOCREngine:
                 texts.append(block_text)
             assigned.append((blk, _assign_block_text(block_text, list(blk.lines))))
 
-        if not blocks:
-            # No detectable layout: try one whole-page pass so a sparse page
-            # still yields searchable text under a single page-spanning line; a
-            # truly blank page leaves an empty Layout, matching Tesseract.
-            full = normalize_markup(transcribe(image, self.config))
-            if full.strip():
-                span = LineBox(0, 0, page_w, page_h)
-                assigned = [(TextBlock(0, 0, page_w, page_h, (span,)), [(span, full)])]
-                texts = [full]
-                logger.debug("glmocr: no blocks detected; whole-page fallback line")
+        if not real_blocks:
+            if blocks:
+                # Blocks were detected but all were near-empty -> blank/noise
+                # page; emit an empty Layout rather than risk a hallucination.
+                logger.debug("glmocr: all %d block(s) near-empty — blank page", len(blocks))
             else:
-                logger.debug("glmocr: blank page (no transcribed text)")
+                # No layout at all. A whole-page pass can still recover real text
+                # that block detection missed, but only when a genuinely dense
+                # text band exists — a blank/noise page is left empty (glm-ocr
+                # would otherwise fabricate a transcript).
+                row_dens = (cleaned > 0).mean(axis=1)
+                has_text = bool(row_dens.size) and (
+                    float(np.percentile(row_dens, 99)) >= _MIN_LINE_INK_DENSITY
+                )
+                if has_text:
+                    full = normalize_markup(transcribe(image, self.config))
+                    if full.strip():
+                        span = LineBox(0, 0, page_w, page_h)
+                        assigned = [(TextBlock(0, 0, page_w, page_h, (span,)), [(span, full)])]
+                        texts = [full]
+                        logger.debug("glmocr: no blocks detected; whole-page fallback line")
+                else:
+                    logger.debug("glmocr: blank page (no dense text band) — empty layout")
 
         txt_out = "\n\n".join(texts)
 
