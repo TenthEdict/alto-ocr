@@ -11,6 +11,9 @@ ZeffPapers/
 docs/
 build.log
 build/
+_probe_summary.json
+batch_spotcheck_summary.json
+temp-ocr*/
 
 # Local outputs from smoke tests — keep schema, not data
 output/*/
