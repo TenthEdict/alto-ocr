@@ -204,48 +204,95 @@ def _post_generate(img_b64: str, config: GLMOCRConfig) -> dict:
 # drops ~10% of real content on clean pages — undetectable at 4,241-page scale.
 # So we never touch generation; we only collapse output that is *provably*
 # degenerate, leaving every healthy page byte-identical.
-_LOOP_MIN_LINES = 6          # too few lines to judge repetition reliably
+_LOOP_MIN_LINES = 6           # too few lines to judge degeneracy by ratio
 _LOOP_DEGENERATE_RATIO = 0.5  # unique/total non-blank lines at/above this = healthy
-_LOOP_MIN_REPEAT = 3          # some line must recur >= this often to count as a loop
+_LOOP_MIN_REPEAT = 3          # a single line must recur >= this often to count as a loop
+_LOOP_MAX_PERIOD_FRAC = 0.67  # period must be <= this fraction of the text (>= ~1.5 cycles)
+_LOOP_MIN_UNIT_CHARS = 40     # a multi-/long-line repeating unit this big = a real loop
+
+
+def _find_periodic_cut(nonblank: list[str]) -> int | None:
+    """If the non-blank lines are a unit repeated >= ~1.5×, return the unit
+    length (in non-blank lines); else None.
+
+    Detects ``nb == unit * k`` with the final copy possibly *truncated* (the
+    2048-token cap often cuts the last repeat mid-way), via the periodicity
+    test ``nb[i] == nb[i % P]`` for the smallest period ``P``. A verbatim
+    multi-line block (or one long line) repeating back-to-back is a generation
+    loop, never real prose — so we keep one copy. Short single-line periods
+    need >= _LOOP_MIN_REPEAT full cycles so legit twice-repeated rows survive.
+    """
+    L = len(nonblank)
+    if L < 2:
+        return None
+    max_period = int(L * _LOOP_MAX_PERIOD_FRAC)
+    for P in range(1, max_period + 1):
+        if not all(nonblank[i] == nonblank[i % P] for i in range(L)):
+            continue
+        unit_chars = sum(len(s) for s in nonblank[:P])
+        if P == 1:
+            # single line repeated: require many cycles OR a long line
+            if L >= _LOOP_MIN_REPEAT or unit_chars >= _LOOP_MIN_UNIT_CHARS:
+                return P
+            return None
+        # multi-line block repeated >= ~1.5×: a loop iff the unit is substantial
+        if unit_chars >= _LOOP_MIN_UNIT_CHARS:
+            return P
+        return None
+    return None
 
 
 def _collapse_repetition_loops(text: str) -> str:
-    """Collapse a degenerate repetition loop to its unique lines, in order.
+    """Collapse a degenerate glm-ocr repetition loop to its real content.
 
-    Fires ONLY when the output is dominated by repetition — fewer than
-    ``_LOOP_DEGENERATE_RATIO`` unique non-blank lines AND some line repeated
-    at least ``_LOOP_MIN_REPEAT`` times. Both conditions are required so a
-    healthy page (≈100% unique lines in practice) — including a data table
-    with a few incidentally-equal rows — is returned untouched. On a loop,
-    we keep each distinct line's first occurrence in original order, which
-    preserves the real content (the loop's first cycle) and discards the rest.
+    Two stages, both leaving healthy pages byte-identical:
+
+    1. **Periodic loop** — if the non-blank lines are a unit repeated back-to-
+       back (k× verbatim, last copy possibly truncated by the token cap), keep
+       just the first copy. Catches a one-line caption ×160, an HTML table
+       emitted ×3, a paragraph block re-emitted ×2.
+    2. **Messy loop** — non-periodic but still repetition-dominated (e.g. a
+       caption interleaved with slightly-varied rephrasings): if < half the
+       non-blank lines are unique AND some line recurs >= _LOOP_MIN_REPEAT
+       times, keep each distinct line's first occurrence in order.
+
+    Generation-time ``repeat_penalty`` is deliberately NOT used — it corrupts
+    legitimately repeated text and drops real content (see module note above).
     """
     if "\n" not in text:
         return text
     lines = text.split("\n")
-    nonblank = [s for s in (ln.strip() for ln in lines) if s]
-    if len(nonblank) < _LOOP_MIN_LINES:
-        return text
-    distinct = set(nonblank)
-    if len(distinct) / len(nonblank) >= _LOOP_DEGENERATE_RATIO:
-        return text  # healthy page — leave byte-identical
-    # Need a genuinely repeated line, not just many distinct short lines.
-    if len(nonblank) - len(distinct) < _LOOP_MIN_REPEAT - 1:
-        return text
-    max_repeat = max(nonblank.count(s) for s in distinct)
-    if max_repeat < _LOOP_MIN_REPEAT:
-        return text
-    seen: set[str] = set()
-    kept: list[str] = []
-    for ln in lines:
-        key = ln.strip()
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        kept.append(ln.rstrip())
-    logger.debug("glm-ocr: collapsed repetition loop (%d lines -> %d unique)",
-                 len(lines), len(kept))
-    return "\n".join(kept)
+    nb_idx = [i for i, ln in enumerate(lines) if ln.strip()]
+    nonblank = [lines[i].strip() for i in nb_idx]
+
+    # Stage 1: exact periodic loop (handles truncated final copy; any length).
+    period = _find_periodic_cut(nonblank)
+    if period is not None:
+        cut = nb_idx[period - 1] + 1  # keep through the period-th non-blank line
+        if cut < len(lines):
+            logger.debug("glm-ocr: collapsed periodic loop (period=%d non-blank lines, "
+                         "%d -> %d lines)", period, len(lines), cut)
+            lines = lines[:cut]
+            nonblank = nonblank[:period]
+
+    # Stage 2: messy (non-periodic) repetition-dominated output.
+    if len(nonblank) >= _LOOP_MIN_LINES:
+        distinct = set(nonblank)
+        if (len(distinct) / len(nonblank) < _LOOP_DEGENERATE_RATIO
+                and max(nonblank.count(s) for s in distinct) >= _LOOP_MIN_REPEAT):
+            seen: set[str] = set()
+            kept: list[str] = []
+            for ln in lines:
+                key = ln.strip()
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                kept.append(ln.rstrip())
+            logger.debug("glm-ocr: collapsed messy repetition (%d -> %d unique lines)",
+                         len(lines), len(kept))
+            lines = kept
+
+    return "\n".join(lines)
 
 
 def transcribe(image: np.ndarray, config: GLMOCRConfig) -> str:
