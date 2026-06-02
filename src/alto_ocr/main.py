@@ -27,7 +27,7 @@ from .ocr import (
     check_tesseract_version,
     find_tesseract,
 )
-from .pipeline import PageProgressLogger, RefIdResult, process_ref_id
+from .pipeline import PageProgressLogger, PageResult, RefIdResult, process_ref_id
 from .preprocess import PreprocessConfig
 from .walker import _natural_key, discover_collection, discover_ref_id
 
@@ -76,6 +76,7 @@ def _force_utf8_output() -> None:
 # Run before constructing the Console so Rich picks up the UTF-8 code page.
 _force_utf8_output()
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -307,6 +308,26 @@ def _process_one_for_pool(args: tuple) -> RefIdResult:
     )
 
 
+def _failed_ref_result(inputs, output_root: Path, exc: BaseException) -> RefIdResult:
+    """Synthesize a failed RefIdResult when a whole Ref ID aborts.
+
+    ``process_ref_id`` isolates per-*page* errors itself; this covers a
+    Ref-ID-level exception (or a crashed pool worker) so one bad object can't
+    abort an unattended multi-hour batch. Recorded as a single failed page so
+    the Ref ID shows up clearly in the summary with its error and real size.
+    """
+    return RefIdResult(
+        ref_id=inputs.ref_id,
+        output_dir=(output_root / inputs.ref_id).resolve(),
+        pages=[PageResult(
+            stem=f"<Ref ID aborted before page output ({inputs.page_count} page(s))>",
+            order=0,
+            ok=False,
+            error=f"{type(exc).__name__}: {exc}",
+        )],
+    )
+
+
 @app.command()
 def batch(
     collection_dir: Path = typer.Argument(..., exists=True, file_okay=False, dir_okay=True,
@@ -368,26 +389,41 @@ def batch(
         total_pages = sum(i.page_count for i in items)
         progress = PageProgressLogger(total_pages)
         for inputs in items:
-            results.append(process_ref_id(
-                inputs, output_root,
-                engine=engine_obj,
-                preprocess_config=cfg,
-                debug_preprocessed_dir=debug_preprocessed,
-                with_checksums=not no_checksums,
-                write_mets_file=not no_mets,
-                write_plaintext=not no_plaintext,
-                on_page_done=progress.tick,
-            ))
+            try:
+                results.append(process_ref_id(
+                    inputs, output_root,
+                    engine=engine_obj,
+                    preprocess_config=cfg,
+                    debug_preprocessed_dir=debug_preprocessed,
+                    with_checksums=not no_checksums,
+                    write_mets_file=not no_mets,
+                    write_plaintext=not no_plaintext,
+                    on_page_done=progress.tick,
+                ))
+            except Exception as e:  # noqa: BLE001 - one bad Ref ID must not abort the batch
+                logger.exception("[%s] Ref ID aborted (recorded as failed, continuing): %s",
+                                 inputs.ref_id, e)
+                results.append(_failed_ref_result(inputs, output_root, e))
     else:
         payloads = [
             (inputs, output_root, engine_obj, cfg,
              debug_preprocessed, not no_checksums, not no_mets, not no_plaintext)
             for inputs in items
         ]
+        # Map each future to its RefIdInputs so a worker-side failure (a
+        # Ref-ID-level exception, or a crashed/broken pool worker) is recorded
+        # as a failed Ref ID and the batch keeps going — a single bad object
+        # can't throw away hours of an unattended run.
         with ProcessPoolExecutor(max_workers=workers) as ex:
-            futures = {ex.submit(_process_one_for_pool, p): p[0].ref_id for p in payloads}
+            futures = {ex.submit(_process_one_for_pool, p): p[0] for p in payloads}
             for fut in as_completed(futures):
-                results.append(fut.result())
+                inputs = futures[fut]
+                try:
+                    results.append(fut.result())
+                except Exception as e:  # noqa: BLE001 - isolate per-Ref-ID failures
+                    logger.exception("[%s] Ref ID aborted (recorded as failed, continuing): %s",
+                                     inputs.ref_id, e)
+                    results.append(_failed_ref_result(inputs, output_root, e))
         results.sort(key=lambda r: r.ref_id)
 
     _print_summary(results)
