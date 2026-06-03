@@ -43,6 +43,11 @@ class ChatCommentaryRegexTests(unittest.TestCase):
         "The text on the monument was barely legible.",
         "The text states that all members shall be entitled to vote.",
         "The text reads, in part, as quoted by the chairman.",
+        # MSA00005 smoke test: a REAL caption that must survive — it looks just
+        # like the "the bottom photo depicts…" leak, so we deliberately keep all
+        # "the <position> photo …" lines rather than risk eating real captions.
+        "The photo at the right shows the sequence of events during powered flight.",
+        "The text is a binding contract between the parties.",
     ]
 
     # Genuine glm-ocr commentary that must STILL be stripped (no regression in
@@ -63,6 +68,9 @@ class ChatCommentaryRegexTests(unittest.TestCase):
         "I'm unable to read this page.",
         "Wait, let me re-read the page.",
         "Let me re-examine the image.",
+        # MSA00005 smoke test: two new leak phrasings the stripper now catches.
+        "The text is centered on a white background with black lettering.",
+        'Wait, the word "BASE OPERATIONS" is at the bottom of the second photo.',
     ]
 
     def test_real_prose_is_not_matched(self):

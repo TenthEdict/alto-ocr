@@ -65,7 +65,8 @@ def force_utf8_output() -> None:
 #     match photograph/photo/picture/illustration/etc. (those occur in real
 #     captions, e.g. "The photograph shows the 1923 class.").
 #   * "the text in the image / the text provided / the text is clear|legible|
-#     as follows|a description / the text reads:|states: (colon-anchored, the
+#     as follows|a description / the text is centered|positioned|arranged|…
+#     (layout description) / the text reads:|states: (colon-anchored, the
 #     model's re-quote form) / the text on the image|page|scan …" — meta about
 #     the scan that documents never write. We do NOT match bare "the text is a
 #     <noun>" ("The text is a binding contract."), "the text reads, in part …",
@@ -74,7 +75,7 @@ def force_utf8_output() -> None:
 #     about …" (all real prose).
 #   * Self-talk: "I'll output/transcribe/re-read", "I'm unable/sorry", "let me
 #     re-read/re-examine", "here's the text[:]" (bare/colon-anchored lead-in),
-#     "Wait, <let me|the text|I'll|…>", bare "It's:". We do NOT match "I will
+#     "Wait, <let me|the text|the word|I'll|…>", bare "It's:". We do NOT match "I will
 #     provide/use …", "Here is the text of the <document> …", bare "wait,/okay,/
 #     sorry,/unfortunately,", "I cannot/can't", or "let me check/look/try" (all
 #     occur in real letters, speeches, minutes).
@@ -95,7 +96,9 @@ _CHAT_COMMENTARY_RE = re.compile(
     r"|the\s+text\s+(?:provided\b|in\s+the\s+(?:image|picture|photo|document|page)\b"
     r"|on\s+the\s+(?:image|picture|photo|scan|page|document)\b"
     r"|reads?(?:\s*:|\s+as\s+follows)|states?(?:\s*:|\s+as\s+follows)|is:"
-    r"|is\s+(?:clear|clearly|legible|illegible|as\s+follows|a\s+description|a\s+transcription)\b)"
+    r"|is\s+(?:clear|clearly|legible|illegible|as\s+follows|a\s+description|a\s+transcription"
+    # layout description (e.g. "The text is centered on a white background…") — model-voice
+    r"|centered|centred|positioned|aligned|arranged|formatted|justified|displayed)\b)"
     # Model self-talk / refusals (kept specific to avoid real first-person prose).
     # Dropped "provide"/"use" — they collide with ordinary letter/minutes prose
     # ("I will provide a full accounting…", "I will use my best judgment…").
@@ -106,7 +109,7 @@ _CHAT_COMMENTARY_RE = re.compile(
     # it does not eat "Here is the text of the resolution adopted by the board."
     r"|here(?:['’]s|\s+is)\s+the\s+(?:text|transcription)"
     r"(?:\s+(?:of|from|in|on)\s+the\s+(?:image|picture|photo|scan|page|document))?\s*:?\s*$"
-    r"|wait,?\s+(?:let\s+me|the\s+text|i['’]ll|i['’]m|here)\b"
+    r"|wait,?\s+(?:let\s+me|the\s+text|the\s+word|i['’]ll|i['’]m|here)\b"
     r"|it['’]s:\s*$"                              # bare "It's:"
     r")",
     re.IGNORECASE,
