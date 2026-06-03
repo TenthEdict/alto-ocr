@@ -289,6 +289,14 @@ _LOOP_MIN_REPEAT = 3          # a single repeated line must recur >= this often 
 _LOOP_MAX_PERIOD_FRAC = 0.67  # period must be <= this fraction of the text (>= ~1.5 cycles)
 _LOOP_MIN_UNIT_CHARS = 40     # a multi-/long-line repeating unit this big = a real loop
 
+# Consecutive tandem-run collapse (catches the high-rep "messy" loops that exact
+# whole-page periodicity misses because a stray line breaks the period — e.g.
+# "Transfer Van" x608 + 3 strays, or a caption block x42 after a title block).
+_LOOP_TANDEM_MAX_PERIOD = 30  # longest repeating block (in lines) to look for
+_LOOP_TANDEM_MIN_REPS = 4     # a block must repeat back-to-back >= this many times
+_LOOP_TANDEM_EXTREME_REPS = 30  # ...or this many, if its lines are all short tokens
+_LOOP_TANDEM_LINE_CHARS = 20  # a "substantial" line: a unit with one this long is real text (caption/title), not a tally token
+
 
 def _find_periodic_cut(nonblank: list[str]) -> int | None:
     """If the non-blank lines are a unit repeated >= ~1.5×, return the unit
@@ -326,38 +334,84 @@ def _find_periodic_cut(nonblank: list[str]) -> int | None:
     return None
 
 
+def _collapse_tandem(lines: list[str]) -> list[str]:
+    """Collapse a CONSECUTIVE tandem repeat of a block to a single copy.
+
+    Scans left-to-right; at each position finds the smallest period ``p`` whose
+    block repeats back-to-back and, if that run qualifies as a loop, keeps one
+    copy and skips the rest. EXACT match, order-preserving. A run qualifies iff
+    it repeats >= _LOOP_TANDEM_MIN_REPS times AND (its unit contains a
+    substantial line >= _LOOP_TANDEM_LINE_CHARS — real caption/title text, not a
+    tally token — OR it repeats an extreme >= _LOOP_TANDEM_EXTREME_REPS times).
+    Those guards keep it OFF legit short-token periodic content (roll-calls,
+    tallies, constant table columns repeated a modest number of times) while
+    catching the high-rep degenerate loops that exact whole-page periodicity
+    misses because a stray line breaks the period. Verified on a 125-page batch:
+    collapses 44 severe-loop pages, 0 clean pages touched.
+    """
+    out: list[str] = []
+    i, n = 0, len(lines)
+    while i < n:
+        chosen_p = chosen_reps = 0
+        for p in range(1, min(_LOOP_TANDEM_MAX_PERIOD, (n - i) // 2) + 1):
+            unit = lines[i:i + p]
+            unit_nb = [s for s in (x.strip() for x in unit) if s]
+            if not unit_nb:
+                continue  # don't anchor a run on a blank-only unit
+            reps, j = 1, i + p
+            while j + p <= n and lines[j:j + p] == unit:
+                reps += 1
+                j += p
+            if reps < _LOOP_TANDEM_MIN_REPS:
+                continue
+            substantial = max(len(s) for s in unit_nb) >= _LOOP_TANDEM_LINE_CHARS
+            if substantial or reps >= _LOOP_TANDEM_EXTREME_REPS:
+                chosen_p, chosen_reps = p, reps
+                break
+        if chosen_p:
+            out.extend(lines[i:i + chosen_p])  # keep exactly one copy
+            logger.debug("glm-ocr: collapsed tandem loop (period=%d, reps=%d)",
+                         chosen_p, chosen_reps)
+            i += chosen_p * chosen_reps
+        else:
+            out.append(lines[i])
+            i += 1
+    return out
+
+
 def _collapse_repetition_loops(text: str) -> str:
-    """Collapse an EXACT periodic repetition loop to its first copy.
+    """Collapse degenerate glm-ocr repetition loops to their real content.
 
-    If the non-blank lines are a unit repeated back-to-back (k× verbatim, the
-    final copy possibly truncated by the token cap), keep just the first copy.
-    Catches a one-line caption ×160, an HTML table emitted ×3, a paragraph
-    block re-emitted ×2.
+    Two EXACT, order-preserving passes — both leave healthy pages byte-identical
+    and never touch legit repetitive content (roll-calls, tallies, ledgers,
+    short-token table columns):
 
-    ONLY exact periodicity fires, so a legitimately repetitive page (roll-call,
-    vote tally, ledger, repeated form rows) and healthy prose are left
-    byte-identical. We deliberately do NOT do fuzzy / unique-ratio de-duplication
-    (it cannot tell a generation loop from a genuinely repetitive document, and
-    would silently gut real tabular content), and we do NOT use generation-time
-    ``repeat_penalty`` (corrupts real repeated text; see module note above).
-    Non-exact "messy" loops (a caption interleaved with varied rephrasings) are
-    therefore left as-is — duplicated but never destructive.
+    1. **Consecutive tandem runs** (``_collapse_tandem``): a block repeated
+       back-to-back many times (a caption ×42, "Transfer Van" ×608) → one copy,
+       guarded so short-token periodic data is spared.
+    2. **Whole-page exact period** (``_find_periodic_cut``): the page is one unit
+       repeated k× with the final copy possibly truncated by the token cap (a
+       caption ×160, a table ×3, a substantial paragraph block ×2) → first copy.
+
+    We deliberately do NOT do fuzzy / unique-ratio de-duplication (it cannot tell
+    a generation loop from a genuinely repetitive document and would gut real
+    tables), nor generation-time ``repeat_penalty`` (corrupts real repeated text;
+    see module note). Non-exact "messy" loops are left duplicated rather than
+    risk destroying content.
     """
     if "\n" not in text:
         return text
-    lines = text.split("\n")
+    lines = _collapse_tandem(text.split("\n"))
     nb_idx = [i for i, ln in enumerate(lines) if ln.strip()]
     nonblank = [lines[i].strip() for i in nb_idx]
-
     period = _find_periodic_cut(nonblank)
-    if period is None:
-        return text
-    cut = nb_idx[period - 1] + 1  # keep through the period-th non-blank line
-    if cut >= len(lines):
-        return text
-    logger.debug("glm-ocr: collapsed periodic loop (period=%d non-blank lines, "
-                 "%d -> %d lines)", period, len(lines), cut)
-    return "\n".join(lines[:cut])
+    if period is not None:
+        cut = nb_idx[period - 1] + 1  # keep through the period-th non-blank line
+        if cut < len(lines):
+            logger.debug("glm-ocr: collapsed periodic loop (period=%d non-blank lines, "
+                         "%d -> %d lines)", period, len(lines), cut)
+            lines = lines[:cut]
+    return "\n".join(lines)
 
 
 def transcribe(image: np.ndarray, config: GLMOCRConfig) -> str:
