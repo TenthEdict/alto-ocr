@@ -12,6 +12,7 @@ Run from the repo root (so ``src.alto_ocr`` resolves):
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -21,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.alto_ocr.glmocr import (  # noqa: E402
     _CHAT_COMMENTARY_RE,
     _collapse_repetition_loops,
+    _collapse_tandem,
     _strip_chat_commentary,
 )
 
@@ -150,6 +152,44 @@ class LoopCollapseTests(unittest.TestCase):
         trunc = (self.SUB_BLOCK + "\n" + self.SUB_BLOCK + "\n"
                  + "Notice of the annual stockholders meeting of the company.")
         self.assertEqual(_collapse_repetition_loops(trunc), self.SUB_BLOCK)
+
+
+class CollapseTandemTests(unittest.TestCase):
+    """#14: the strip-once refactor must not change _collapse_tandem behavior."""
+
+    def test_substantial_block_back_to_back_collapses_to_one(self):
+        line = "Transfer Van Department Ledger"  # 30 chars -> "substantial"
+        out = _collapse_tandem([line] * 5 + ["Grand total carried forward"])
+        self.assertEqual(out, [line, "Grand total carried forward"])
+
+    def test_short_token_rows_are_preserved(self):
+        # short tokens repeated a modest number of times are NOT a loop signature
+        lines = ["0 0 0"] * 4 + ["1 2 3"]
+        self.assertEqual(_collapse_tandem(lines), lines)
+
+    def test_blank_only_unit_does_not_anchor_a_run(self):
+        lines = ["", "", "", "", "real line"]
+        self.assertEqual(_collapse_tandem(lines), lines)
+
+
+class DependencyFreeImportTests(unittest.TestCase):
+    """#11: the canary regex lives in _util so the QA script imports it without
+    pulling in the engine's cv2/numpy. Verified in a CLEAN interpreter (the suite
+    itself imports glmocr, so cv2 is already loaded in-process)."""
+
+    def test_util_import_does_not_pull_cv2_or_numpy(self):
+        repo_root = Path(__file__).resolve().parent.parent
+        code = (
+            "import sys, src.alto_ocr._util as u;"
+            "assert u._CHAT_COMMENTARY_RE is not None;"
+            "assert 'cv2' not in sys.modules, 'cv2 leaked';"
+            "assert 'numpy' not in sys.modules, 'numpy leaked';"
+            "print('ok')"
+        )
+        r = subprocess.run([sys.executable, "-c", code], cwd=repo_root,
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("ok", r.stdout)
 
 
 if __name__ == "__main__":

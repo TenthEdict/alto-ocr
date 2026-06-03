@@ -38,18 +38,20 @@ import argparse
 import csv
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 
 # Allow running as `python scripts/scan_output.py` from the repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# Imported ONLY as a regression canary: lines matching the engine's own
-# stripper that are STILL present mean the strip wasn't applied (stale output
-# or a bug) — on current-engine output this is 0 by construction. New/leaked
-# commentary is surfaced by the INDEPENDENT, broader _COMMENTARY_HINTS below,
-# NOT by this regex (which would be tautological for that purpose).
-from src.alto_ocr._util import force_utf8_output  # noqa: E402
-from src.alto_ocr.glmocr import _CHAT_COMMENTARY_RE  # noqa: E402
+# _CHAT_COMMENTARY_RE is imported ONLY as a regression canary: lines matching
+# the engine's own stripper that are STILL present mean the strip wasn't applied
+# (stale output or a bug) — on current-engine output this is 0 by construction.
+# New/leaked commentary is surfaced by the INDEPENDENT, broader _COMMENTARY_HINTS
+# below, NOT by this regex (which would be tautological for that purpose). Both
+# imports come from ._util (stdlib-only) so this QA script stays dependency-free
+# — importing it does NOT pull in the engine's cv2/numpy.
+from src.alto_ocr._util import _CHAT_COMMENTARY_RE, force_utf8_output  # noqa: E402
 
 # Robust UTF-8 stdout/stderr (errors='replace' + Windows code page), shared
 # with the CLI — OCR text (½, —, CJK) would otherwise crash prints on cp1252.
@@ -124,6 +126,7 @@ def _candidate_commentary(text: str) -> list[str]:
 def scan_page(path: Path) -> dict:
     text = path.read_text(encoding="utf-8", errors="replace")
     nb = _nonblank(text)
+    uniq = _unique_ratio(nb)  # computed once; used by both "uniq" and the "dup" flag
     # Regression canary: lines the CURRENT engine stripper matches but are still
     # present -> the strip wasn't applied (stale output / bug). 0 on fresh output.
     leaked = [ln.strip() for ln in text.split("\n") if _CHAT_COMMENTARY_RE.match(ln)]
@@ -132,13 +135,12 @@ def scan_page(path: Path) -> dict:
         "ref_id": path.parent.parent.name,
         "bytes": len(text),
         "lines": len(nb),
-        "uniq": _unique_ratio(nb),
-        "text": text,
+        "uniq": uniq,
         "flags": {
             "leaked": leaked,                          # LEAK / exit-1 signal (expect 0)
             "candidate": _candidate_commentary(text),  # review candidates (independent, broad)
             # Known limitations / info (never affect exit code)
-            "dup": len(nb) >= _DUP_MIN_LINES and _unique_ratio(nb) < _DUP_RATIO,
+            "dup": len(nb) >= _DUP_MIN_LINES and uniq < _DUP_RATIO,
             "cjk": _has_cjk_hallucination(text),
             "empty": not text.strip(),
         },
@@ -202,11 +204,15 @@ def main(argv: list[str] | None = None) -> int:
         except (json.JSONDecodeError, KeyError, TypeError) as e:
             print(f"  summary.json present but unreadable: {e}")
 
-    # ALTO/Text count alignment per Ref ID (stems should match 1:1)
+    # ALTO/Text count alignment per Ref ID (stems should match 1:1). Derived from
+    # the txts/altos lists already globbed above — no re-glob per Ref ID, which
+    # would be 2*len(ref_ids) extra directory scans on the SMB-mounted tree.
+    text_counts = Counter(p.parent.parent.name for p in txts)
+    alto_counts = Counter(p.parent.parent.name for p in altos)
     mismatches = []
     for rid in ref_ids:
-        na = len(list((root / rid / "ALTO").glob("*.xml")))
-        nt = len(list((root / rid / "Text").glob("*.txt")))
+        na = alto_counts.get(rid, 0)
+        nt = text_counts.get(rid, 0)
         if na != nt:
             mismatches.append((rid, na, nt))
     if mismatches:

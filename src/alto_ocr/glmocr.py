@@ -31,13 +31,17 @@ import base64
 import json
 import logging
 import os
-import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
 import cv2
 import numpy as np
+
+# _CHAT_COMMENTARY_RE lives in ._util (stdlib-only) so the QA script can import
+# it as a regression canary without pulling in this module's cv2/numpy. Its full
+# precision-first design rationale is documented there.
+from ._util import _CHAT_COMMENTARY_RE
 
 logger = logging.getLogger(__name__)
 
@@ -146,73 +150,6 @@ def _looks_like_image_description(text: str) -> bool:
         if any(rest.startswith(p) for p in _IMAGE_DESCRIPTION_LEADS):
             return True
     return False
-
-
-# Chat-style commentary glm-ocr appends AFTER (or interleaves with) a real
-# transcription — a separate, more pervasive failure than the whole-page
-# descriptions ``_looks_like_image_description`` catches. Observed on MSA00005
-# front-matter / photo / title / cover pages: the model transcribes the page,
-# then adds meta lines like "The image is a title page…", "The text in the
-# image reads: …" (re-quoting the real text — the source of the duplicate
-# content), "The text provided does not contain…", "Wait, let me re-read…",
-# "I'll just output the text." We delete such lines, keeping everything else
-# (so interleaved real text survives).
-#
-# PRECISION-FIRST (this is line-DELETION applied to an accepted transcript, so
-# a false match silently loses real content across ALL collections). The
-# patterns are therefore restricted to phrasings that are genuinely model-voice
-# and do NOT collide with ordinary archival prose:
-#   * "The image …" — the model's own word for the SCAN; real captions say
-#     "the photograph/figure/the photo at right", so we deliberately do NOT
-#     match photograph/photo/picture/illustration/etc. (those occur in real
-#     captions, e.g. "The photograph shows the 1923 class.").
-#   * "the text in the image / the text provided / the text is clear|legible|
-#     as follows|a description / the text reads:|states: (colon-anchored, the
-#     model's re-quote form) / the text on the image|page|scan …" — meta about
-#     the scan that documents never write. We do NOT match bare "the text is a
-#     <noun>" ("The text is a binding contract."), "the text reads, in part …",
-#     "the text states that …", "the text on the monument …" (inscription /
-#     caption prose), "the text mentions/describes/…", or "the document is
-#     about …" (all real prose).
-#   * Self-talk: "I'll output/transcribe/re-read", "I'm unable/sorry", "let me
-#     re-read/re-examine", "here's the text[:]" (bare/colon-anchored lead-in),
-#     "Wait, <let me|the text|I'll|…>", bare "It's:". We do NOT match "I will
-#     provide/use …", "Here is the text of the <document> …", bare "wait,/okay,/
-#     sorry,/unfortunately,", "I cannot/can't", or "let me check/look/try" (all
-#     occur in real letters, speeches, minutes).
-# Apostrophes accept both ASCII ' (U+0027) and curly ’ (U+2019) — glm-ocr emits
-# the curly form. KNOWN RESIDUAL: a real line literally starting "The image
-# is/shows …" is still stripped (uncommon — documents rarely open a line that
-# way); a fully-stripped page is logged at INFO so it can be spot-checked.
-_CHAT_COMMENTARY_RE = re.compile(
-    r"^\s*(?:"
-    # "The image is/shows/…" — model's word for the scan itself (NOT photograph/picture/…).
-    r"(?:the|this)\s+image\s+(?:is|was|shows?|depicts?|appears?|contains?|displays?|presents?|features?|portrays?|seems?|provides?)\b"
-    r"|(?:the|this)\s+image\s*$"                       # bare "The image" fragment
-    # Meta about "the text"/scan — phrasings real documents do not use. The
-    # reads/states/on-the arms are NARROWED to the model's re-quote form (a
-    # trailing colon / "as follows", or a scan-referent noun) so they no longer
-    # eat real prose like "The text reads, in part …", "The text states that …",
-    # or inscription captions "The text on the monument …".
-    r"|the\s+text\s+(?:provided\b|in\s+the\s+(?:image|picture|photo|document|page)\b"
-    r"|on\s+the\s+(?:image|picture|photo|scan|page|document)\b"
-    r"|reads?(?:\s*:|\s+as\s+follows)|states?(?:\s*:|\s+as\s+follows)|is:"
-    r"|is\s+(?:clear|clearly|legible|illegible|as\s+follows|a\s+description|a\s+transcription)\b)"
-    # Model self-talk / refusals (kept specific to avoid real first-person prose).
-    # Dropped "provide"/"use" — they collide with ordinary letter/minutes prose
-    # ("I will provide a full accounting…", "I will use my best judgment…").
-    r"|i(?:['’]ll|\s+will)\s+(?:just\s+)?(?:output|transcribe|re-?read)\b"
-    r"|i(?:['’]m|\s+am)\s+(?:unable|sorry)\b"
-    r"|let\s+me\s+re-?(?:read|examine)\b"
-    # "Here is the text[:]" lead-in — anchored to a bare/colon-terminated form so
-    # it does not eat "Here is the text of the resolution adopted by the board."
-    r"|here(?:['’]s|\s+is)\s+the\s+(?:text|transcription)"
-    r"(?:\s+(?:of|from|in|on)\s+the\s+(?:image|picture|photo|scan|page|document))?\s*:?\s*$"
-    r"|wait,?\s+(?:let\s+me|the\s+text|i['’]ll|i['’]m|here)\b"
-    r"|it['’]s:\s*$"                              # bare "It's:"
-    r")",
-    re.IGNORECASE,
-)
 
 
 def _strip_chat_commentary(text: str) -> str:
@@ -371,11 +308,12 @@ def _collapse_tandem(lines: list[str]) -> list[str]:
     """
     out: list[str] = []
     i, n = 0, len(lines)
+    stripped = [ln.strip() for ln in lines]  # strip once, not per (i, p) window
     while i < n:
         chosen_p = chosen_reps = 0
         for p in range(1, min(_LOOP_TANDEM_MAX_PERIOD, (n - i) // 2) + 1):
             unit = lines[i:i + p]
-            unit_nb = [s for s in (x.strip() for x in unit) if s]
+            unit_nb = [s for s in stripped[i:i + p] if s]
             if not unit_nb:
                 continue  # don't anchor a run on a blank-only unit
             reps, j = 1, i + p
@@ -493,8 +431,6 @@ def transcribe(image: np.ndarray, config: GLMOCRConfig) -> str:
         )
         return ""
 
-    raw_len = len(text)
-
     # Strip chat-style commentary the model appends/interleaves after a real
     # transcription ("The image shows…", "The text reads: …", "Wait, …"), then
     # collapse any exact repetition loop. Both no-op on clean pages. Order is
@@ -504,22 +440,25 @@ def transcribe(image: np.ndarray, config: GLMOCRConfig) -> str:
     text = _strip_chat_commentary(text)
     if not text:
         return ""
+    pre_collapse_len = len(text)
     text = _collapse_repetition_loops(text)
 
     # A non-"stop" finish (reason=length) is only worth warning about when it
-    # truncated REAL content. If the output collapsed sharply, the page was
-    # looping and the truncation was benign (raising --glmocr-num-predict would
-    # just generate more loop) — so only warn when the kept text is still large.
+    # truncated REAL content. Measure shrink against the POST-strip length, NOT
+    # the raw length: commentary removal is orthogonal to truncation, so only a
+    # sharp LOOP collapse means the truncation was benign (raising
+    # --glmocr-num-predict would just generate more loop). Gating on the raw
+    # length would let heavy commentary-stripping mask a real truncation.
     done_reason = payload.get("done_reason")
     if done_reason and done_reason != "stop":
-        if len(text) >= raw_len * 0.5:
+        if len(text) >= pre_collapse_len * 0.5:
             logger.warning("glm-ocr stopped with reason=%s; kept %d chars may be "
                            "truncated — consider raising --glmocr-num-predict",
                            done_reason, len(text))
         else:
             logger.debug("glm-ocr stopped with reason=%s but output collapsed %d->%d "
                          "chars (looping page; truncation benign)",
-                         done_reason, raw_len, len(text))
+                         done_reason, pre_collapse_len, len(text))
     return text
 
 
