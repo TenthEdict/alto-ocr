@@ -194,7 +194,11 @@ def main(argv: list[str] | None = None) -> int:
                   f"failed_pages={s.get('failed_page_total')}")
             for r in s.get("ref_ids", []):
                 if not r.get("ok"):
-                    print(f"    [!] NOT OK: {r['ref_id']} ({len(r.get('failed_pages', []))} failed page(s))")
+                    # Prefer failed_page_count (counts all unproduced pages of an
+                    # aborted Ref ID); fall back to the detail-list length for
+                    # summaries written before that field existed.
+                    nfailed = r.get("failed_page_count", len(r.get("failed_pages", [])))
+                    print(f"    [!] NOT OK: {r['ref_id']} ({nfailed} failed page(s))")
         except (json.JSONDecodeError, KeyError, TypeError) as e:
             print(f"  summary.json present but unreadable: {e}")
 

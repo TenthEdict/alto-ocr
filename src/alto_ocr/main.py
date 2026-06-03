@@ -114,13 +114,17 @@ def _summary_dict(results: list[RefIdResult]) -> dict:
     return {
         "ref_id_count": len(results),
         "ok_count": sum(1 for r in results if r.ok),
-        "failed_page_total": sum(len(r.failed_pages) for r in results),
+        "failed_page_total": sum(r.failed_page_count for r in results),
         "ref_ids": [
             {
                 "ref_id": r.ref_id,
                 "output_dir": str(r.output_dir),
                 "ok": r.ok,
                 "page_count": r.page_count,
+                # failed_page_count == page_count for an aborted Ref ID (all
+                # pages unproduced); the failed_pages list below still carries a
+                # single descriptive error, so the two can legitimately differ.
+                "failed_page_count": r.failed_page_count,
                 "failed_pages": [
                     {"stem": p.stem, "order": p.order, "error": p.error}
                     for p in r.failed_pages
@@ -138,7 +142,7 @@ def _print_summary(results: list[RefIdResult]) -> None:
     table.add_column("Failed", justify="right")
     table.add_column("Output")
     for r in results:
-        failed = len(r.failed_pages)
+        failed = r.failed_page_count
         style = "red" if failed else "green"
         table.add_row(
             r.ref_id,
@@ -301,10 +305,51 @@ def _failed_ref_result(inputs, output_root: Path, exc: BaseException) -> RefIdRe
 def _record_ref_failure(results: list[RefIdResult], inputs, output_root: Path,
                         exc: BaseException) -> None:
     """Log a Ref-ID-level failure (with traceback) and append a synthetic failed
-    result so the batch continues. Shared by the single-worker and pool paths."""
-    logger.exception("[%s] Ref ID aborted (recorded as failed, continuing): %s",
-                     inputs.ref_id, exc)
+    result so the batch continues. Shared by the single-worker and pool paths.
+
+    Uses ``exc_info=exc`` (not bare ``logger.exception``) so the *passed*
+    exception's traceback is logged even when called outside its except block —
+    the pool-recovery path records errors while handling a BrokenProcessPool."""
+    logger.error("[%s] Ref ID aborted (recorded as failed, continuing): %s",
+                 inputs.ref_id, exc, exc_info=exc)
     results.append(_failed_ref_result(inputs, output_root, exc))
+
+
+def _classify_broken_pool_futures(futures: dict, harvested_ids: set) -> tuple[list, list, list]:
+    """Partition the not-yet-harvested pool futures after a BrokenProcessPool.
+
+    A BrokenProcessPool marks *every* still-pending future broken, but a future
+    can be DONE with a real result (its ALTO/Text/METS already written to disk by
+    process_ref_id) yet simply not have been yielded by ``as_completed`` when the
+    break fired. Harvesting those is what stops a fully-OCR'd object from being
+    falsely reported failed and needlessly re-run. Returns three lists:
+
+      * ``completed`` — RefIdResults from futures that genuinely finished; keep.
+      * ``failed`` — ``(inputs, exc)`` for futures that raised a *real* per-Ref-ID
+        error (something other than the pool death); record as failed.
+      * ``not_run`` — inputs whose future produced no result (pending, running,
+        cancelled, or killed by the pool death); must be re-run.
+
+    Skips any future whose Ref ID is already in ``harvested_ids`` (i.e. yielded
+    by ``as_completed`` before the break).
+    """
+    completed: list = []
+    failed: list = []
+    not_run: list = []
+    for fut, inputs in futures.items():
+        if inputs.ref_id in harvested_ids:
+            continue
+        if fut.done() and not fut.cancelled():
+            try:
+                completed.append(fut.result())  # finished before the pool broke
+                continue
+            except BrokenProcessPool:
+                pass  # this future was killed by the pool death -> re-run
+            except Exception as exc:  # noqa: BLE001 - a real per-Ref-ID error
+                failed.append((inputs, exc))
+                continue
+        not_run.append(inputs)  # pending / running / cancelled -> re-run
+    return completed, failed, not_run
 
 
 @app.command()
@@ -399,23 +444,32 @@ def batch(
                     results.append(fut.result())
                 except BrokenProcessPool:
                     # The POOL itself died (a worker crashed / was OOM-killed),
-                    # not a single bad object. Every still-pending future will
-                    # raise this, so DON'T fabricate a per-object failure for
-                    # each — record the un-run Ref IDs with a clear "pool died,
-                    # re-run" reason and stop. (Distinct from the per-Ref-ID
-                    # isolation below, which is for one bad object.)
-                    done = {r.ref_id for r in results}
-                    not_run = [futures[f] for f in futures if futures[f].ref_id not in done]
-                    logger.error("Worker pool died (a worker likely crashed or was OOM-killed). "
-                                 "%d Ref ID(s) did NOT run and must be re-run: %s",
-                                 len(not_run), ", ".join(ri.ref_id for ri in not_run))
-                    console.print(f"[red]FATAL: worker pool died — {len(not_run)} Ref ID(s) not "
-                                  f"processed; re-run them (lower --workers if it recurs).[/red]")
-                    for ri in not_run:
-                        results.append(_failed_ref_result(
-                            ri, output_root,
-                            RuntimeError("worker pool died before this Ref ID was processed "
-                                         "(not OCR'd) — re-run it")))
+                    # not a single bad object. Every still-pending future raises
+                    # this — but some may have ALREADY finished and written their
+                    # output before the break, so harvest those instead of
+                    # blanket-failing them (a finished object must not be flagged
+                    # failed and needlessly re-run). Then record the genuinely
+                    # un-run Ref IDs with a clear "pool died, re-run" reason and
+                    # stop. (Distinct from the per-Ref-ID isolation below.)
+                    harvested = {r.ref_id for r in results}
+                    completed, failed, not_run = _classify_broken_pool_futures(futures, harvested)
+                    results.extend(completed)
+                    for ri, exc in failed:
+                        _record_ref_failure(results, ri, output_root, exc)
+                    if not_run:
+                        logger.error("Worker pool died (a worker likely crashed or was OOM-killed). "
+                                     "%d Ref ID(s) did NOT run and must be re-run: %s",
+                                     len(not_run), ", ".join(ri.ref_id for ri in not_run))
+                        console.print(f"[red]FATAL: worker pool died — {len(not_run)} Ref ID(s) not "
+                                      f"processed; re-run them (lower --workers if it recurs).[/red]")
+                        for ri in not_run:
+                            results.append(_failed_ref_result(
+                                ri, output_root,
+                                RuntimeError("worker pool died before this Ref ID was processed "
+                                             "(not OCR'd) — re-run it")))
+                    else:
+                        logger.warning("Worker pool reported broken, but all Ref IDs had already "
+                                       "completed or been recorded; nothing to re-run.")
                     break
                 except Exception as e:  # noqa: BLE001 - isolate per-Ref-ID failures
                     _record_ref_failure(results, inputs, output_root, e)

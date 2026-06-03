@@ -187,6 +187,17 @@ class RefIdResult:
         return [p for p in self.pages if not p.ok]
 
     @property
+    def failed_page_count(self) -> int:
+        # When a whole Ref ID aborted, ALL of its expected input pages went
+        # unproduced even though a single synthetic PageResult carries the
+        # error — so the failed count is the full page_count, not 1. On a
+        # normally-processed Ref ID this is just len(failed_pages). Keeps
+        # "succeeded = page_count - failed_page_count" true on both paths.
+        if self.expected_page_count is not None:
+            return self.expected_page_count
+        return len(self.failed_pages)
+
+    @property
     def ok(self) -> bool:
         return bool(self.pages) and not self.failed_pages
 
