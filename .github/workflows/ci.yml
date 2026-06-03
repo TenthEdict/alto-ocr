@@ -1,9 +1,19 @@
 name: CI
 
-# Quick test CI: runs the stdlib-unittest suite on both supported platforms
-# (Windows + Linux is a load-bearing requirement — see CLAUDE.md). The suite is
-# pure logic (text cleanup, loop collapse, batch accounting) and needs neither
-# Tesseract nor a running Ollama, so it stays fast.
+# Test CI for github.itap.purdue.edu (Purdue's GitHub Enterprise Server).
+#
+# An Enterprise Server has NO GitHub-hosted runners (there is no ubuntu-latest /
+# windows-latest to borrow), so this job targets a SELF-HOSTED runner you
+# register under: repo -> Settings -> Actions -> Runners -> "New self-hosted
+# runner". Until a runner is online, runs sit in "Queued" — that is expected,
+# not an error. The runner just needs Python 3.12 + pip on PATH; the suite is
+# pure logic (no Tesseract, no Ollama), so it stays fast.
+#
+# Cross-platform (Windows + Linux) is load-bearing for this tool (see
+# CLAUDE.md). A single runner only covers its own OS; the pre-push hook
+# (scripts/hooks/pre-push) covers whichever OS you push from. To get both in CI,
+# register a second runner on the other OS and turn `runs-on` into a matrix of
+# their labels.
 
 on:
   push:
@@ -19,22 +29,13 @@ concurrency:
 
 jobs:
   test:
-    name: tests (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-        python-version: ["3.12"]
+    name: tests (self-hosted)
+    runs-on: [self-hosted]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-          cache-dependency-path: requirements.txt
+      - name: Show Python version
+        run: python --version
 
       - name: Install runtime dependencies
         run: |

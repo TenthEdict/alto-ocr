@@ -1,0 +1,29 @@
+#!/bin/sh
+# Pre-push hook — run the test suite before every push; block the push on
+# failure. Pure-stdlib unittest, so it's quick (no Tesseract/Ollama needed).
+#
+# ENABLE (once per clone):   git config core.hooksPath scripts/hooks
+# BYPASS (emergencies only):  git push --no-verify
+#
+# Runs from the repo top-level (git invokes hooks there), so the relative
+# discover path resolves correctly. Cross-platform: git runs hooks via sh on
+# both Linux/WSL and Git-for-Windows.
+
+if command -v python >/dev/null 2>&1; then
+    PY=python
+elif command -v python3 >/dev/null 2>&1; then
+    PY=python3
+else
+    echo "pre-push: no python on PATH; skipping tests (push allowed)." >&2
+    exit 0
+fi
+
+echo "pre-push: running test suite ($PY -m unittest discover -s tests)..."
+if "$PY" -m unittest discover -s tests; then
+    echo "pre-push: tests passed — pushing."
+    exit 0
+else
+    echo "pre-push: TESTS FAILED — push aborted." >&2
+    echo "          Fix the failures, or override once with: git push --no-verify" >&2
+    exit 1
+fi
