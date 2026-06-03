@@ -29,6 +29,7 @@ from .ocr import (
     find_tesseract,
 )
 from .pipeline import PageProgressLogger, PageResult, RefIdResult, process_ref_id
+from ._util import force_utf8_output
 from .preprocess import PreprocessConfig
 from .walker import _natural_key, discover_collection, discover_ref_id
 
@@ -40,42 +41,8 @@ app = typer.Typer(
 )
 
 
-def _force_utf8_output() -> None:
-    """Make stdout/stderr tolerate non-ASCII output on Windows consoles.
-
-    Rich (the logging handler + the summary ``Table``) and a handful of log
-    lines emit characters — ``->`` rendered as ``→``, ``←``, em
-    dashes — that the legacy Windows cp1252 console codec can't encode,
-    which otherwise crashes the CLI at the summary step (observed under
-    redirected output). Reconfigure the streams to UTF-8 with a lenient
-    error handler, and on Windows switch the console output code page to
-    UTF-8 so Rich's legacy-console renderer (which encodes via the code
-    page, not the Python stream) succeeds too.
-
-    All best-effort: every step is guarded so a locked-down environment
-    can't stop the tool from running. No-op on POSIX, where stdout is
-    already UTF-8.
-    """
-    for stream in (sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure is not None:
-            try:
-                reconfigure(encoding="utf-8", errors="replace")
-            except (OSError, ValueError):
-                pass
-    if sys.platform == "win32":
-        try:
-            import ctypes
-
-            # 65001 = CP_UTF8. Output code page only; leave the input code
-            # page alone so console input handling is unaffected.
-            ctypes.windll.kernel32.SetConsoleOutputCP(65001)
-        except Exception:  # best effort; never fatal
-            pass
-
-
 # Run before constructing the Console so Rich picks up the UTF-8 code page.
-_force_utf8_output()
+force_utf8_output()
 console = Console()
 logger = logging.getLogger(__name__)
 
@@ -331,6 +298,15 @@ def _failed_ref_result(inputs, output_root: Path, exc: BaseException) -> RefIdRe
     )
 
 
+def _record_ref_failure(results: list[RefIdResult], inputs, output_root: Path,
+                        exc: BaseException) -> None:
+    """Log a Ref-ID-level failure (with traceback) and append a synthetic failed
+    result so the batch continues. Shared by the single-worker and pool paths."""
+    logger.exception("[%s] Ref ID aborted (recorded as failed, continuing): %s",
+                     inputs.ref_id, exc)
+    results.append(_failed_ref_result(inputs, output_root, exc))
+
+
 @app.command()
 def batch(
     collection_dir: Path = typer.Argument(..., exists=True, file_okay=False, dir_okay=True,
@@ -404,9 +380,7 @@ def batch(
                     on_page_done=progress.tick,
                 ))
             except Exception as e:  # noqa: BLE001 - one bad Ref ID must not abort the batch
-                logger.exception("[%s] Ref ID aborted (recorded as failed, continuing): %s",
-                                 inputs.ref_id, e)
-                results.append(_failed_ref_result(inputs, output_root, e))
+                _record_ref_failure(results, inputs, output_root, e)
     else:
         payloads = [
             (inputs, output_root, engine_obj, cfg,
@@ -444,9 +418,7 @@ def batch(
                                          "(not OCR'd) — re-run it")))
                     break
                 except Exception as e:  # noqa: BLE001 - isolate per-Ref-ID failures
-                    logger.exception("[%s] Ref ID aborted (recorded as failed, continuing): %s",
-                                     inputs.ref_id, e)
-                    results.append(_failed_ref_result(inputs, output_root, e))
+                    _record_ref_failure(results, inputs, output_root, e)
         results.sort(key=lambda r: r.ref_id)
 
     _print_summary(results)

@@ -300,6 +300,11 @@ def _find_periodic_cut(nonblank: list[str]) -> int | None:
     multi-line block (or one long line) repeating back-to-back is a generation
     loop, never real prose — so we keep one copy. Short single-line periods
     need >= _LOOP_MIN_REPEAT full cycles so legit twice-repeated rows survive.
+
+    LIMITATION (deliberate): a *short* repeating unit (< _LOOP_MIN_UNIT_CHARS,
+    multi-line) is NOT collapsed — short repeated rows (tallies, ledgers,
+    "0 0 0") are far more often legitimate content than a loop, so a tiny block
+    emitted ~2× is left duplicated rather than risk gutting real tabular data.
     """
     L = len(nonblank)
     if L < 2:

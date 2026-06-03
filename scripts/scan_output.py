@@ -48,14 +48,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # or a bug) — on current-engine output this is 0 by construction. New/leaked
 # commentary is surfaced by the INDEPENDENT, broader _COMMENTARY_HINTS below,
 # NOT by this regex (which would be tautological for that purpose).
+from src.alto_ocr._util import force_utf8_output  # noqa: E402
 from src.alto_ocr.glmocr import _CHAT_COMMENTARY_RE  # noqa: E402
 
-# Windows consoles default to cp1252; OCR text (½, —, CJK) would crash prints.
-try:
-    sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
-except (AttributeError, ValueError):  # pragma: no cover - non-reconfigurable stream
-    pass
+# Robust UTF-8 stdout/stderr (errors='replace' + Windows code page), shared
+# with the CLI — OCR text (½, —, CJK) would otherwise crash prints on cp1252.
+force_utf8_output()
 
+# This script is intentionally engine-INDEPENDENT (see _COMMENTARY_HINTS): these
+# thresholds are its OWN duplicate-heavy heuristic for triage, NOT a mirror of
+# any engine constant, so they don't drift when engine tuning changes.
 _DUP_RATIO = 0.6   # unique/total non-blank lines below this (multi-line page) = duplicate-heavy
 _DUP_MIN_LINES = 8
 
