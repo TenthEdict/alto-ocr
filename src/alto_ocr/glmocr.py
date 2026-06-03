@@ -167,15 +167,19 @@ def _looks_like_image_description(text: str) -> bool:
 #     match photograph/photo/picture/illustration/etc. (those occur in real
 #     captions, e.g. "The photograph shows the 1923 class.").
 #   * "the text in the image / the text provided / the text is clear|legible|
-#     as follows|a description / the text reads|states / the text on the …" —
-#     meta about the scan that documents never write. We do NOT match bare
-#     "the text is a <noun>" ("The text is a binding contract."), "the text
-#     mentions/describes/…", or "the document is about …" (all real prose).
-#   * Self-talk: "I'll output/transcribe/use", "I'm unable/sorry", "let me
-#     re-read/re-examine", "here's the text", "Wait, <let me|the text|I'll|…>",
-#     bare "It's:". We do NOT match bare "wait,/okay,/sorry,/unfortunately,",
-#     "I cannot/can't", or "let me check/look/try" (all occur in real letters,
-#     speeches, minutes).
+#     as follows|a description / the text reads:|states: (colon-anchored, the
+#     model's re-quote form) / the text on the image|page|scan …" — meta about
+#     the scan that documents never write. We do NOT match bare "the text is a
+#     <noun>" ("The text is a binding contract."), "the text reads, in part …",
+#     "the text states that …", "the text on the monument …" (inscription /
+#     caption prose), "the text mentions/describes/…", or "the document is
+#     about …" (all real prose).
+#   * Self-talk: "I'll output/transcribe/re-read", "I'm unable/sorry", "let me
+#     re-read/re-examine", "here's the text[:]" (bare/colon-anchored lead-in),
+#     "Wait, <let me|the text|I'll|…>", bare "It's:". We do NOT match "I will
+#     provide/use …", "Here is the text of the <document> …", bare "wait,/okay,/
+#     sorry,/unfortunately,", "I cannot/can't", or "let me check/look/try" (all
+#     occur in real letters, speeches, minutes).
 # Apostrophes accept both ASCII ' (U+0027) and curly ’ (U+2019) — glm-ocr emits
 # the curly form. KNOWN RESIDUAL: a real line literally starting "The image
 # is/shows …" is still stripped (uncommon — documents rarely open a line that
@@ -185,15 +189,25 @@ _CHAT_COMMENTARY_RE = re.compile(
     # "The image is/shows/…" — model's word for the scan itself (NOT photograph/picture/…).
     r"(?:the|this)\s+image\s+(?:is|was|shows?|depicts?|appears?|contains?|displays?|presents?|features?|portrays?|seems?|provides?)\b"
     r"|(?:the|this)\s+image\s*$"                       # bare "The image" fragment
-    # Meta about "the text"/scan — phrasings real documents do not use.
+    # Meta about "the text"/scan — phrasings real documents do not use. The
+    # reads/states/on-the arms are NARROWED to the model's re-quote form (a
+    # trailing colon / "as follows", or a scan-referent noun) so they no longer
+    # eat real prose like "The text reads, in part …", "The text states that …",
+    # or inscription captions "The text on the monument …".
     r"|the\s+text\s+(?:provided\b|in\s+the\s+(?:image|picture|photo|document|page)\b"
-    r"|on\s+the\s|reads?\b|states?\b|is:"
+    r"|on\s+the\s+(?:image|picture|photo|scan|page|document)\b"
+    r"|reads?(?:\s*:|\s+as\s+follows)|states?(?:\s*:|\s+as\s+follows)|is:"
     r"|is\s+(?:clear|clearly|legible|illegible|as\s+follows|a\s+description|a\s+transcription)\b)"
     # Model self-talk / refusals (kept specific to avoid real first-person prose).
-    r"|i(?:['’]ll|\s+will)\s+(?:just\s+)?(?:output|provide|transcribe|re-?read|use)\b"
+    # Dropped "provide"/"use" — they collide with ordinary letter/minutes prose
+    # ("I will provide a full accounting…", "I will use my best judgment…").
+    r"|i(?:['’]ll|\s+will)\s+(?:just\s+)?(?:output|transcribe|re-?read)\b"
     r"|i(?:['’]m|\s+am)\s+(?:unable|sorry)\b"
     r"|let\s+me\s+re-?(?:read|examine)\b"
-    r"|here(?:['’]s|\s+is)\s+the\s+(?:text|transcription)\b"
+    # "Here is the text[:]" lead-in — anchored to a bare/colon-terminated form so
+    # it does not eat "Here is the text of the resolution adopted by the board."
+    r"|here(?:['’]s|\s+is)\s+the\s+(?:text|transcription)"
+    r"(?:\s+(?:of|from|in|on)\s+the\s+(?:image|picture|photo|scan|page|document))?\s*:?\s*$"
     r"|wait,?\s+(?:let\s+me|the\s+text|i['’]ll|i['’]m|here)\b"
     r"|it['’]s:\s*$"                              # bare "It's:"
     r")",
@@ -286,7 +300,7 @@ def _post_generate(img_b64: str, config: GLMOCRConfig) -> dict:
 # So we never touch generation; we only collapse output that is *provably*
 # degenerate, leaving every healthy page byte-identical.
 _LOOP_MIN_REPEAT = 3          # a single repeated line must recur >= this often to count as a loop
-_LOOP_MAX_PERIOD_FRAC = 0.67  # period must be <= this fraction of the text (>= ~1.5 cycles)
+_LOOP_MAX_PERIOD_FRAC = 0.67  # coarse cap on the period scan; the >= 3× floor in _find_periodic_cut is the real gate
 _LOOP_MIN_UNIT_CHARS = 40     # a multi-/long-line repeating unit this big = a real loop
 
 # Consecutive tandem-run collapse (catches the high-rep "messy" loops that exact
@@ -299,20 +313,26 @@ _LOOP_TANDEM_LINE_CHARS = 20  # a "substantial" line: a unit with one this long 
 
 
 def _find_periodic_cut(nonblank: list[str]) -> int | None:
-    """If the non-blank lines are a unit repeated >= ~1.5×, return the unit
-    length (in non-blank lines); else None.
+    """If the non-blank lines are a unit repeated >= 3×, return the unit length
+    (in non-blank lines); else None.
 
-    Detects ``nb == unit * k`` with the final copy possibly *truncated* (the
-    2048-token cap often cuts the last repeat mid-way), via the periodicity
-    test ``nb[i] == nb[i % P]`` for the smallest period ``P``. A verbatim
-    multi-line block (or one long line) repeating back-to-back is a generation
-    loop, never real prose — so we keep one copy. Short single-line periods
-    need >= _LOOP_MIN_REPEAT full cycles so legit twice-repeated rows survive.
+    Detects ``nb == unit * k`` (k >= 3) with the final copy possibly *truncated*
+    (the 2048-token cap often cuts the last repeat mid-way), via the periodicity
+    test ``nb[i] == nb[i % P]`` for the smallest period ``P``. A verbatim block
+    (or one long line) repeating back-to-back >= 3× is a generation loop, never
+    real prose — so we keep one copy.
+
+    The >= 3× floor (``L >= 2*P + 1`` ⇒ every unit line recurs >= 3×) is the same
+    guarantee the old ``_LOOP_MIN_REPEAT`` gate gave. Content that appears only
+    ~2× is far more often legitimately doubled — a repeated letterhead/caption, a
+    carbon-copy form, or a running head bracketing one body line (the
+    ``[X, body, X]`` shape, where only X recurs) — than a generation loop, so it
+    is left intact rather than risk silently halving real text.
 
     LIMITATION (deliberate): a *short* repeating unit (< _LOOP_MIN_UNIT_CHARS,
     multi-line) is NOT collapsed — short repeated rows (tallies, ledgers,
     "0 0 0") are far more often legitimate content than a loop, so a tiny block
-    emitted ~2× is left duplicated rather than risk gutting real tabular data.
+    is left duplicated rather than risk gutting real tabular data.
     """
     L = len(nonblank)
     if L < 2:
@@ -321,14 +341,14 @@ def _find_periodic_cut(nonblank: list[str]) -> int | None:
     for P in range(1, max_period + 1):
         if not all(nonblank[i] == nonblank[i % P] for i in range(L)):
             continue
-        unit_chars = sum(len(s) for s in nonblank[:P])
-        if P == 1:
-            # single line repeated: require many cycles OR a long line
-            if L >= _LOOP_MIN_REPEAT or unit_chars >= _LOOP_MIN_UNIT_CHARS:
-                return P
+        # Require >= 3 occurrences of the unit (final copy may be truncated by
+        # the token cap): L >= 2*P + 1 means every unit line recurs >= 3×.
+        if L < 2 * P + 1:
             return None
-        # multi-line block repeated >= ~1.5×: a loop iff the unit is substantial
-        if unit_chars >= _LOOP_MIN_UNIT_CHARS:
+        if P == 1:
+            return P  # a single line repeated >= 3× is a loop regardless of length
+        # multi-line block repeated >= 3×: a loop iff the unit is substantial
+        if sum(len(s) for s in nonblank[:P]) >= _LOOP_MIN_UNIT_CHARS:
             return P
         return None
     return None
@@ -390,8 +410,9 @@ def _collapse_repetition_loops(text: str) -> str:
        back-to-back many times (a caption ×42, "Transfer Van" ×608) → one copy,
        guarded so short-token periodic data is spared.
     2. **Whole-page exact period** (``_find_periodic_cut``): the page is one unit
-       repeated k× with the final copy possibly truncated by the token cap (a
-       caption ×160, a table ×3, a substantial paragraph block ×2) → first copy.
+       repeated k× (k >= 3) with the final copy possibly truncated by the token
+       cap (a caption ×160, a table ×3) → first copy. A block that appears only
+       ~2× is treated as legitimately doubled content and left intact.
 
     We deliberately do NOT do fuzzy / unique-ratio de-duplication (it cannot tell
     a generation loop from a genuinely repetitive document and would gut real
@@ -476,7 +497,10 @@ def transcribe(image: np.ndarray, config: GLMOCRConfig) -> str:
 
     # Strip chat-style commentary the model appends/interleaves after a real
     # transcription ("The image shows…", "The text reads: …", "Wait, …"), then
-    # collapse any exact repetition loop. Both no-op on clean pages.
+    # collapse any exact repetition loop. Both no-op on clean pages. Order is
+    # safe: stripping a commentary line sitting between two identical REAL blocks
+    # makes them adjacent only ~2×, and _find_periodic_cut requires >= 3× before
+    # it cuts — so the second real copy survives.
     text = _strip_chat_commentary(text)
     if not text:
         return ""
