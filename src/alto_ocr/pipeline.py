@@ -173,10 +173,14 @@ class RefIdResult:
     ref_id: str
     output_dir: Path
     pages: list[PageResult] = field(default_factory=list)
+    # Set only when a whole Ref ID aborted before per-page results existed, so
+    # the summary can report the object's true input page count instead of the
+    # single synthetic failure page. None on a normally-processed Ref ID.
+    expected_page_count: int | None = None
 
     @property
     def page_count(self) -> int:
-        return len(self.pages)
+        return self.expected_page_count if self.expected_page_count is not None else len(self.pages)
 
     @property
     def failed_pages(self) -> list[PageResult]:

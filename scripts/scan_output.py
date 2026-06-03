@@ -1,22 +1,27 @@
 """Scan an OCR output tree for quality anomalies — a QA triage tool.
 
 Walks ``<output_root>/<RefID>/Text/*.txt`` (and the sibling ``ALTO/*.xml``)
-and reports, using the SAME helpers the engine uses so the checks stay in
-sync with the shipped behavior:
+and reports:
 
   * counts + ``summary.json`` (per-Ref-ID failures, ALTO/Text alignment)
-  * **LEAKS** — high-signal problems worth investigating / bringing to Claude:
-      - residual chat commentary (lines the shipped stripper regex matches —
-        i.e. a NEW phrasing that slipped through: a 2-minute regex addition)
-      - whole-page image descriptions
-      - periodic repetition loops the de-loop would still collapse
+  * **LEAKS (regression canary, expect 0)** — lines that match the engine's
+    OWN stripper yet are still present in the output. On fresh output this is
+    0 by construction (the engine removed them before writing); a non-zero
+    count means the output is stale (produced before the current stripper) or
+    the strip regressed. This is the scriptable signal: exit code 1 iff > 0.
+  * **REVIEW candidates** — lines flagged by a deliberately BROAD, engine-
+    INDEPENDENT model-voice heuristic (a superset of the stripper). This is
+    what surfaces genuinely NEW commentary phrasings the engine doesn't yet
+    know — but it also flags real captions ("The photograph shows…"), so it's
+    a human-review list (use ``--show``), not a pass/fail signal. Bring any
+    real leaked commentary to Claude — extending the stripper is a ~2-min edit.
   * **Known limitations** — accepted 2026-06 (expected on a minority of pages):
       - duplicate-heavy pages (glm-ocr column-doubling on dense multi-column scans)
       - CJK / non-Latin hallucination (mangled math pages)
       - empty (blank) pages
 
-Exit code is 1 when any LEAK is found (0 otherwise), so it is scriptable.
-Known limitations never affect the exit code.
+Exit code is 1 only when the regression canary fires; REVIEW candidates and
+known limitations never affect it.
 
 Usage::
 
@@ -38,11 +43,12 @@ from pathlib import Path
 # Allow running as `python scripts/scan_output.py` from the repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.alto_ocr.glmocr import (  # noqa: E402
-    _CHAT_COMMENTARY_RE,
-    _collapse_repetition_loops,
-    _looks_like_image_description,
-)
+# Imported ONLY as a regression canary: lines matching the engine's own
+# stripper that are STILL present mean the strip wasn't applied (stale output
+# or a bug) — on current-engine output this is 0 by construction. New/leaked
+# commentary is surfaced by the INDEPENDENT, broader _COMMENTARY_HINTS below,
+# NOT by this regex (which would be tautological for that purpose).
+from src.alto_ocr.glmocr import _CHAT_COMMENTARY_RE  # noqa: E402
 
 # Windows consoles default to cp1252; OCR text (½, —, CJK) would crash prints.
 try:
@@ -77,10 +83,48 @@ def _has_cjk_hallucination(text: str) -> bool:
     return False
 
 
+# INDEPENDENT, deliberately-broad model-voice openers — a SUPERSET of the
+# engine's stripper, so this surfaces commentary the engine did NOT remove
+# (genuinely new phrasings + the colliding openers the engine intentionally
+# leaves, e.g. "the photograph shows"). These are review CANDIDATES, not
+# confirmed leaks: a line may be real caption text ("The photograph shows the
+# 1923 class.") or leaked model commentary — a human (or Claude) judges. Kept
+# leaning toward self-referential / self-talk phrasings to limit noise.
+_COMMENTARY_HINTS = (
+    "the image ", "this image ", "the photograph ", "the photo ", "the picture ",
+    "the illustration ", "the drawing ", "the graphic ", "the scene ",
+    "the text in the ", "the text provided", "the text appears", "the text reads",
+    "the text is a description", "the text on the ",
+    "the document is about", "the document describes", "the document discusses",
+    "appears to be a", "this is a photo", "this is an image", "this is an illustration",
+    "in the foreground", "in the background",
+    "i'm unable", "i am unable", "i'll output", "i'll just", "i'll transcribe",
+    "i will output", "let me re-read", "let me reread", "let me re-examine",
+    "here is the text", "here's the text", "here is the transcription",
+    "unfortunately, i", "i cannot transcribe", "i can't transcribe",
+)
+
+
+def _candidate_commentary(text: str) -> list[str]:
+    """Lines whose lowercased start matches a broad model-voice hint (review).
+
+    Hints that end in a space (e.g. "the image ") get a word boundary for free,
+    so a plain startswith is both correct and simple.
+    """
+    out = []
+    for ln in text.split("\n"):
+        low = ln.strip().lower()
+        if low and any(low.startswith(h) for h in _COMMENTARY_HINTS):
+            out.append(ln.strip())
+    return out
+
+
 def scan_page(path: Path) -> dict:
     text = path.read_text(encoding="utf-8", errors="replace")
     nb = _nonblank(text)
-    commentary = [ln.strip() for ln in text.split("\n") if _CHAT_COMMENTARY_RE.match(ln)]
+    # Regression canary: lines the CURRENT engine stripper matches but are still
+    # present -> the strip wasn't applied (stale output / bug). 0 on fresh output.
+    leaked = [ln.strip() for ln in text.split("\n") if _CHAT_COMMENTARY_RE.match(ln)]
     return {
         "path": path,
         "ref_id": path.parent.parent.name,
@@ -89,11 +133,9 @@ def scan_page(path: Path) -> dict:
         "uniq": _unique_ratio(nb),
         "text": text,
         "flags": {
-            # LEAKS (high signal)
-            "commentary": commentary,                                            # list (truthy if any)
-            "description": _looks_like_image_description(text),
-            "loop": bool(text.strip()) and _collapse_repetition_loops(text) != text,
-            # Known limitations / info
+            "leaked": leaked,                          # LEAK / exit-1 signal (expect 0)
+            "candidate": _candidate_commentary(text),  # review candidates (independent, broad)
+            # Known limitations / info (never affect exit code)
             "dup": len(nb) >= _DUP_MIN_LINES and _unique_ratio(nb) < _DUP_RATIO,
             "cjk": _has_cjk_hallucination(text),
             "empty": not text.strip(),
@@ -102,9 +144,12 @@ def scan_page(path: Path) -> dict:
 
 
 _LEAK_CATS = (
-    ("commentary", "residual chat commentary (NEW phrasing — bring to Claude)"),
-    ("description", "whole-page image description"),
-    ("loop", "periodic repetition loop the de-loop would still collapse"),
+    ("leaked", "lines the current stripper would remove but are STILL present "
+               "(stale output / regression — expect 0 on fresh output)"),
+)
+_REVIEW_CATS = (
+    ("candidate", "model-voice lines to eyeball (real caption vs leaked commentary; "
+                  "broad heuristic, independent of the engine — bring real leaks to Claude)"),
 )
 _INFO_CATS = (
     ("dup", "duplicate-heavy page (accepted: column-doubling on dense multi-column)"),
@@ -171,22 +216,27 @@ def main(argv: list[str] | None = None) -> int:
     def sample(pg: dict) -> str:
         return f"{pg['ref_id'][-14:]}/{pg['path'].name}"
 
-    leak_total = sum(len(members(c)) for c, _ in _LEAK_CATS)
-
-    print("\n=== LEAKS (investigate / bring up) ===")
-    if leak_total == 0:
-        print("  none — no commentary, descriptions, or periodic loops leaked.")
-    else:
-        for cat, desc in _LEAK_CATS:
+    def print_line_cats(cats, marker):
+        for cat, desc in cats:
             m = members(cat)
             print(f"  [{len(m):4d}] {desc}")
             for pg in m[: args.show]:
                 print(f"        {sample(pg)}  ({pg['bytes']}B)")
-                if cat == "commentary":
-                    for ln in pg["flags"]["commentary"][:3]:
-                        print(f"           ! {ln[:90]}")
-                else:
-                    print(f"           {pg['text'][:110]!r}")
+                for ln in pg["flags"][cat][:3]:
+                    print(f"           {marker} {ln[:90]}")
+
+    leak_total = sum(len(members(c)) for c, _ in _LEAK_CATS)
+    review_total = sum(len(members(c)) for c, _ in _REVIEW_CATS)
+
+    print("\n=== LEAKS (regression canary — expect 0; non-zero => exit 1) ===")
+    if leak_total == 0:
+        print("  none — no lines matching the current stripper remain in the output.")
+    else:
+        print_line_cats(_LEAK_CATS, "!")
+
+    print(f"\n=== REVIEW candidates ({review_total}) — eyeball with --show; "
+          f"a real leaked commentary line is a 2-min regex add ===")
+    print_line_cats(_REVIEW_CATS, "?")
 
     print("\n=== Known limitations (accepted — expected on a minority) ===")
     for cat, desc in _INFO_CATS:
@@ -200,17 +250,18 @@ def main(argv: list[str] | None = None) -> int:
         with args.csv.open("w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(["ref_id", "page", "bytes", "nonblank_lines", "unique_pct",
-                        "commentary_lines", "description", "loop", "dup", "cjk", "empty"])
+                        "leaked_lines", "candidate_lines", "dup", "cjk", "empty"])
             for pg in pages:
                 fl = pg["flags"]
                 w.writerow([pg["ref_id"], pg["path"].name, pg["bytes"], pg["lines"],
-                            round(pg["uniq"] * 100), len(fl["commentary"]),
-                            int(fl["description"]), int(fl["loop"]),
+                            round(pg["uniq"] * 100), len(fl["leaked"]), len(fl["candidate"]),
                             int(fl["dup"]), int(fl["cjk"]), int(fl["empty"])])
         print(f"\nWrote per-page CSV: {args.csv}")
 
-    print(f"\nVerdict: {leak_total} leak(s) across {len(txts)} page(s). "
-          + ("Investigate the LEAKS above." if leak_total else "Clean on the high-signal checks."))
+    print(f"\nVerdict: {leak_total} regression-canary leak(s), {review_total} review "
+          f"candidate(s) across {len(txts)} page(s). "
+          + ("Investigate the LEAKS above." if leak_total
+             else "Canary clean; skim REVIEW candidates for any leaked commentary."))
     return 1 if leak_total else 0
 
 

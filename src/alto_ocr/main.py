@@ -6,6 +6,7 @@ import json
 import logging
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from typing import Optional
 
@@ -313,12 +314,14 @@ def _failed_ref_result(inputs, output_root: Path, exc: BaseException) -> RefIdRe
 
     ``process_ref_id`` isolates per-*page* errors itself; this covers a
     Ref-ID-level exception (or a crashed pool worker) so one bad object can't
-    abort an unattended multi-hour batch. Recorded as a single failed page so
-    the Ref ID shows up clearly in the summary with its error and real size.
+    abort an unattended multi-hour batch. ``expected_page_count`` is set so the
+    summary reports the object's true input page count (not 1), and a single
+    synthetic failed page carries the error.
     """
     return RefIdResult(
         ref_id=inputs.ref_id,
         output_dir=(output_root / inputs.ref_id).resolve(),
+        expected_page_count=inputs.page_count,
         pages=[PageResult(
             stem=f"<Ref ID aborted before page output ({inputs.page_count} page(s))>",
             order=0,
@@ -420,6 +423,26 @@ def batch(
                 inputs = futures[fut]
                 try:
                     results.append(fut.result())
+                except BrokenProcessPool:
+                    # The POOL itself died (a worker crashed / was OOM-killed),
+                    # not a single bad object. Every still-pending future will
+                    # raise this, so DON'T fabricate a per-object failure for
+                    # each — record the un-run Ref IDs with a clear "pool died,
+                    # re-run" reason and stop. (Distinct from the per-Ref-ID
+                    # isolation below, which is for one bad object.)
+                    done = {r.ref_id for r in results}
+                    not_run = [futures[f] for f in futures if futures[f].ref_id not in done]
+                    logger.error("Worker pool died (a worker likely crashed or was OOM-killed). "
+                                 "%d Ref ID(s) did NOT run and must be re-run: %s",
+                                 len(not_run), ", ".join(ri.ref_id for ri in not_run))
+                    console.print(f"[red]FATAL: worker pool died — {len(not_run)} Ref ID(s) not "
+                                  f"processed; re-run them (lower --workers if it recurs).[/red]")
+                    for ri in not_run:
+                        results.append(_failed_ref_result(
+                            ri, output_root,
+                            RuntimeError("worker pool died before this Ref ID was processed "
+                                         "(not OCR'd) — re-run it")))
+                    break
                 except Exception as e:  # noqa: BLE001 - isolate per-Ref-ID failures
                     logger.exception("[%s] Ref ID aborted (recorded as failed, continuing): %s",
                                      inputs.ref_id, e)

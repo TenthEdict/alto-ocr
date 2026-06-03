@@ -150,33 +150,52 @@ def _looks_like_image_description(text: str) -> bool:
 
 # Chat-style commentary glm-ocr appends AFTER (or interleaves with) a real
 # transcription — a separate, more pervasive failure than the whole-page
-# descriptions ``_looks_like_image_description`` catches. Observed on
-# MSA00005 front-matter / photo / title / cover pages: the model transcribes
-# the page, then adds meta lines like "The image is a title page…", "The text
-# in the image reads: …" (often re-quoting the real text, which is where the
-# duplicate content comes from), "The text provided does not contain…", "Wait,
-# let me re-read…", "I'll just output the text." We delete such lines, keeping
-# everything else (so interleaved real text survives). The patterns are
-# model-voice phrasings that essentially never start a line in real archival
-# prose — verified zero false positives across the clean pages of a 39-page
-# batch. Anchored at line start; the continuation words keep it from matching
-# ordinary sentences like "The image quality was poor".
+# descriptions ``_looks_like_image_description`` catches. Observed on MSA00005
+# front-matter / photo / title / cover pages: the model transcribes the page,
+# then adds meta lines like "The image is a title page…", "The text in the
+# image reads: …" (re-quoting the real text — the source of the duplicate
+# content), "The text provided does not contain…", "Wait, let me re-read…",
+# "I'll just output the text." We delete such lines, keeping everything else
+# (so interleaved real text survives).
+#
+# PRECISION-FIRST (this is line-DELETION applied to an accepted transcript, so
+# a false match silently loses real content across ALL collections). The
+# patterns are therefore restricted to phrasings that are genuinely model-voice
+# and do NOT collide with ordinary archival prose:
+#   * "The image …" — the model's own word for the SCAN; real captions say
+#     "the photograph/figure/the photo at right", so we deliberately do NOT
+#     match photograph/photo/picture/illustration/etc. (those occur in real
+#     captions, e.g. "The photograph shows the 1923 class.").
+#   * "the text in the image / the text provided / the text is clear|legible|
+#     as follows|a description / the text reads|states / the text on the …" —
+#     meta about the scan that documents never write. We do NOT match bare
+#     "the text is a <noun>" ("The text is a binding contract."), "the text
+#     mentions/describes/…", or "the document is about …" (all real prose).
+#   * Self-talk: "I'll output/transcribe/use", "I'm unable/sorry", "let me
+#     re-read/re-examine", "here's the text", "Wait, <let me|the text|I'll|…>",
+#     bare "It's:". We do NOT match bare "wait,/okay,/sorry,/unfortunately,",
+#     "I cannot/can't", or "let me check/look/try" (all occur in real letters,
+#     speeches, minutes).
+# Apostrophes accept both ASCII ' (U+0027) and curly ’ (U+2019) — glm-ocr emits
+# the curly form. KNOWN RESIDUAL: a real line literally starting "The image
+# is/shows …" is still stripped (uncommon — documents rarely open a line that
+# way); a fully-stripped page is logged at INFO so it can be spot-checked.
 _CHAT_COMMENTARY_RE = re.compile(
     r"^\s*(?:"
-    r"(?:the|this)\s+(?:image|photograph|photo|picture|illustration|drawing|graphic|scene)\s+"
-    r"(?:is|was|shows?|depicts?|appears?|contains?|displays?|presents?|features?|portrays?|seems?|provides?|reads?|states?)\b"
-    r"|(?:the|this)\s+(?:image|photograph|photo|picture|illustration|drawing|graphic|scene)\s*$"
-    r"|the\s+text\s+(?:provided|in\s+the\s+image|on\s+the\s|reads?|states?|appears?|describes?|discusses|consists|mentions"
-    r"|is:|is\s+(?:a|an|clear|clearly|legible|concise|written|divided|presented|primarily|mostly|composed|organized|reproduced|provided|as\s+follows)\b)"
-    r"|the\s+document\s+(?:is\s+about|describes|discusses)"
-    r"|(?:wait|okay|hmm|hold\s+on)\b[,.\s]"
-    r"|let\s+me\s+(?:re-?read|re-?examine|look|check|try|provide|transcribe)"
-    r"|i(?:'ll|\s+will)\s+(?:just\s+)?(?:output|provide|transcribe|re-?read)"
-    r"|i(?:'m|\s+am)\s+(?:unable|sorry)"
-    r"|i\s+(?:cannot|can't|am\s+unable)"
-    r"|(?:sorry|unfortunately)\s*[,:]"
-    r"|here(?:'s|\s+is)\s+the\s+(?:text|transcription)"
-    r"|it's:\s*$"
+    # "The image is/shows/…" — model's word for the scan itself (NOT photograph/picture/…).
+    r"(?:the|this)\s+image\s+(?:is|was|shows?|depicts?|appears?|contains?|displays?|presents?|features?|portrays?|seems?|provides?)\b"
+    r"|(?:the|this)\s+image\s*$"                       # bare "The image" fragment
+    # Meta about "the text"/scan — phrasings real documents do not use.
+    r"|the\s+text\s+(?:provided\b|in\s+the\s+(?:image|picture|photo|document|page)\b"
+    r"|on\s+the\s|reads?\b|states?\b|is:"
+    r"|is\s+(?:clear|clearly|legible|illegible|as\s+follows|a\s+description|a\s+transcription)\b)"
+    # Model self-talk / refusals (kept specific to avoid real first-person prose).
+    r"|i(?:['’]ll|\s+will)\s+(?:just\s+)?(?:output|provide|transcribe|re-?read|use)\b"
+    r"|i(?:['’]m|\s+am)\s+(?:unable|sorry)\b"
+    r"|let\s+me\s+re-?(?:read|examine)\b"
+    r"|here(?:['’]s|\s+is)\s+the\s+(?:text|transcription)\b"
+    r"|wait,?\s+(?:let\s+me|the\s+text|i['’]ll|i['’]m|here)\b"
+    r"|it['’]s:\s*$"                              # bare "It's:"
     r")",
     re.IGNORECASE,
 )
@@ -193,11 +212,20 @@ def _strip_chat_commentary(text: str) -> str:
     """
     if not text:
         return text
-    kept = [ln for ln in text.split("\n") if not _CHAT_COMMENTARY_RE.match(ln)]
-    n_removed = text.count("\n") + 1 - len(kept)
+    lines = text.split("\n")
+    kept = [ln for ln in lines if not _CHAT_COMMENTARY_RE.match(ln)]
+    n_removed = len(lines) - len(kept)
+    result = "\n".join(kept).strip()
     if n_removed:
-        logger.debug("glm-ocr: stripped %d chat-commentary line(s)", n_removed)
-    return "\n".join(kept).strip()
+        if not result and any(ln.strip() for ln in lines):
+            # Removed EVERY line — usually a pure description/commentary page,
+            # but surface it (INFO, not DEBUG) so a mis-strip of a real page is
+            # visible rather than silently emptied. See _CHAT_COMMENTARY_RE note.
+            logger.info("glm-ocr: stripped entire page as chat-commentary (%d line(s)); "
+                        "verify it was not real text: %r", n_removed, text[:80])
+        else:
+            logger.debug("glm-ocr: stripped %d chat-commentary line(s)", n_removed)
+    return result
 
 
 # Fallback resize edges to try when the model returns GGML_ASSERT.
@@ -257,9 +285,7 @@ def _post_generate(img_b64: str, config: GLMOCRConfig) -> dict:
 # drops ~10% of real content on clean pages — undetectable at 4,241-page scale.
 # So we never touch generation; we only collapse output that is *provably*
 # degenerate, leaving every healthy page byte-identical.
-_LOOP_MIN_LINES = 6           # too few lines to judge degeneracy by ratio
-_LOOP_DEGENERATE_RATIO = 0.5  # unique/total non-blank lines at/above this = healthy
-_LOOP_MIN_REPEAT = 3          # a single line must recur >= this often to count as a loop
+_LOOP_MIN_REPEAT = 3          # a single repeated line must recur >= this often to count as a loop
 _LOOP_MAX_PERIOD_FRAC = 0.67  # period must be <= this fraction of the text (>= ~1.5 cycles)
 _LOOP_MIN_UNIT_CHARS = 40     # a multi-/long-line repeating unit this big = a real loop
 
@@ -296,21 +322,21 @@ def _find_periodic_cut(nonblank: list[str]) -> int | None:
 
 
 def _collapse_repetition_loops(text: str) -> str:
-    """Collapse a degenerate glm-ocr repetition loop to its real content.
+    """Collapse an EXACT periodic repetition loop to its first copy.
 
-    Two stages, both leaving healthy pages byte-identical:
+    If the non-blank lines are a unit repeated back-to-back (k× verbatim, the
+    final copy possibly truncated by the token cap), keep just the first copy.
+    Catches a one-line caption ×160, an HTML table emitted ×3, a paragraph
+    block re-emitted ×2.
 
-    1. **Periodic loop** — if the non-blank lines are a unit repeated back-to-
-       back (k× verbatim, last copy possibly truncated by the token cap), keep
-       just the first copy. Catches a one-line caption ×160, an HTML table
-       emitted ×3, a paragraph block re-emitted ×2.
-    2. **Messy loop** — non-periodic but still repetition-dominated (e.g. a
-       caption interleaved with slightly-varied rephrasings): if < half the
-       non-blank lines are unique AND some line recurs >= _LOOP_MIN_REPEAT
-       times, keep each distinct line's first occurrence in order.
-
-    Generation-time ``repeat_penalty`` is deliberately NOT used — it corrupts
-    legitimately repeated text and drops real content (see module note above).
+    ONLY exact periodicity fires, so a legitimately repetitive page (roll-call,
+    vote tally, ledger, repeated form rows) and healthy prose are left
+    byte-identical. We deliberately do NOT do fuzzy / unique-ratio de-duplication
+    (it cannot tell a generation loop from a genuinely repetitive document, and
+    would silently gut real tabular content), and we do NOT use generation-time
+    ``repeat_penalty`` (corrupts real repeated text; see module note above).
+    Non-exact "messy" loops (a caption interleaved with varied rephrasings) are
+    therefore left as-is — duplicated but never destructive.
     """
     if "\n" not in text:
         return text
@@ -318,34 +344,15 @@ def _collapse_repetition_loops(text: str) -> str:
     nb_idx = [i for i, ln in enumerate(lines) if ln.strip()]
     nonblank = [lines[i].strip() for i in nb_idx]
 
-    # Stage 1: exact periodic loop (handles truncated final copy; any length).
     period = _find_periodic_cut(nonblank)
-    if period is not None:
-        cut = nb_idx[period - 1] + 1  # keep through the period-th non-blank line
-        if cut < len(lines):
-            logger.debug("glm-ocr: collapsed periodic loop (period=%d non-blank lines, "
-                         "%d -> %d lines)", period, len(lines), cut)
-            lines = lines[:cut]
-            nonblank = nonblank[:period]
-
-    # Stage 2: messy (non-periodic) repetition-dominated output.
-    if len(nonblank) >= _LOOP_MIN_LINES:
-        distinct = set(nonblank)
-        if (len(distinct) / len(nonblank) < _LOOP_DEGENERATE_RATIO
-                and max(nonblank.count(s) for s in distinct) >= _LOOP_MIN_REPEAT):
-            seen: set[str] = set()
-            kept: list[str] = []
-            for ln in lines:
-                key = ln.strip()
-                if not key or key in seen:
-                    continue
-                seen.add(key)
-                kept.append(ln.rstrip())
-            logger.debug("glm-ocr: collapsed messy repetition (%d -> %d unique lines)",
-                         len(lines), len(kept))
-            lines = kept
-
-    return "\n".join(lines)
+    if period is None:
+        return text
+    cut = nb_idx[period - 1] + 1  # keep through the period-th non-blank line
+    if cut >= len(lines):
+        return text
+    logger.debug("glm-ocr: collapsed periodic loop (period=%d non-blank lines, "
+                 "%d -> %d lines)", period, len(lines), cut)
+    return "\n".join(lines[:cut])
 
 
 def transcribe(image: np.ndarray, config: GLMOCRConfig) -> str:
@@ -406,17 +413,31 @@ def transcribe(image: np.ndarray, config: GLMOCRConfig) -> str:
         )
         return ""
 
-    if payload.get("done_reason") and payload["done_reason"] != "stop":
-        logger.warning("glm-ocr stopped with reason=%s (length=%d)",
-                       payload["done_reason"], len(text))
+    raw_len = len(text)
 
     # Strip chat-style commentary the model appends/interleaves after a real
     # transcription ("The image shows…", "The text reads: …", "Wait, …"), then
-    # collapse any degenerate repetition loop. Both no-op on clean pages.
+    # collapse any exact repetition loop. Both no-op on clean pages.
     text = _strip_chat_commentary(text)
     if not text:
         return ""
-    return _collapse_repetition_loops(text)
+    text = _collapse_repetition_loops(text)
+
+    # A non-"stop" finish (reason=length) is only worth warning about when it
+    # truncated REAL content. If the output collapsed sharply, the page was
+    # looping and the truncation was benign (raising --glmocr-num-predict would
+    # just generate more loop) — so only warn when the kept text is still large.
+    done_reason = payload.get("done_reason")
+    if done_reason and done_reason != "stop":
+        if len(text) >= raw_len * 0.5:
+            logger.warning("glm-ocr stopped with reason=%s; kept %d chars may be "
+                           "truncated — consider raising --glmocr-num-predict",
+                           done_reason, len(text))
+        else:
+            logger.debug("glm-ocr stopped with reason=%s but output collapsed %d->%d "
+                         "chars (looping page; truncation benign)",
+                         done_reason, raw_len, len(text))
+    return text
 
 
 def check_endpoint(config: GLMOCRConfig) -> str:
