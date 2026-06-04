@@ -63,16 +63,24 @@ def force_utf8_output() -> None:
 #   * "The image …" — the model's own word for the SCAN; real captions say
 #     "the photograph/figure/the photo at right", so we deliberately do NOT
 #     match photograph/photo/picture/illustration/etc. (those occur in real
-#     captions, e.g. "The photograph shows the 1923 class.").
+#     captions, e.g. "The photograph shows the 1923 class."). Includes "the
+#     image provided is …" and "the image does not contain …".
 #   * "the text in the image / the text provided / the text is clear|legible|
 #     as follows|a description / the text is centered|positioned|arranged|…
 #     (layout description) / the text reads:|states: (colon-anchored, the
 #     model's re-quote form) / the text on the image|page|scan …" — meta about
-#     the scan that documents never write. We do NOT match bare "the text is a
-#     <noun>" ("The text is a binding contract."), "the text reads, in part …",
-#     "the text states that …", "the text on the monument …" (inscription /
-#     caption prose), "the text mentions/describes/…", or "the document is
-#     about …" (all real prose).
+#     the scan that documents never write. PLUS the self-summary the model
+#     appends after transcribing (seen all over the MSA00005 NASA manuals):
+#     "the text appears to be …", "the text provides (detailed) information
+#     about …", "the text is (partially) cut off …", "the text is a <kind>
+#     document that …", and "the text describes|discusses|outlines|… a|an …"
+#     (ARTICLE-anchored). We still do NOT match bare "the text is a <noun>"
+#     ("The text is a binding contract."), "the text reads, in part …", "the
+#     text states that …", "the text on the monument …" (inscription / caption
+#     prose), or "the text describes|outlines THE <noun> …" (deed/manual prose
+#     that uses "the", not "a/an").
+#   * "the document is about a|an|the …" — model self-summary; anchored to
+#     a/an/the so the "the document is about to <verb>" idiom is NOT matched.
 #   * Self-talk: "I'll output/transcribe/re-read", "I'm unable/sorry", "let me
 #     re-read/re-examine", "here's the text[:]" (bare/colon-anchored lead-in),
 #     "Wait, <let me|the text|the word|I'll|…>", bare "It's:". We do NOT match "I will
@@ -80,25 +88,50 @@ def force_utf8_output() -> None:
 #     sorry,/unfortunately,", "I cannot/can't", or "let me check/look/try" (all
 #     occur in real letters, speeches, minutes).
 # Apostrophes accept both ASCII ' (U+0027) and curly ’ (U+2019) — glm-ocr emits
-# the curly form. KNOWN RESIDUAL: a real line literally starting "The image
-# is/shows …" is still stripped (uncommon — documents rarely open a line that
-# way); a fully-stripped page is logged at INFO so it can be spot-checked.
+# the curly form. KNOWN RESIDUALS (all uncommon — documents rarely open a line
+# this way; a fully-stripped page is logged at INFO for spot-check): a real line
+# literally starting "The image is/shows …", "The text appears to be …", "The
+# text describes|discusses|… a|an …", or "The document is about a|an|the …" is
+# still stripped. The article-less and "the"-anchored forms ("describes the
+# boundaries …", "is about to be signed") are deliberately left in to protect
+# real deed/manual/letter prose.
 _CHAT_COMMENTARY_RE = re.compile(
     r"^\s*(?:"
-    # "The image is/shows/…" — model's word for the scan itself (NOT photograph/picture/…).
-    r"(?:the|this)\s+image\s+(?:is|was|shows?|depicts?|appears?|contains?|displays?|presents?|features?|portrays?|seems?|provides?)\b"
+    # "The image is/shows/provided/does-not-contain …" — model's word for the
+    # scan itself (NOT photograph/picture/…). "provide[sd]?" also catches "The
+    # image provided is too blurry …"; "does not"/"doesn't" catches "The image
+    # does not contain any textual content …".
+    r"(?:the|this)\s+image\s+(?:is|was|shows?|depicts?|appears?|contains?|displays?|presents?|features?|portrays?|seems?|provide[sd]?|does(?:n['’]t|\s+not))\b"
     r"|(?:the|this)\s+image\s*$"                       # bare "The image" fragment
     # Meta about "the text"/scan — phrasings real documents do not use. The
     # reads/states/on-the arms are NARROWED to the model's re-quote form (a
     # trailing colon / "as follows", or a scan-referent noun) so they no longer
     # eat real prose like "The text reads, in part …", "The text states that …",
     # or inscription captions "The text on the monument …".
-    r"|the\s+text\s+(?:provided\b|in\s+the\s+(?:image|picture|photo|document|page)\b"
+    r"|the\s+text\s+(?:provided\b"
+    # self-summary the model appends after transcribing (pervasive across the
+    # NASA technical manuals in MSA00005): "The text appears to be a page
+    # from …", "… provides detailed information about …", "… is partially cut
+    # off …", "… is a technical document that outlines …".
+    r"|appears\s+to\s+be\b"
+    r"|provides\s+(?:detailed\s+)?information\s+about\b"
+    r"|in\s+the\s+(?:image|picture|photo|document|page)\b"
     r"|on\s+the\s+(?:image|picture|photo|scan|page|document)\b"
     r"|reads?(?:\s*:|\s+as\s+follows)|states?(?:\s*:|\s+as\s+follows)|is:"
+    r"|is\s+(?:partially\s+)?cut\s+off\b"
+    r"|is\s+a\s+(?:\w+\s+)?document\s+that\b"
     r"|is\s+(?:clear|clearly|legible|illegible|as\s+follows|a\s+description|a\s+transcription"
     # layout description (e.g. "The text is centered on a white background…") — model-voice
-    r"|centered|centred|positioned|aligned|arranged|formatted|justified|displayed)\b)"
+    r"|centered|centred|positioned|aligned|arranged|formatted|justified|displayed)\b"
+    # summary verbs, ARTICLE-ANCHORED ("describes an UHF …", "discusses a
+    # system …") so they catch the model's paraphrase without eating real
+    # "The text describes the boundaries …" / "outlines the procedure …" prose
+    # (those use "the", not "a/an", and are left to the INFO-logged residual).
+    r"|(?:describes|discusses|outlines|summarizes|highlights)\s+an?\b)"
+    # "The document is about a/an/the …" — model self-summary. Anchored to
+    # a/an/the so the "is about to <verb>" idiom ("the document is about to be
+    # signed") is NOT matched.
+    r"|the\s+document\s+is\s+about\s+(?:an?|the)\b"
     # Model self-talk / refusals (kept specific to avoid real first-person prose).
     # Dropped "provide"/"use" — they collide with ordinary letter/minutes prose
     # ("I will provide a full accounting…", "I will use my best judgment…").

@@ -48,6 +48,12 @@ class ChatCommentaryRegexTests(unittest.TestCase):
         # "the <position> photo …" lines rather than risk eating real captions.
         "The photo at the right shows the sequence of events during powered flight.",
         "The text is a binding contract between the parties.",
+        # 33-Ref-ID batch: precision guards for the NEW self-summary arms — each
+        # looks superficially like a leak but is real prose and must survive.
+        "The document is about to be signed by all parties present.",        # "is about to" idiom, not "about a/an/the"
+        "The text describes the southern boundary of the lot as follows.",   # "describes THE" (deed prose), not "a/an"
+        "The text outlines the procedure the committee shall follow.",       # "outlines THE", not "a/an"
+        "The text is a faithful copy of the original deed.",                 # "is a <noun>" without "document that"
     ]
 
     # Genuine glm-ocr commentary that must STILL be stripped (no regression in
@@ -71,6 +77,19 @@ class ChatCommentaryRegexTests(unittest.TestCase):
         # MSA00005 smoke test: two new leak phrasings the stripper now catches.
         "The text is centered on a white background with black lettering.",
         'Wait, the word "BASE OPERATIONS" is at the bottom of the second photo.',
+        # 33-Ref-ID batch (MSA00005 NASA technical manuals): the model transcribes
+        # the page correctly, then appends a third-person self-summary (often
+        # looped 3-4x). These are the new phrasing families the stripper catches.
+        "The text appears to be a page from a technical document or manual, likely related to spacecraft operations.",
+        "The text is partially cut off at the bottom. It seems to continue with the heading.",
+        "The text is cut off at the bottom. It seems to continue.",
+        "The text is a technical document that outlines the procedures for retrofire operations.",
+        "The text provides detailed information about an UHF voice receiver-transmitter system.",
+        "The text describes an UHF voice receiver-transmitter system designed as a small unit.",
+        "The text discusses a system of three antenna units serving different functions.",
+        "The image provided is too blurry to accurately recognize any text or details.",
+        "The image does not contain any textual content other than the title and the figure number.",
+        "The document is about the results of a second United States manned orbital space flight.",
     ]
 
     def test_real_prose_is_not_matched(self):

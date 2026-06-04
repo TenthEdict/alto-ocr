@@ -16,9 +16,10 @@ _probe_summary.json
 batch_spotcheck_summary.json
 temp-ocr*/
 
-# Local outputs from smoke tests — keep schema, not data
+# Local outputs from smoke tests / batch runs — keep schema, not data
 output/*/
 !output/.gitkeep
+ocr-output-local/
 
 # Editor / OS junk
 .vscode/
