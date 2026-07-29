@@ -48,14 +48,16 @@ Running the GUI
     - Pick the folder of TIF scans (or a parent folder containing many
       Ref ID subfolders, with "OCR all subfolders" checked).
     - Pick an output folder (auto-fills next to the input by default).
-    - Choose the OCR engine: GLMOCR (default, high accuracy) or
-      Tesseract (fallback).
+    - Choose the OCR engine: Tesseract (default — also records per-word
+      confidence values in the ALTO for later transcript review) or
+      GLMOCR (for handwriting-heavy material; needs a local Ollama).
     - Click "Run OCR".
 
   Advanced settings tab:
     - Tune preprocessing stages (deskew, denoise, CLAHE, binarize,
       border crop) and OCR options (language, PSM, OEM).
-    - Configure GLMOCR endpoint / model / timeout if using handwritten.
+    - Configure GLMOCR endpoint / model / timeout if using GLMOCR
+      for handwritten material.
     - All settings persist across launches in %USERPROFILE%\.alto_ocr.json.
 
 Running the CLI

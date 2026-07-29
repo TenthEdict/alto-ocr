@@ -3,14 +3,20 @@
 The pipeline talks to OCR engines through the ``OCREngine`` Protocol —
 a single ``ocr(image, output_base, *, dpi)`` method that produces an ALTO
 ``.xml`` and a plain ``.txt`` alongside ``output_base`` and returns their
-paths. ``TesseractEngine`` is the default implementation; ``GLMOCREngine``
-will be added behind ``--engine glmocr`` in a follow-up.
+paths. ``TesseractEngine`` is the default (it emits the word confidences
+the remediation workflow triages on); ``GLMOCREngine`` sits behind
+``--engine glmocr`` for handwriting-heavy material.
 
 Tesseract notes:
 
-* Two invocations per page — one with the ``alto`` config (→ ``.xml``),
-  one with the default config (→ ``.txt``). Tesseract appends the extension
-  based on the active config, so we always pass an *extension-less* base.
+* One invocation per page with three output configs — ``alto tsv txt`` —
+  so a single recognition pass produces the ALTO (``.xml``), a word-level
+  TSV with confidences (``.tsv``), and the transcript (``.txt``).
+  Tesseract appends each extension itself, so we always pass an
+  *extension-less* base. The TSV's per-word confidences are merged into
+  the ALTO as ``WC`` attributes (plus a mean-derived ``PC`` on ``Page``)
+  by ``_merge_tsv_confidence`` and the TSV is then deleted — it is an
+  intermediate, not part of the output contract.
 * The binary is located via ``shutil.which`` and the ``TESSERACT_PATH``
   env var, with an explicit override accepted by ``find_tesseract``. On
   Windows a non-PATH install (e.g.
@@ -155,9 +161,12 @@ def _run_tesseract(
     output_base: Path,
     options: OCROptions,
     dpi: int,
-    config: str | None,
+    configs: tuple[str, ...],
 ) -> None:
-    """Single Tesseract invocation. ``config`` is e.g. 'alto' or None (txt)."""
+    """Single Tesseract invocation. ``configs`` are output configs appended to
+    the command line (e.g. ``("alto", "tsv", "txt")``); each one enables a
+    renderer, and the single recognition pass feeds all of them.
+    """
     cmd: list[str] = [
         str(binary),
         str(image_path),
@@ -166,9 +175,8 @@ def _run_tesseract(
         "--psm", str(options.psm),
         "--oem", str(options.oem),
         "--dpi", str(dpi),
+        *configs,
     ]
-    if config:
-        cmd.append(config)
 
     logger.debug("tesseract: %s", " ".join(cmd))
     proc = subprocess.run(
@@ -182,6 +190,70 @@ def _run_tesseract(
             f"stdout: {proc.stdout.strip()}\n"
             f"stderr: {proc.stderr.strip()}"
         )
+
+
+def _merge_tsv_confidence(alto_path: Path, tsv_path: Path) -> None:
+    """Merge word confidences from a Tesseract TSV into the sibling ALTO.
+
+    Tesseract's ``alto`` renderer emits no confidence values; its ``tsv``
+    renderer emits one 0–100 confidence per word. Both renderers walk the
+    same recognition result, so their word bounding boxes are identical.
+    Each level-5 (word) TSV row is keyed by its pixel bbox and matched to
+    the ALTO ``String`` with the same HPOS/VPOS/WIDTH/HEIGHT; each match
+    gains ``WC`` (ALTO word confidence, 0..1). ``Page`` gains ``PC`` — the
+    mean word confidence — which is what remediation triage sorts on to
+    find pages (and handwriting-heavy objects) that need human attention.
+
+    Must run *before* ``_convert_to_institution_format``: matching relies
+    on the ALTO coordinates still being in pixels. The added attributes
+    survive conversion (they're not pixel attrs, and the attribute-order
+    tables already reserve WC/PC slots from the reference samples).
+
+    Confidence is an enhancement, not part of the output contract —
+    callers should treat a failure here as non-fatal.
+    """
+    confs: dict[tuple[str | None, ...], list[float]] = {}
+    all_confs: list[float] = []
+    for row in tsv_path.read_text(encoding="utf-8").splitlines()[1:]:
+        parts = row.split("\t")
+        if len(parts) < 12 or parts[0] != "5":  # level 5 = word rows
+            continue
+        try:
+            conf = float(parts[10])
+        except ValueError:
+            continue
+        if conf < 0:
+            continue
+        # Key on the raw bbox strings (left, top, width, height): both
+        # renderers print the same integers, so no numeric round-trip.
+        confs.setdefault(tuple(parts[6:10]), []).append(conf)
+        all_confs.append(conf)
+
+    parser = etree.XMLParser(remove_blank_text=True)
+    tree = etree.parse(str(alto_path), parser)
+    root = tree.getroot()
+    ns = root.nsmap.get(None)
+
+    unmatched = 0
+    for el in root.iter(_qname(ns, "String")):
+        key = (el.get("HPOS"), el.get("VPOS"), el.get("WIDTH"), el.get("HEIGHT"))
+        bucket = confs.get(key)
+        if bucket:
+            # Identical bboxes (rare) pair up in document order.
+            el.set("WC", f"{min(bucket.pop(0), 100.0) / 100:.2f}")
+        else:
+            unmatched += 1
+    if unmatched:
+        logger.debug(
+            "%s: %d ALTO String(s) had no TSV confidence match", alto_path.name, unmatched
+        )
+
+    if all_confs:
+        page = root.find(f".//{_qname(ns, 'Page')}")
+        if page is not None:
+            page.set("PC", f"{sum(all_confs) / len(all_confs) / 100:.2f}")
+
+    _serialize_with_tabs(tree, alto_path)
 
 
 # Both Tesseract and the GLMOCR builder emit ALTO that doesn't match the
@@ -491,7 +563,8 @@ class OCREngine(Protocol):
 
 @dataclass
 class TesseractEngine:
-    """Default OCR engine: shell out to Tesseract twice (alto + txt configs)."""
+    """Default OCR engine: one Tesseract pass (``alto tsv txt`` configs),
+    then TSV word confidences are merged into the ALTO as ``WC``/``PC``."""
 
     binary: Path
     options: OCROptions = None  # type: ignore[assignment]  # set in __post_init__
@@ -530,8 +603,10 @@ class TesseractEngine:
             raise IOError(f"Failed to write temporary preprocessed image: {tmp}")
 
         try:
-            _run_tesseract(self.binary, tmp, output_base, self.options, dpi, config="alto")
-            _run_tesseract(self.binary, tmp, output_base, self.options, dpi, config=None)
+            _run_tesseract(
+                self.binary, tmp, output_base, self.options, dpi,
+                configs=("alto", "tsv", "txt"),
+            )
         finally:
             try:
                 tmp.unlink()
@@ -540,11 +615,33 @@ class TesseractEngine:
 
         alto = output_base.with_suffix(".xml")
         txt = output_base.with_suffix(".txt")
+        tsv = output_base.with_suffix(".tsv")
         if not alto.is_file() or not txt.is_file():
             raise RuntimeError(
                 f"Tesseract reported success but expected outputs are missing: "
                 f"alto={alto.is_file()}, txt={txt.is_file()}"
             )
+        # Confidence merge is best-effort: a failure here must not turn a
+        # successfully OCR'd page into a failure stub.
+        try:
+            if tsv.is_file():
+                _merge_tsv_confidence(alto, tsv)
+            else:
+                logger.warning(
+                    "%s: Tesseract wrote no .tsv — ALTO will lack WC/PC "
+                    "confidence values (Tesseract 5+ expected)", alto.name,
+                )
+        except Exception:
+            logger.warning(
+                "Confidence merge failed for %s; ALTO left without WC/PC values",
+                alto.name, exc_info=True,
+            )
+        finally:
+            try:
+                tsv.unlink(missing_ok=True)
+            except OSError:
+                logger.debug("Could not remove TSV file: %s", tsv)
+
         _convert_to_institution_format(
             alto, page_index, dpi=dpi, source_filename=source_filename,
         )

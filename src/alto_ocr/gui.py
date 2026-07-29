@@ -56,9 +56,10 @@ class JobConfig:
     write_mets: bool
     write_plaintext: bool
     with_checksums: bool = True
-    # Engine selection. Default matches the CLI + CLAUDE.md (GLMOCR is the
-    # default engine for all material); the GUI radio also defaults to glmocr.
-    engine: str = "glmocr"  # "glmocr" | "tesseract"
+    # Engine selection. Default matches the CLI + CLAUDE.md (Tesseract is
+    # the default — its confidence output drives the remediation workflow);
+    # GLMOCR remains selectable for handwriting-heavy material.
+    engine: str = "tesseract"  # "tesseract" | "glmocr"
     tesseract_path: Optional[Path] = None
     # Advanced — mirror the upstream dataclasses they configure.
     preprocess_config: PreprocessConfig = field(default_factory=PreprocessConfig)
@@ -130,7 +131,7 @@ class AltoOcrApp:
         self.var_recurse = tk.BooleanVar(value=bool(s.get("recurse", False)))
         self.var_mets = tk.BooleanVar(value=bool(s.get("write_mets", True)))
         self.var_plaintext = tk.BooleanVar(value=bool(s.get("write_plaintext", True)))
-        self.var_engine = tk.StringVar(value=str(s.get("engine", "glmocr")))
+        self.var_engine = tk.StringVar(value=str(s.get("engine", "tesseract")))
         self.var_tesseract = tk.StringVar(value=str(s.get("tesseract_path", "")))
         self.var_status = tk.StringVar(value="Ready.")
 
@@ -280,11 +281,11 @@ class AltoOcrApp:
         engine_frame.columnconfigure(1, weight=1)
         radio_row = ttk.Frame(engine_frame)
         radio_row.grid(row=0, column=0, columnspan=3, sticky="w")
-        ttk.Radiobutton(radio_row, text="GLMOCR (default)",
-                        variable=self.var_engine, value="glmocr").pack(
+        ttk.Radiobutton(radio_row, text="Tesseract (default — word confidences)",
+                        variable=self.var_engine, value="tesseract").pack(
             side="left", padx=(0, 16))
-        ttk.Radiobutton(radio_row, text="Tesseract",
-                        variable=self.var_engine, value="tesseract").pack(side="left")
+        ttk.Radiobutton(radio_row, text="GLMOCR (handwriting)",
+                        variable=self.var_engine, value="glmocr").pack(side="left")
         # Optional Tesseract binary override — leave blank to auto-detect.
         ttk.Label(engine_frame, text="Tesseract path:").grid(
             row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))

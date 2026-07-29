@@ -39,7 +39,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="ocr_one", description=__doc__)
     parser.add_argument("source", type=Path, help="source TIF/PNG/JPEG")
     parser.add_argument("out_dir", type=Path, help="directory to write <stem>.xml + <stem>.txt")
-    parser.add_argument("--engine", default="glmocr", choices=("glmocr", "tesseract"))
+    parser.add_argument("--engine", default="tesseract", choices=("tesseract", "glmocr"))
     parser.add_argument("--page-index", type=int, default=1,
                         help="1-based Page ID / PHYSICAL_IMG_NR to stamp (default: 1)")
     parser.add_argument("--glmocr-model", default=None,

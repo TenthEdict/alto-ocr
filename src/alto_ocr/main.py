@@ -156,10 +156,12 @@ def _print_summary(results: list[RefIdResult]) -> None:
 # ---------- Common option types -------------------------------------------------
 
 # Typer 0.25 requires Optional[...] (not "X | None") for option types.
-EngineOpt = typer.Option("glmocr", "--engine",
-                         help="OCR engine: 'glmocr' (default, high-accuracy multimodal; "
-                              "requires local Ollama) or 'tesseract' (fallback; faster "
-                              "setup, lower accuracy on this institution's material).")
+EngineOpt = typer.Option("tesseract", "--engine",
+                         help="OCR engine: 'tesseract' (default; its single pass also "
+                              "emits the per-word confidences written to ALTO as WC/PC "
+                              "for remediation triage) or 'glmocr' (multimodal; better "
+                              "raw accuracy on handwriting but no confidence values; "
+                              "requires local Ollama).")
 TesseractOpt = typer.Option(None, "--tesseract-path",
                             help="Path to tesseract binary (overrides PATH/TESSERACT_PATH).")
 GLMOCREndpointOpt = typer.Option(None, "--glmocr-endpoint",
