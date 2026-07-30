@@ -31,6 +31,7 @@ from .ocr import (
 from .pipeline import PageProgressLogger, PageResult, RefIdResult, process_ref_id
 from ._util import force_utf8_output
 from .preprocess import PreprocessConfig
+from .remediate import iter_object_dirs, repackage_object
 from .triage import (
     DEFAULT_LOW_WC,
     DEFAULT_REVIEW_PC,
@@ -663,6 +664,55 @@ def triage(
         obj_csv, pages_csv = write_csvs(objects, csv_dir or output_root)
         console.print(f"[dim]csv:[/dim] {obj_csv}")
         console.print(f"[dim]csv:[/dim] {pages_csv}")
+
+
+@app.command()
+def repackage(
+    output_root: Path = typer.Argument(..., exists=True, file_okay=False, dir_okay=True,
+                                       help="Output root (contains <RefID>/ALTO/), or a "
+                                            "single object output directory."),
+    no_checksums: bool = NoChecksumsOpt,
+    no_mets: bool = NoMetsOpt,
+    verbose: bool = VerboseOpt,
+) -> None:
+    """Regenerate Text/ transcripts and the METS from hand-corrected ALTO.
+
+    Run after review (the GUI, or an external editor such as eScriptorium):
+    the corrected ALTO is the source of truth. Transcripts re-render through
+    the same canonical renderer the review GUI's save uses, and the METS is
+    rebuilt so its file sizes and checksums match the edited files, keeping
+    the existing structMap page order. Idempotent — byte-identical
+    transcripts are not rewritten, so re-running is free. Objects without a
+    METS or Text/ folder (runs that opted out) are left that way.
+    """
+    _setup_logging(verbose)
+
+    objects = iter_object_dirs(output_root)
+    if not objects:
+        console.print(f"[red]No objects with an ALTO folder found under {output_root}[/red]")
+        raise typer.Exit(code=1)
+
+    table = Table(title="Repackage")
+    table.add_column("Ref ID", style="bold")
+    table.add_column("Pages", justify="right")
+    table.add_column("Txt updated", justify="right")
+    table.add_column("METS")
+    table.add_column("Notes")
+    n_problems = 0
+    for obj in objects:
+        r = repackage_object(
+            obj, with_checksums=not no_checksums, write_mets_file=not no_mets,
+        )
+        n_problems += len(r.problems)
+        table.add_row(
+            r.ref_id,
+            str(r.pages),
+            str(r.txt_written),
+            "rewritten" if r.mets_written else "—",
+            f"[yellow]{'; '.join(r.problems)}[/yellow]" if r.problems else "",
+        )
+    console.print(table)
+    raise typer.Exit(code=0 if n_problems == 0 else 1)
 
 
 _TIF_EXTS = (".tif", ".tiff", ".TIF", ".TIFF")

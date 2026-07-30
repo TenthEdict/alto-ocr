@@ -1,9 +1,10 @@
 """Headless remediation logic: load, edit, and save reviewed ALTO pages.
 
 The review GUI (``review.py``) is a thin Tk layer over this module so the
-edit/save semantics stay unit-testable without a display. The planned
-``repackage`` command will reuse ``alto_to_text`` so every tool renders the
-same canonical transcript from a corrected ALTO.
+edit/save semantics stay unit-testable without a display. The ``repackage``
+command's logic (``repackage_object``) lives here too and shares
+``alto_to_text`` with the review save path, so every tool renders the
+identical canonical transcript from a corrected ALTO.
 
 Semantics (agreed 2026-07-30):
 
@@ -29,14 +30,15 @@ from __future__ import annotations
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 from lxml import etree
 
+from .mets import METS_NS, PageEntry, build_mets, write_mets
 from .ocr import _ATTR_ORDER, _qname, _reorder_attrs, _serialize_with_tabs
-from .walker import IMAGE_SUFFIXES
+from .walker import IMAGE_SUFFIXES, _natural_key
 
 logger = logging.getLogger(__name__)
 
@@ -264,6 +266,134 @@ def alto_to_text(root: etree._Element, ns: str | None) -> str:
         if lines:
             blocks.append("\n".join(lines))
     return "\n\n".join(blocks) + "\n" if blocks else ""
+
+
+@dataclass
+class RepackageResult:
+    """Outcome of repackaging one object from its (corrected) ALTO."""
+
+    ref_id: str
+    object_dir: Path
+    pages: int
+    txt_written: int          # transcripts created or updated (identical files untouched)
+    mets_written: bool
+    problems: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.problems
+
+
+def iter_object_dirs(output_root: Path) -> list[Path]:
+    """Object directories under an output root, per the output contract:
+    ``<root>/<RefID>/ALTO/`` — or ``root`` itself when pointed at one object."""
+    if (output_root / "ALTO").is_dir():
+        return [output_root]
+    return [d for d in sorted(output_root.iterdir())
+            if d.is_dir() and (d / "ALTO").is_dir()]
+
+
+def _mets_page_order(mets_path: Path) -> list[str] | None:
+    """Page stems in the existing METS structMap's order (LABEL attrs sorted
+    by ORDER). ``None`` when the METS is unreadable or lists no pages —
+    callers fall back to natural stem order."""
+    try:
+        root = etree.parse(str(mets_path)).getroot()
+    except (OSError, etree.XMLSyntaxError) as e:
+        logger.warning("Could not read existing METS %s (%s); page order will "
+                       "fall back to natural stem sort", mets_path, e)
+        return None
+    divs = [el for el in root.iter(f"{{{METS_NS}}}div") if el.get("TYPE") == "page"]
+
+    def order_key(el: etree._Element) -> int:
+        try:
+            return int(el.get("ORDER", ""))
+        except ValueError:
+            return 1 << 30  # unordered divs sink to the end, document order kept
+
+    stems = [el.get("LABEL") for el in sorted(divs, key=order_key)]
+    stems = [s for s in stems if s]
+    return stems or None
+
+
+def repackage_object(
+    object_dir: Path,
+    *,
+    with_checksums: bool = True,
+    write_mets_file: bool = True,
+) -> RepackageResult:
+    """Regenerate everything derived from an object's (corrected) ALTO.
+
+    After review — in the GUI or any external editor — the ALTO is the
+    source of truth: transcripts are re-rendered through ``alto_to_text``
+    (write skipped when the file is already byte-identical, so re-running
+    is free) and the METS is rebuilt so its sizes/checksums match the
+    edited files. The existing METS's structMap page order is preserved
+    (stem sorting can't reconstruct the original nested-folder order);
+    pages new on disk are appended in natural order, and METS entries with
+    no ALTO on disk are dropped with a note. Objects without a METS
+    (``--no-mets`` runs) get transcripts only — repackage doesn't invent
+    files the original run opted out of; the same applies to ``Text/``.
+    """
+    object_dir = Path(object_dir)
+    alto_dir = object_dir / "ALTO"
+    result = RepackageResult(
+        ref_id=object_dir.name, object_dir=object_dir,
+        pages=0, txt_written=0, mets_written=False,
+    )
+
+    stems = [p.stem for p in sorted(alto_dir.glob("*.xml"), key=_natural_key)]
+    result.pages = len(stems)
+    if not stems:
+        result.problems.append("no ALTO pages found")
+        return result
+
+    text_dir = object_dir / "Text"
+    has_text = text_dir.is_dir()
+    for stem in stems:
+        alto_path = alto_dir / f"{stem}.xml"
+        try:
+            root = etree.parse(str(alto_path)).getroot()
+        except (OSError, etree.XMLSyntaxError) as e:
+            result.problems.append(f"{stem}: unreadable ALTO ({e})")
+            continue
+        if has_text:
+            txt = alto_to_text(root, root.nsmap.get(None))
+            txt_path = text_dir / f"{stem}.txt"
+            try:
+                current = txt_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                current = None
+            if current != txt:
+                txt_path.write_text(txt, encoding="utf-8")
+                result.txt_written += 1
+
+    if write_mets_file:
+        mets_path = object_dir / f"{object_dir.name}.mets.xml"
+        if mets_path.is_file():
+            on_disk = set(stems)
+            old_order = _mets_page_order(mets_path) or []
+            missing = [s for s in old_order if s not in on_disk]
+            if missing:
+                result.problems.append(
+                    "METS listed page(s) with no ALTO on disk, dropped: "
+                    + ", ".join(missing)
+                )
+            ordered = [s for s in old_order if s in on_disk]
+            ordered += [s for s in stems if s not in set(ordered)]
+            pages = [PageEntry(stem=s, order=i) for i, s in enumerate(ordered, start=1)]
+            tree = build_mets(
+                object_dir.name, object_dir, pages,
+                with_checksums=with_checksums,
+                with_plaintext=has_text,
+            )
+            write_mets(tree, mets_path)
+            result.mets_written = True
+        else:
+            logger.info("[%s] no existing METS — skipping METS regeneration "
+                        "(original run used --no-mets?)", object_dir.name)
+
+    return result
 
 
 def index_source_images(source_dir: Path) -> dict[str, Path]:
