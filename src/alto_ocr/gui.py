@@ -77,9 +77,36 @@ class JobConfig:
     glmocr_timeout: int = 120
 
 
+# Bumped when a saved preference has to be retired rather than merely
+# defaulted. Saved settings normally win over dataclass defaults, so a
+# default flip alone would never reach anyone who has run the GUI before.
+_BINARIZE_MIGRATION_KEY = "binarize_default_2026_07_30"
+
+
+def _migrate_settings(s: dict) -> dict:
+    """Retire a persisted ``do_binarize: true``.
+
+    Binarization was default-on until 2026-07-30, when it was measured to cost
+    accuracy on every collection tested (see PreprocessConfig.do_binarize). A
+    plain default flip would not reach existing users, whose saved settings
+    take precedence — so drop the stale preference once and record that we did.
+    Anyone who deliberately re-checks the box keeps it: the marker means this
+    runs only the first time.
+    """
+    if s.get(_BINARIZE_MIGRATION_KEY):
+        return s
+    if s.get("do_binarize"):
+        s.pop("do_binarize", None)
+        logger.info("Binarize is no longer on by default (it lowered OCR accuracy on every "
+                    "collection measured); your saved preference for it has been cleared. "
+                    "Re-check the box if a collection needs it.")
+    s[_BINARIZE_MIGRATION_KEY] = True
+    return s
+
+
 def _load_settings() -> dict:
     try:
-        return json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        return _migrate_settings(json.loads(SETTINGS_PATH.read_text(encoding="utf-8")))
     except (OSError, ValueError):
         return {}
 
