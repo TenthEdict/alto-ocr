@@ -40,6 +40,7 @@ from ._util import atomic_write_text
 from .alto_format import (
     ATTR_ORDER,
     alto_namespace,
+    hardened_parser,
     qname,
     reorder_attrs,
     serialize_with_tabs,
@@ -73,7 +74,7 @@ def has_review_provenance(alto_path: Path) -> bool:
     exactly a re-run, so it must not trip the overwrite guard.
     """
     try:
-        root = etree.parse(str(alto_path)).getroot()
+        root = etree.parse(str(alto_path), hardened_parser()).getroot()
     except (OSError, etree.XMLSyntaxError):
         return False
     return any(p.get("ID") == "review" for p in root.iter("{*}Processing"))
@@ -115,7 +116,7 @@ class ReviewPage:
 
     def __init__(self, alto_path: Path, image_size: tuple[int, int]) -> None:
         self.alto_path = Path(alto_path)
-        parser = etree.XMLParser(remove_blank_text=True)
+        parser = hardened_parser(remove_blank_text=True)
         try:
             self.tree = etree.parse(str(self.alto_path), parser)
         except etree.XMLSyntaxError as e:
@@ -258,6 +259,11 @@ class ReviewPage:
                 )
         self._recompute_pc()
         self._stamp_provenance()
+        # The session's edits are folded into the tree's cumulative count
+        # now — zero the counter BEFORE the writes, so a failed txt write
+        # followed by a retried save can't fold the same edits in twice
+        # (_stamp_provenance re-reads the tree's total as `prior`).
+        self.session_edits = 0
         serialize_with_tabs(self.tree, self.alto_path)
         self._loaded_mtime_ns = self.alto_path.stat().st_mtime_ns
 
@@ -268,7 +274,6 @@ class ReviewPage:
             atomic_write_text(txt_path, alto_to_text(self.root))
 
         self.dirty = False
-        self.session_edits = 0
         return txt_path
 
     def _recompute_pc(self) -> None:
@@ -365,7 +370,7 @@ def _mets_page_order(mets_path: Path) -> list[str] | None:
     by ORDER). ``None`` when the METS is unreadable or lists no pages —
     callers fall back to natural stem order."""
     try:
-        root = etree.parse(str(mets_path)).getroot()
+        root = etree.parse(str(mets_path), hardened_parser()).getroot()
     except (OSError, etree.XMLSyntaxError) as e:
         logger.warning("Could not read existing METS %s (%s); page order will "
                        "fall back to natural stem sort", mets_path, e)
@@ -381,6 +386,18 @@ def _mets_page_order(mets_path: Path) -> list[str] | None:
     stems = [el.get("LABEL") for el in sorted(divs, key=order_key)]
     stems = [s for s in stems if s]
     return stems or None
+
+
+def _mets_createdate(mets_path: Path) -> str | None:
+    """CREATEDATE from the existing METS header, so a rebuild can preserve
+    it. Rebuilding must not lie about provenance: the file was *created*
+    once; every repackage after that is a modification (``LASTMODDATE``)."""
+    try:
+        root = etree.parse(str(mets_path), hardened_parser()).getroot()
+    except (OSError, etree.XMLSyntaxError):
+        return None
+    hdr = root.find(f"{{{METS_NS}}}metsHdr")
+    return hdr.get("CREATEDATE") if hdr is not None else None
 
 
 def repackage_object(
@@ -420,7 +437,7 @@ def repackage_object(
     for stem in stems:
         alto_path = alto_dir / f"{stem}.xml"
         try:
-            root = etree.parse(str(alto_path)).getroot()
+            root = etree.parse(str(alto_path), hardened_parser()).getroot()
         except (OSError, etree.XMLSyntaxError) as e:
             result.problems.append(f"{stem}: unreadable ALTO ({e})")
             continue
@@ -438,6 +455,7 @@ def repackage_object(
     if write_mets_file:
         mets_path = object_dir / f"{object_dir.name}.mets.xml"
         if mets_path.is_file():
+            created = _mets_createdate(mets_path)
             on_disk = set(stems)
             old_order = _mets_page_order(mets_path) or []
             missing = [s for s in old_order if s not in on_disk]
@@ -454,6 +472,12 @@ def repackage_object(
                 with_checksums=with_checksums,
                 with_plaintext=has_text,
             )
+            hdr = tree.getroot().find(f"{{{METS_NS}}}metsHdr")
+            if hdr is not None:
+                if created:
+                    hdr.set("CREATEDATE", created)
+                hdr.set("LASTMODDATE", datetime.now(timezone.utc)
+                        .replace(microsecond=0).isoformat())
             write_mets(tree, mets_path)
             result.mets_written = True
         else:

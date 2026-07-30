@@ -60,6 +60,25 @@ def alto_namespace(root: etree._Element) -> str | None:
     return etree.QName(root).namespace
 
 
+def hardened_parser(*, remove_blank_text: bool = False) -> etree.XMLParser:
+    """Fresh lxml parser with DTD entity resolution off — use for every
+    parse of pipeline files (ALTO, METS).
+
+    Output trees live on shared network drives and round-trip through
+    external editors, and lxml's default ``resolve_entities=True`` lets a
+    crafted internal-DTD entity pull local files into the document (XXE) or
+    amplify expansion. We never use DTD entities; built-in character
+    entities (``&amp;`` ``&lt;`` …) are unaffected. Returns a *fresh* parser
+    per call — lxml parsers are not thread-safe to share, and the GUI
+    parses from two threads.
+    """
+    return etree.XMLParser(
+        remove_blank_text=remove_blank_text,
+        resolve_entities=False,
+        no_network=True,
+    )
+
+
 _TYPE_CODES = {
     "ComposedBlock": "CB",
     "TextBlock": "TB",
@@ -190,7 +209,7 @@ def convert_to_institution_format(
     is set to ``./<source_filename>`` to match the reference convention.
     Pass ``None`` to leave any existing fileName text alone.
     """
-    parser = etree.XMLParser(remove_blank_text=True)
+    parser = hardened_parser(remove_blank_text=True)
     tree = etree.parse(str(alto_path), parser)
     root = tree.getroot()
     src_ns = alto_namespace(root)

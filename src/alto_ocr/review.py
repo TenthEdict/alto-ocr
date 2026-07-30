@@ -35,9 +35,16 @@ from .remediate import (
     index_source_images,
 )
 from .triage import DEFAULT_LOW_WC, scan_alto_file
+from .walker import natural_chunks, natural_key
 
-# Archival scans are huge; don't trip Pillow's decompression-bomb guard.
-Image.MAX_IMAGE_PIXELS = None
+# Archival scans are huge (hundreds of megapixels), so raise Pillow's
+# decompression-bomb guard far past any real scan — but keep a ceiling so a
+# corrupt file can't demand unbounded memory (warn at 1 GP, error at 2 GP).
+Image.MAX_IMAGE_PIXELS = 1_000_000_000
+
+# Cap on rendered canvas pixels: 200% zoom on a 600-DPI scan would build a
+# multi-hundred-MB PhotoImage and can MemoryError — clamp the scale instead.
+_MAX_RENDER_PX = 40_000_000
 
 logger = logging.getLogger("alto_ocr.review")
 
@@ -72,6 +79,7 @@ class ReviewFrame(ttk.Frame):
         self._persist = persist
 
         self._pages: list[tuple[str, float | None, str]] = []  # (stem, pc, status)
+        self._sorted_stems: list[str] = []  # listbox row index -> stem
         self._img_index: dict[str, Path] = {}
         self._page: Optional[ReviewPage] = None
         self._stem: Optional[str] = None
@@ -229,7 +237,7 @@ class ReviewFrame(ttk.Frame):
         self._img_index = index_source_images(src)
         self._pages = []
         missing = 0
-        for xml in sorted(alto_dir.glob("*.xml")):
+        for xml in sorted(alto_dir.glob("*.xml"), key=natural_key):
             info = scan_alto_file(xml)
             self._pages.append((xml.stem, info.pc, info.status))
             if xml.stem not in self._img_index:
@@ -255,25 +263,29 @@ class ReviewFrame(ttk.Frame):
         stem, pc, status = entry
         if self.var_worst_first.get():
             rank = {"failed": 0, "scored": 1, "unscored": 2, "empty": 3}.get(status, 4)
-            return (rank, pc if pc is not None else 2.0, stem)
-        return (stem,)
+            return (rank, pc if pc is not None else 2.0, natural_chunks(stem))
+        return (natural_chunks(stem),)
 
     def _refresh_page_list(self) -> None:
         self.lst_pages.delete(0, "end")
+        self._sorted_stems = []
         for stem, pc, status in sorted(self._pages, key=self._page_sort_key):
             if status == "scored" and pc is not None:
                 label = f"{stem}   PC {pc:.2f}"
             else:
                 label = f"{stem}   [{status}]"
             self.lst_pages.insert("end", label)
+            self._sorted_stems.append(stem)
             if stem == self._stem:
                 self.lst_pages.selection_set("end")
 
     def _on_page_selected(self, _event: object) -> None:
         sel = self.lst_pages.curselection()
-        if not sel:
+        if not sel or sel[0] >= len(self._sorted_stems):
             return
-        stem = self.lst_pages.get(sel[0]).split("   ")[0]
+        # Index into the parallel stem list — never parse the display label
+        # back apart (stems can legally contain the label's separator).
+        stem = self._sorted_stems[sel[0]]
         if stem == self._stem:
             return
         if not self._confirm_discard():
@@ -334,8 +346,11 @@ class ReviewFrame(ttk.Frame):
         if z == "Fit":
             cw = max(self.canvas.winfo_width(), 1)
             ch = max(self.canvas.winfo_height(), 1)
-            return max(min(cw / self._pil.width, ch / self._pil.height), 0.02)
-        return int(z.rstrip("%")) / 100.0
+            scale = max(min(cw / self._pil.width, ch / self._pil.height), 0.02)
+        else:
+            scale = int(z.rstrip("%")) / 100.0
+        max_scale = (_MAX_RENDER_PX / (self._pil.width * self._pil.height)) ** 0.5
+        return min(scale, max_scale)
 
     def _render_if_fit(self) -> None:
         if self._pil is not None and self.var_zoom.get() == "Fit":

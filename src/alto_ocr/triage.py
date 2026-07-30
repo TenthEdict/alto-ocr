@@ -39,6 +39,7 @@ from pathlib import Path
 
 from lxml import etree
 
+from .alto_format import hardened_parser
 from .walker import natural_chunks, natural_key
 
 logger = logging.getLogger(__name__)
@@ -160,7 +161,7 @@ class ObjectConfidence:
 
 def scan_alto_file(alto_path: Path, *, low_wc: float = DEFAULT_LOW_WC) -> PageConfidence:
     """Read confidence facts from one ALTO file (namespace-agnostic)."""
-    root = etree.parse(str(alto_path)).getroot()
+    root = etree.parse(str(alto_path), hardened_parser()).getroot()
 
     for proc in root.iter("{*}Processing"):
         if proc.get("ID") == "failed":
@@ -267,6 +268,14 @@ def _fmt(v: float | None, places: int = 2) -> str:
     return "" if v is None else f"{v:.{places}f}"
 
 
+def _excel_safe(value: str) -> str:
+    """Neutralize spreadsheet formula injection for cells sourced from
+    filesystem names: Excel executes cells starting with ``=`` ``+`` ``-``
+    ``@``. A leading apostrophe marks the cell as text (the quote itself is
+    not displayed). The triage CSVs are explicitly opened in Excel."""
+    return f"'{value}" if value[:1] in ("=", "+", "-", "@") else value
+
+
 def write_csvs(objects: list[ObjectConfidence], out_dir: Path) -> tuple[Path, Path]:
     """Write ``triage_objects.csv`` + ``triage_pages.csv`` into ``out_dir``.
 
@@ -287,10 +296,10 @@ def write_csvs(objects: list[ObjectConfidence], out_dir: Path) -> tuple[Path, Pa
         for o in objects:
             pct_low = (100.0 * o.low_words / o.scored_words) if o.scored_words else None
             w.writerow([
-                o.ref_id, o.page_count, o.scored_pages, o.unscored_pages,
+                _excel_safe(o.ref_id), o.page_count, o.scored_pages, o.unscored_pages,
                 o.empty_pages, o.failed_pages,
                 o.total_words, o.low_words, _fmt(pct_low, 1),
-                _fmt(o.mean_wc, 3), _fmt(o.min_pc), o.min_pc_stem or "",
+                _fmt(o.mean_wc, 3), _fmt(o.min_pc), _excel_safe(o.min_pc_stem or ""),
                 len(o.review_pages),
             ])
 
@@ -302,7 +311,7 @@ def write_csvs(objects: list[ObjectConfidence], out_dir: Path) -> tuple[Path, Pa
         ])
         for ref_id, p in worst_pages(objects):
             w.writerow([
-                ref_id, p.stem, p.status, _fmt(p.pc), p.words,
+                _excel_safe(ref_id), _excel_safe(p.stem), p.status, _fmt(p.pc), p.words,
                 p.low_words, _fmt(p.pct_low, 1),
             ])
 

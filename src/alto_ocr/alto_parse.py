@@ -22,8 +22,11 @@ from xml.etree import ElementTree as ET
 
 from PIL import Image
 
-# Archival scans are huge; don't trip Pillow's decompression-bomb guard.
-Image.MAX_IMAGE_PIXELS = None
+# Archival scans are huge (hundreds of megapixels), so raise Pillow's
+# decompression-bomb guard far past any real scan — but keep a ceiling so a
+# corrupt or malicious file can't demand unbounded memory (Pillow warns at
+# this value and errors at 2x it).
+Image.MAX_IMAGE_PIXELS = 1_000_000_000
 
 # Post-conversion ALTO is v2; accept v3 as well so the tools also work on raw
 # engine/Tesseract output during debugging.

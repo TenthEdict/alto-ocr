@@ -893,6 +893,11 @@ class AltoOcrApp:
         self.log_text.configure(state="normal")
         tag = level if level in ("ERROR", "WARNING", "INFO", "DEBUG") else "INFO"
         self.log_text.insert("end", msg + "\n", tag)
+        # Trim retention: a multi-hour batch logs tens of thousands of lines
+        # and Tk's Text widget gets sluggish past ~10^5. Keep the newest ~5000.
+        line_count = int(self.log_text.index("end-1c").split(".")[0])
+        if line_count > 6000:
+            self.log_text.delete("1.0", f"{line_count - 5000}.0")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 

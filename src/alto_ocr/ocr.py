@@ -55,6 +55,7 @@ from .alto_format import (  # noqa: F401  — ALTO_NS/ALTO_NS_V3 re-exported for
     XSI_NS,
     alto_namespace,
     convert_to_institution_format,
+    hardened_parser,
     qname,
     serialize_with_tabs,
 )
@@ -146,6 +147,7 @@ def check_tesseract_version(binary: Path) -> str:
     result = subprocess.run(
         [str(binary), "--version"],
         capture_output=True, text=True, check=True,
+        encoding="utf-8", errors="replace",
         creationflags=_NO_WINDOW_FLAGS,
     )
     # Tesseract prints version to stderr on some builds, stdout on others.
@@ -186,6 +188,7 @@ def _run_tesseract(
     logger.debug("tesseract: %s", " ".join(cmd))
     proc = subprocess.run(
         cmd, capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
         creationflags=_NO_WINDOW_FLAGS,
     )
     if proc.returncode != 0:
@@ -234,7 +237,7 @@ def _merge_tsv_confidence(alto_path: Path, tsv_path: Path) -> None:
         confs.setdefault(tuple(parts[6:10]), []).append(conf)
         all_confs.append(conf)
 
-    parser = etree.XMLParser(remove_blank_text=True)
+    parser = hardened_parser(remove_blank_text=True)
     tree = etree.parse(str(alto_path), parser)
     root = tree.getroot()
     ns = alto_namespace(root)
