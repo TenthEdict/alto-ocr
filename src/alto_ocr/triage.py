@@ -39,7 +39,7 @@ from pathlib import Path
 
 from lxml import etree
 
-from .walker import _natural_chunks, _natural_key
+from .walker import natural_chunks, natural_key
 
 logger = logging.getLogger(__name__)
 
@@ -213,7 +213,7 @@ def scan_object(
     if not alto_dir.is_dir():
         return None
     obj = ObjectConfidence(ref_id=object_dir.name, review_pc=review_pc)
-    for alto_path in sorted(alto_dir.glob("*.xml"), key=_natural_key):
+    for alto_path in sorted(alto_dir.glob("*.xml"), key=natural_key):
         try:
             obj.pages.append(scan_alto_file(alto_path, low_wc=low_wc))
         except Exception as e:  # noqa: BLE001 - one bad file must not kill the report
@@ -258,7 +258,7 @@ def worst_pages(objects: list[ObjectConfidence]) -> list[tuple[str, PageConfiden
         _STATUS_RANK.get(rp[1].status, 9),
         rp[1].pc if rp[1].pc is not None else 2.0,
         rp[0],
-        _natural_chunks(rp[1].stem),
+        natural_chunks(rp[1].stem),
     ))
     return rows
 

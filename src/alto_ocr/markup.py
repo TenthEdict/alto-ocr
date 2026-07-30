@@ -189,7 +189,11 @@ _GENERIC_CMD_RE = re.compile(r"\\([a-zA-Z]+)")
 _MATH_SPAN_RE = re.compile(
     r"\\begin\{[^{}]*\}(.*?)\\end\{[^{}]*\}"
     r"|\$\$(.+?)\$\$"
-    r"|\$(.+?)\$"
+    # Single-$ spans are SAME-LINE only: with DOTALL, two unrelated currency
+    # signs on different lines would otherwise pair into one "math span" and
+    # be silently eaten. Display math ($$…$$, \[…\], environments) stays
+    # multi-line; inline $…$ math never legitimately crosses a line break.
+    r"|\$([^\n]+?)\$"
     r"|\\\[(.+?)\\\]"
     r"|\\\((.+?)\\\)",
     re.DOTALL,

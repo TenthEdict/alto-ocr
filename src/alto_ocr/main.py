@@ -19,12 +19,12 @@ from .glmocr import (
     DEFAULT_NUM_PREDICT, GLMOCRConfig, GLMOCRError, check_endpoint, resolve_endpoint,
 )
 from .line_detect import DetectParams
+from .alto_format import convert_to_institution_format
 from .ocr import (
     GLMOCREngine,
     OCREngine,
     OCROptions,
     TesseractEngine,
-    _convert_to_institution_format,
     check_tesseract_version,
     find_tesseract,
 )
@@ -49,7 +49,7 @@ from .triage import (
     worst_pages,
     write_csvs,
 )
-from .walker import SkippedRefId, _natural_key, discover_collection, discover_ref_id
+from .walker import SkippedRefId, discover_collection, discover_ref_id, natural_key
 
 app = typer.Typer(
     name="alto-ocr",
@@ -825,7 +825,7 @@ def reformat(
     alto_dir = target / "ALTO" if (target / "ALTO").is_dir() else target
     xml_files = sorted(
         [p for p in alto_dir.glob("*.xml") if p.is_file()],
-        key=_natural_key,
+        key=natural_key,
     )
     if not xml_files:
         console.print(f"[red]No ALTO XML files found under {alto_dir}[/red]")
@@ -838,7 +838,7 @@ def reformat(
             tif = _find_source_tif(path, source_tiff_dir)
             page_dpi = dpi if dpi is not None else _resolve_dpi_from_tif(tif, min_dpi=min_dpi)
             source_filename = tif.name if tif is not None else f"{path.stem}.tiff"
-            _convert_to_institution_format(
+            convert_to_institution_format(
                 path, page_index=idx, dpi=page_dpi, source_filename=source_filename,
             )
             n_ok += 1

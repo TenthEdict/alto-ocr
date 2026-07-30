@@ -37,9 +37,15 @@ from pathlib import Path
 from lxml import etree
 
 from ._util import atomic_write_text
+from .alto_format import (
+    ATTR_ORDER,
+    alto_namespace,
+    qname,
+    reorder_attrs,
+    serialize_with_tabs,
+)
 from .mets import METS_NS, PageEntry, build_mets, write_mets
-from .ocr import _ATTR_ORDER, _qname, _reorder_attrs, _serialize_with_tabs
-from .walker import IMAGE_SUFFIXES, _natural_key
+from .walker import IMAGE_SUFFIXES, natural_key
 
 logger = logging.getLogger(__name__)
 
@@ -118,12 +124,12 @@ class ReviewPage:
                 "re-run OCR for this page instead of reviewing it."
             ) from e
         self.root = self.tree.getroot()
-        # Namespace of the document's ALTO elements, taken from the root's own
-        # qualified name — prefixed ALTO (external editors) works the same as
-        # default-namespace ALTO. nsmap.get(None) would miss prefixed docs.
-        self.ns = etree.QName(self.root).namespace
+        # Namespace of the document's ALTO elements — the shared idiom
+        # (alto_format.alto_namespace): prefixed ALTO from external editors
+        # works the same as default-namespace ALTO.
+        self.ns = alto_namespace(self.root)
 
-        self.page = self.root.find(f".//{_qname(self.ns, 'Page')}")
+        self.page = self.root.find(f".//{qname(self.ns, 'Page')}")
         if self.page is None:
             raise StubPageError(
                 f"{self.alto_path.name} has no <Page> — it is a failure stub; "
@@ -142,7 +148,7 @@ class ReviewPage:
         self.sy = img_h / page_h
 
         self.words: list[Word] = []
-        for el in self.root.iter(_qname(self.ns, "String")):
+        for el in self.root.iter(qname(self.ns, "String")):
             try:
                 h, v = int(el.get("HPOS", "")), int(el.get("VPOS", ""))
                 w, ht = int(el.get("WIDTH", "")), int(el.get("HEIGHT", ""))
@@ -182,7 +188,7 @@ class ReviewPage:
             raise ValueError("Empty text — use delete_word to remove a word.")
         word.elem.set("CONTENT", text)
         word.elem.set("WC", "1.00")
-        _reorder_attrs(word.elem, _ATTR_ORDER["String"])
+        reorder_attrs(word.elem, ATTR_ORDER["String"])
         self.dirty = True
         self.session_edits += 1
 
@@ -190,7 +196,7 @@ class ReviewPage:
         """Remove a hallucinated word (plus a neighboring SP; cascade empties)."""
         el = word.elem
         parent = el.getparent()
-        sp_tag = _qname(self.ns, "SP")
+        sp_tag = qname(self.ns, "SP")
         prev, nxt = el.getprevious(), el.getnext()
         if prev is not None and prev.tag == sp_tag:
             parent.remove(prev)
@@ -200,7 +206,7 @@ class ReviewPage:
 
         # Cascade: drop text containers left with no String anywhere below.
         # Only TextLine/TextBlock/ComposedBlock — never PrintSpace/Page/margins.
-        string_tag = _qname(self.ns, "String")
+        string_tag = qname(self.ns, "String")
         removable = {"TextLine", "TextBlock", "ComposedBlock"}
         node = parent
         while node is not None and etree.QName(node).localname in removable:
@@ -222,7 +228,7 @@ class ReviewPage:
             word.elem.attrib.pop("WC", None)
         else:
             word.elem.set("WC", f"{old_wc:.2f}")
-        _reorder_attrs(word.elem, _ATTR_ORDER["String"])
+        reorder_attrs(word.elem, ATTR_ORDER["String"])
         self.session_edits = max(0, self.session_edits - 1)
 
     # ---------- save ------------------------------------------------------
@@ -252,7 +258,7 @@ class ReviewPage:
                 )
         self._recompute_pc()
         self._stamp_provenance()
-        _serialize_with_tabs(self.tree, self.alto_path)
+        serialize_with_tabs(self.tree, self.alto_path)
         self._loaded_mtime_ns = self.alto_path.stat().st_mtime_ns
 
         txt_path: Path | None = None
@@ -272,34 +278,34 @@ class ReviewPage:
         wcs = [w.wc for w in self.words if w.wc is not None]
         if wcs:
             self.page.set("PC", f"{sum(wcs) / len(wcs):.2f}")
-            _reorder_attrs(self.page, _ATTR_ORDER["Page"])
+            reorder_attrs(self.page, ATTR_ORDER["Page"])
 
     def _stamp_provenance(self) -> None:
-        desc = self.root.find(f"./{_qname(self.ns, 'Description')}")
+        desc = self.root.find(f"./{qname(self.ns, 'Description')}")
         if desc is None:
             return  # non-institution ALTO; don't invent structure
         proc = None
-        for el in desc.findall(_qname(self.ns, "Processing")):
+        for el in desc.findall(qname(self.ns, "Processing")):
             if el.get("ID") == "review":
                 proc = el
                 break
         prior = 0
         if proc is None:
-            proc = etree.SubElement(desc, _qname(self.ns, "Processing"), {"ID": "review"})
+            proc = etree.SubElement(desc, qname(self.ns, "Processing"), {"ID": "review"})
             for tag in ("processingDateTime", "processingAgency", "processingStepDescription"):
-                etree.SubElement(proc, _qname(self.ns, tag))
+                etree.SubElement(proc, qname(self.ns, tag))
         else:
-            step = proc.find(_qname(self.ns, "processingStepDescription"))
+            step = proc.find(qname(self.ns, "processingStepDescription"))
             if step is not None and step.text:
                 m = re.search(r"(\d+) word", step.text)
                 prior = int(m.group(1)) if m else 0
 
         total = prior + self.session_edits
-        proc.find(_qname(self.ns, "processingDateTime")).text = (
+        proc.find(qname(self.ns, "processingDateTime")).text = (
             datetime.now(timezone.utc).isoformat()
         )
-        proc.find(_qname(self.ns, "processingAgency")).text = "alto_ocr"
-        proc.find(_qname(self.ns, "processingStepDescription")).text = (
+        proc.find(qname(self.ns, "processingAgency")).text = "alto_ocr"
+        proc.find(qname(self.ns, "processingStepDescription")).text = (
             f"human review: {total} word(s) corrected"
         )
 
@@ -403,7 +409,7 @@ def repackage_object(
         pages=0, txt_written=0, mets_written=False,
     )
 
-    stems = [p.stem for p in sorted(alto_dir.glob("*.xml"), key=_natural_key)]
+    stems = [p.stem for p in sorted(alto_dir.glob("*.xml"), key=natural_key)]
     result.pages = len(stems)
     if not stems:
         result.problems.append("no ALTO pages found")

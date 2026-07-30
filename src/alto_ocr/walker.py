@@ -47,7 +47,7 @@ _PDF_PAGE_DIGITS = 3
 _NUM_RE = re.compile(r"(\d+)")
 
 
-def _natural_chunks(s: str) -> tuple:
+def natural_chunks(s: str) -> tuple:
     """Split a string into alternating text/int chunks for natural sort.
 
     ``"Page 10"`` → ``("page ", 10, "")``; ``"19270104"`` → ``("", 19270104, "")``.
@@ -60,17 +60,17 @@ def _natural_chunks(s: str) -> tuple:
     )
 
 
-def _natural_key(path: Path) -> tuple:
+def natural_key(path: Path) -> tuple:
     """Sort key for a Path based on its filename stem (no directory parts).
 
     Useful when sorting a flat list of files that already live in the same
     directory — e.g., ALTO XML outputs being re-collated from a single
     ``ALTO/`` folder.
     """
-    return _natural_chunks(path.stem)
+    return natural_chunks(path.stem)
 
 
-def _rel_natural_key(path: Path, base: Path) -> tuple:
+def rel_natural_key(path: Path, base: Path) -> tuple:
     """Sort key: relative-path components from ``base``, each naturally sorted.
 
     For ``base = /A`` and ``path = /A/year/meeting/001foo.tif``, returns a
@@ -81,7 +81,7 @@ def _rel_natural_key(path: Path, base: Path) -> tuple:
     """
     rel = path.relative_to(base)
     *dir_parts, name = rel.parts
-    return tuple(_natural_chunks(p) for p in (*dir_parts, Path(name).stem))
+    return tuple(natural_chunks(p) for p in (*dir_parts, Path(name).stem))
 
 
 def _is_junk(path: Path) -> bool:
@@ -164,7 +164,7 @@ def _find_sources_in(directory: Path) -> list[SourceFile]:
                     continue
                 sources.append(SourceFile(path=full, page_count=n))
     if sources:
-        return sorted(sources, key=lambda s: _rel_natural_key(s.path, directory))
+        return sorted(sources, key=lambda s: rel_natural_key(s.path, directory))
 
     leftovers = [p.name for p in directory.iterdir() if not _is_junk(p)]
     if leftovers:

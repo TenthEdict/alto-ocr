@@ -23,11 +23,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from lxml import etree  # noqa: E402
 
-from src.alto_ocr.ocr import (  # noqa: E402
+from src.alto_ocr.alto_format import (  # noqa: E402
     ALTO_NS_V2,
-    _convert_to_institution_format,
-    _merge_tsv_confidence,
+    convert_to_institution_format,
 )
+from src.alto_ocr.ocr import _merge_tsv_confidence  # noqa: E402
 
 _RAW_ALTO = """<?xml version="1.0" encoding="UTF-8"?>
 <alto xmlns="http://www.loc.gov/standards/alto/ns-v3#">
@@ -109,7 +109,7 @@ class MergeTsvConfidenceTests(unittest.TestCase):
 
     def test_wc_pc_survive_institution_format_conversion(self) -> None:
         _merge_tsv_confidence(self.alto, self.tsv)
-        _convert_to_institution_format(
+        convert_to_institution_format(
             self.alto, 1, dpi=300, source_filename="page.tif",
         )
         root = etree.parse(str(self.alto)).getroot()

@@ -36,7 +36,7 @@ from .ocr import OCREngine
 from .remediate import has_review_provenance
 from .pdf import rasterize_pdf
 from .preprocess import PreprocessConfig, preprocess
-from .walker import RefIdInputs, SkippedRefId, _rel_natural_key
+from .walker import RefIdInputs, SkippedRefId, rel_natural_key
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +99,7 @@ def _expand_sources(
                 stem=tif.stem,
             ))
 
-    pages.sort(key=lambda p: _rel_natural_key(p.sort_path, inputs.source_dir))
+    pages.sort(key=lambda p: rel_natural_key(p.sort_path, inputs.source_dir))
     return pages
 
 

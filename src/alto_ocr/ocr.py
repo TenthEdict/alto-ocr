@@ -46,6 +46,18 @@ from lxml import etree
 from dataclasses import replace as dc_replace
 
 from ._util import atomic_write_text
+from .alto_format import (  # noqa: F401  — ALTO_NS/ALTO_NS_V3 re-exported for compat
+    ALTO_NS,
+    ALTO_NS_V2,
+    ALTO_NS_V3,
+    ALTO_V2_SCHEMA_URL,
+    XLINK_NS,
+    XSI_NS,
+    alto_namespace,
+    convert_to_institution_format,
+    qname,
+    serialize_with_tabs,
+)
 from .glmocr import GLMOCRConfig, transcribe
 from .line_detect import DetectParams, LineBox, TextBlock, _clean_mask, detect_blocks
 from .markup import normalize_markup
@@ -60,17 +72,9 @@ logger = logging.getLogger(__name__)
 _NO_WINDOW_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 # Output ALTO v2 to match the institution's reference format. Tesseract
-# emits v3; the converter swaps the namespace + schema location and
-# normalizes everything else (units, attribute order, indentation, etc.).
-ALTO_NS_V2 = "http://www.loc.gov/standards/alto/ns-v2#"
-ALTO_NS_V3 = "http://www.loc.gov/standards/alto/ns-v3#"
-_ALTO_V2_SCHEMA_URL = "http://www.loc.gov/standards/alto/v2/alto-2-0.xsd"
-_XSI_NS = "http://www.w3.org/2001/XMLSchema-instance"
-_XLINK_NS = "http://www.w3.org/1999/xlink"
-
-# Backwards-compatible alias for code (and tests) that still imports the
-# old single-version constant.
-ALTO_NS = ALTO_NS_V2
+# emits v3; alto_format.convert_to_institution_format swaps the namespace +
+# schema location and normalizes everything else (units, attribute order,
+# indentation, etc.) — the whole serialization layer lives in alto_format.
 
 
 class TesseractNotFoundError(RuntimeError):
@@ -205,7 +209,7 @@ def _merge_tsv_confidence(alto_path: Path, tsv_path: Path) -> None:
     mean word confidence — which is what remediation triage sorts on to
     find pages (and handwriting-heavy objects) that need human attention.
 
-    Must run *before* ``_convert_to_institution_format``: matching relies
+    Must run *before* ``convert_to_institution_format``: matching relies
     on the ALTO coordinates still being in pixels. The added attributes
     survive conversion (they're not pixel attrs, and the attribute-order
     tables already reserve WC/PC slots from the reference samples).
@@ -233,10 +237,10 @@ def _merge_tsv_confidence(alto_path: Path, tsv_path: Path) -> None:
     parser = etree.XMLParser(remove_blank_text=True)
     tree = etree.parse(str(alto_path), parser)
     root = tree.getroot()
-    ns = root.nsmap.get(None)
+    ns = alto_namespace(root)
 
     unmatched = 0
-    for el in root.iter(_qname(ns, "String")):
+    for el in root.iter(qname(ns, "String")):
         key = (el.get("HPOS"), el.get("VPOS"), el.get("WIDTH"), el.get("HEIGHT"))
         bucket = confs.get(key)
         if bucket:
@@ -250,288 +254,15 @@ def _merge_tsv_confidence(alto_path: Path, tsv_path: Path) -> None:
         )
 
     if all_confs:
-        page = root.find(f".//{_qname(ns, 'Page')}")
+        page = root.find(f".//{qname(ns, 'Page')}")
         if page is not None:
             page.set("PC", f"{sum(all_confs) / len(all_confs) / 100:.2f}")
 
-    _serialize_with_tabs(tree, alto_path)
+    serialize_with_tabs(tree, alto_path)
 
 
-# Both Tesseract and the GLMOCR builder emit ALTO that doesn't match the
-# institution's reference format (verified to work with their downstream
-# system). The post-processor below normalizes the file end-to-end:
-#
-#   * Sequential ``P{N}`` page IDs and element-type-prefixed child IDs
-#     (``P{N}_TB00001`` / ``P{N}_TL00001`` / ``P{N}_ST00001`` etc.).
-#   * Explicit Top/Left/Right/BottomMargin elements derived from the
-#     bounding box of the printed area; PrintSpace shrunk to that bbox.
-#   * MeasurementUnit ``mm10`` (1/10 mm) with all HPOS/VPOS/WIDTH/HEIGHT
-#     values converted from the OCR's pixel space using the page's DPI.
-#   * ALTO v2 namespace + schema location.
-#   * ``<sourceImageInformation>`` referencing the source TIF basename.
-#   * Per-element-type attribute order matching the reference samples.
-#   * Tab indentation, double-quoted XML declaration.
-#
-# The converter is idempotent: it detects whether coordinates are already
-# in mm10 (via MeasurementUnit) and skips re-conversion on subsequent
-# passes; existing margins are stripped before recomputing; the namespace
-# swap is a no-op when the input is already v2.
-_TYPE_CODES = {
-    "ComposedBlock": "CB",
-    "TextBlock": "TB",
-    "TextLine": "TL",
-    "String": "ST",
-    "SP": "SP",
-}
-
-_PIXEL_ATTRS = ("HPOS", "VPOS", "WIDTH", "HEIGHT")
-
-# Per-element attribute order matching the reference samples. Unknown
-# attributes are appended after the listed ones in their original order.
-_ATTR_ORDER: dict[str, tuple[str, ...]] = {
-    "Page":          ("ID", "PHYSICAL_IMG_NR", "HEIGHT", "WIDTH", "PC"),
-    "TopMargin":     ("ID", "HPOS", "VPOS", "WIDTH", "HEIGHT"),
-    "LeftMargin":    ("ID", "HPOS", "VPOS", "WIDTH", "HEIGHT"),
-    "RightMargin":   ("ID", "HPOS", "VPOS", "WIDTH", "HEIGHT"),
-    "BottomMargin":  ("ID", "HPOS", "VPOS", "WIDTH", "HEIGHT"),
-    "PrintSpace":    ("ID", "HPOS", "VPOS", "WIDTH", "HEIGHT"),
-    "ComposedBlock": ("ID", "HPOS", "VPOS", "WIDTH", "HEIGHT", "STYLEREFS", "TYPE"),
-    "TextBlock":     ("ID", "HPOS", "VPOS", "WIDTH", "HEIGHT", "language", "STYLEREFS"),
-    "TextLine":      ("ID", "HPOS", "VPOS", "WIDTH", "HEIGHT"),
-    "String":        ("ID", "HPOS", "VPOS", "WIDTH", "HEIGHT", "CONTENT", "WC", "CC",
-                       "STYLEREFS", "SUBS_TYPE", "SUBS_CONTENT"),
-    "SP":            ("ID", "HPOS", "VPOS", "WIDTH"),
-    "GraphicalElement": ("ID", "HPOS", "VPOS", "WIDTH", "HEIGHT"),
-}
-
-
-def _qname(ns: str | None, tag: str) -> str:
-    return f"{{{ns}}}{tag}" if ns else tag
-
-
-def _px_to_mm10(px: int, dpi: int) -> int:
-    """Convert a pixel value to ALTO ``mm10`` units (1/10 mm).
-
-    1 inch = 25.4 mm = 254 mm10, so ``mm10 = px * 254 / dpi``. Result is
-    rounded to the nearest integer (ALTO coordinate attributes are integer
-    strings).
-    """
-    if dpi <= 0:
-        return px  # safety net; caller should validate dpi
-    return int(round(px * 254 / dpi))
-
-
-def _reorder_attrs(elem: etree._Element, order: tuple[str, ...]) -> None:
-    current = dict(elem.attrib)
-    elem.attrib.clear()
-    for key in order:
-        if key in current:
-            elem.set(key, current.pop(key))
-    for key, value in current.items():
-        elem.set(key, value)
-
-
-def _change_default_namespace(root: etree._Element, new_ns: str) -> etree._Element:
-    """Rebuild the tree under a new default namespace, preserving xsi/xlink."""
-    old_ns = root.nsmap.get(None)
-    nsmap = {None: new_ns, "xsi": _XSI_NS, "xlink": _XLINK_NS}
-
-    def remap(tag: str) -> str:
-        qn = etree.QName(tag)
-        if qn.namespace == old_ns:
-            return f"{{{new_ns}}}{qn.localname}"
-        return tag
-
-    new_root = etree.Element(remap(root.tag), nsmap=nsmap)
-    new_root.text = root.text
-    for k, v in root.attrib.items():
-        new_root.set(remap(k), v)
-
-    def copy_into(src: etree._Element, dst: etree._Element) -> None:
-        for child in src:
-            new_child = etree.SubElement(dst, remap(child.tag))
-            for k, v in child.attrib.items():
-                new_child.set(remap(k), v)
-            new_child.text = child.text
-            new_child.tail = child.tail
-            copy_into(child, new_child)
-
-    copy_into(root, new_root)
-    return new_root
-
-
-def _serialize_with_tabs(tree: etree._ElementTree, alto_path: Path) -> None:
-    """Write tree with tab indentation and a double-quoted XML declaration.
-
-    lxml's ``pretty_print`` uses 2-space indents and its XML declaration
-    uses single quotes; the institution's reference samples use tabs and
-    double quotes. We post-process the serialized string to match.
-
-    The write is atomic (``_util.atomic_write_text``): a crash or I/O error
-    mid-save can never truncate an existing ALTO — load-bearing once a file
-    carries hand corrections.
-    """
-    body = etree.tostring(
-        tree, pretty_print=True, encoding="utf-8", xml_declaration=False,
-    ).decode("utf-8")
-    body = re.sub(
-        r"^( {2})+",
-        lambda m: "\t" * (len(m.group(0)) // 2),
-        body,
-        flags=re.MULTILINE,
-    )
-    atomic_write_text(
-        alto_path, '<?xml version="1.0" encoding="UTF-8"?>\n' + body,
-    )
-
-
-def _convert_to_institution_format(
-    alto_path: Path,
-    page_index: int,
-    *,
-    dpi: int,
-    source_filename: str | None = None,
-) -> None:
-    """Rewrite the ALTO file at ``alto_path`` to match the institution's
-    reference format. See the module-level comment block above for the full
-    list of transformations.
-
-    ``dpi`` is the effective DPI at which the OCR coordinates were produced
-    (typically ``preprocess.PreprocessResult.effective_dpi``). It is used to
-    convert pixel coordinates to mm10. If the file's ``MeasurementUnit`` is
-    already ``mm10``, the conversion step is skipped (idempotency).
-
-    ``source_filename`` is the basename of the source TIF (e.g.
-    ``image001.tif``); when provided, ``<sourceImageInformation><fileName>``
-    is set to ``./<source_filename>`` to match the reference convention.
-    Pass ``None`` to leave any existing fileName text alone.
-    """
-    parser = etree.XMLParser(remove_blank_text=True)
-    tree = etree.parse(str(alto_path), parser)
-    root = tree.getroot()
-    src_ns = root.nsmap.get(None)
-
-    desc = root.find(f"./{_qname(src_ns, 'Description')}")
-    mu_el = desc.find(f"./{_qname(src_ns, 'MeasurementUnit')}") if desc is not None else None
-    needs_unit_conversion = mu_el is None or (mu_el.text or "").strip() != "mm10"
-
-    page = root.find(f".//{_qname(src_ns, 'Page')}")
-    if page is not None:
-        page_id = f"P{page_index}"
-        page.set("ID", page_id)
-        page.set("PHYSICAL_IMG_NR", str(page_index))
-
-        try:
-            page_w = int(page.get("WIDTH", "0"))
-            page_h = int(page.get("HEIGHT", "0"))
-        except (TypeError, ValueError):
-            page_w = page_h = 0
-
-        for margin_tag in ("TopMargin", "LeftMargin", "RightMargin", "BottomMargin"):
-            for el in page.findall(_qname(src_ns, margin_tag)):
-                page.remove(el)
-
-        print_space = page.find(_qname(src_ns, "PrintSpace"))
-        if print_space is not None:
-            print_space.set("ID", f"{page_id}_PS00001")
-            children = list(print_space)
-            if children and page_w > 0 and page_h > 0:
-                try:
-                    xs  = [int(c.get("HPOS", "0")) for c in children]
-                    ys  = [int(c.get("VPOS", "0")) for c in children]
-                    xs2 = [int(c.get("HPOS", "0")) + int(c.get("WIDTH", "0")) for c in children]
-                    ys2 = [int(c.get("VPOS", "0")) + int(c.get("HEIGHT", "0")) for c in children]
-                    min_x, min_y = min(xs), min(ys)
-                    max_x, max_y = max(xs2), max(ys2)
-                except (TypeError, ValueError):
-                    min_x = None  # type: ignore[assignment]
-
-                if isinstance(min_x, int):
-                    # Clamp to page so leaked-past-edge blocks (Tesseract
-                    # does this on noisy scans) don't yield negative-area
-                    # margins.
-                    min_x = max(0, min(min_x, page_w))
-                    min_y = max(0, min(min_y, page_h))
-                    max_x = max(min_x, min(max_x, page_w))
-                    max_y = max(min_y, min(max_y, page_h))
-
-                    print_space.set("HPOS", str(min_x))
-                    print_space.set("VPOS", str(min_y))
-                    print_space.set("WIDTH", str(max_x - min_x))
-                    print_space.set("HEIGHT", str(max_y - min_y))
-
-                    ps_idx = list(page).index(print_space)
-                    margins = [
-                        ("TopMargin",    f"{page_id}_TM00001", 0,     0,     page_w,         min_y),
-                        ("LeftMargin",   f"{page_id}_LM00001", 0,     min_y, min_x,          max_y - min_y),
-                        ("RightMargin",  f"{page_id}_RM00001", max_x, min_y, page_w - max_x, max_y - min_y),
-                        ("BottomMargin", f"{page_id}_BM00001", 0,     max_y, page_w,         page_h - max_y),
-                    ]
-                    for offset, (tag, mid, h, v, w, ht) in enumerate(margins):
-                        el = etree.Element(_qname(src_ns, tag), attrib={
-                            "ID":   mid,
-                            "HPOS": str(h),
-                            "VPOS": str(v),
-                            "WIDTH":  str(w),
-                            "HEIGHT": str(ht),
-                        })
-                        page.insert(ps_idx + offset, el)
-
-        counters: dict[str, int] = {tag: 0 for tag in _TYPE_CODES}
-        for el in page.iter():
-            local = etree.QName(el).localname
-            code = _TYPE_CODES.get(local)
-            if code is None:
-                continue
-            counters[local] += 1
-            el.set("ID", f"{page_id}_{code}{counters[local]:05d}")
-
-    # Ensure MeasurementUnit = mm10 + sourceImageInformation/fileName.
-    if desc is not None:
-        if mu_el is None:
-            mu_el = etree.Element(_qname(src_ns, "MeasurementUnit"))
-            desc.insert(0, mu_el)
-        mu_el.text = "mm10"
-
-        if source_filename is not None:
-            sii = desc.find(f"./{_qname(src_ns, 'sourceImageInformation')}")
-            if sii is None:
-                sii = etree.Element(_qname(src_ns, "sourceImageInformation"))
-                desc.insert(list(desc).index(mu_el) + 1, sii)
-            fn = sii.find(f"./{_qname(src_ns, 'fileName')}")
-            if fn is None:
-                fn = etree.SubElement(sii, _qname(src_ns, "fileName"))
-            fn.text = f"./{source_filename}"
-
-    if needs_unit_conversion:
-        for el in root.iter():
-            for attr in _PIXEL_ATTRS:
-                val = el.get(attr)
-                if val is None:
-                    continue
-                try:
-                    px = int(val)
-                except (TypeError, ValueError):
-                    continue
-                el.set(attr, str(_px_to_mm10(px, dpi)))
-
-    for el in root.iter():
-        local = etree.QName(el).localname
-        order = _ATTR_ORDER.get(local)
-        if order is not None:
-            _reorder_attrs(el, order)
-
-    if src_ns != ALTO_NS_V2:
-        new_root = _change_default_namespace(root, ALTO_NS_V2)
-        tree = etree.ElementTree(new_root)
-        root = new_root
-
-    root.set(
-        f"{{{_XSI_NS}}}schemaLocation",
-        f"{ALTO_NS_V2} {_ALTO_V2_SCHEMA_URL}",
-    )
-
-    _serialize_with_tabs(tree, alto_path)
+# (The attribute-order tables, tab serializer, and institution-format
+# converter that used to live here moved verbatim to alto_format.py.)
 
 
 class OCREngine(Protocol):
@@ -665,7 +396,7 @@ class TesseractEngine:
             except OSError:
                 logger.debug("Could not remove TSV file: %s", tsv)
 
-        _convert_to_institution_format(
+        convert_to_institution_format(
             alto, page_index, dpi=dpi, source_filename=source_filename,
         )
         return alto, txt
@@ -859,7 +590,7 @@ def _build_alto_words(
     Lines with no assigned text are skipped, and a block with no text-bearing
     lines is skipped; a page with nothing left produces a valid empty Layout
     (matching Tesseract on blank pages). Element IDs here are placeholders —
-    ``_convert_to_institution_format`` renumbers every element afterwards.
+    ``convert_to_institution_format`` renumbers every element afterwards.
 
     ``page_index`` is the 1-based page number within the Ref ID; it seeds the
     Page ID + PHYSICAL_IMG_NR so child IDs stay unique when downstream consumers
@@ -920,9 +651,9 @@ def _build_alto_words(
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         f'<alto xmlns="{ALTO_NS_V2}" '
-        f'xmlns:xsi="{_XSI_NS}" '
-        f'xsi:schemaLocation="{ALTO_NS_V2} {_ALTO_V2_SCHEMA_URL}" '
-        f'xmlns:xlink="{_XLINK_NS}">\n'
+        f'xmlns:xsi="{XSI_NS}" '
+        f'xsi:schemaLocation="{ALTO_NS_V2} {ALTO_V2_SCHEMA_URL}" '
+        f'xmlns:xlink="{XLINK_NS}">\n'
         '  <Description>\n'
         '    <MeasurementUnit>pixel</MeasurementUnit>\n'
         f'    <OCRProcessing ID="OCR_0">\n'
@@ -1121,7 +852,7 @@ class GLMOCREngine:
         txt_path = output_base.with_suffix(".txt")
         atomic_write_text(alto_path, alto_xml)
         atomic_write_text(txt_path, txt_out)
-        _convert_to_institution_format(
+        convert_to_institution_format(
             alto_path, page_index, dpi=dpi, source_filename=source_filename,
         )
         return alto_path, txt_path
