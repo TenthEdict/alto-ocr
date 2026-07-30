@@ -185,13 +185,13 @@ class SaveTests(_PageFixture):
 class AltoToTextTests(unittest.TestCase):
     def test_rendering_shape(self) -> None:
         root = etree.fromstring(_ALTO.encode())
-        self.assertEqual(alto_to_text(root, root.nsmap.get(None)),
+        self.assertEqual(alto_to_text(root),
                          "Board cf\n1927\n\nLone\n")
 
     def test_empty_layout_renders_empty(self) -> None:
         stub = ALTO_FAILURE_STUB.format(when="t", reason="x")
         root = etree.fromstring(stub.encode())
-        self.assertEqual(alto_to_text(root, root.nsmap.get(None)), "")
+        self.assertEqual(alto_to_text(root), "")
 
 
 class SourceIndexTests(unittest.TestCase):

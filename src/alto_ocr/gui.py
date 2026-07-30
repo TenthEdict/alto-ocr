@@ -37,10 +37,16 @@ from .ocr import (
     check_tesseract_version,
     find_tesseract,
 )
-from .pipeline import PageProgressLogger, RefIdResult, process_ref_id
+from .pipeline import (
+    PageProgressLogger,
+    RefIdResult,
+    failed_ref_result,
+    process_ref_id,
+    skipped_ref_result,
+)
 from .preprocess import PreprocessConfig
 from .review import ReviewFrame
-from .walker import discover_collection, discover_ref_id
+from .walker import SkippedRefId, discover_collection, discover_ref_id
 
 APP_TITLE = "Alto OCR"
 SETTINGS_PATH = Path.home() / ".alto_ocr.json"
@@ -740,9 +746,12 @@ class AltoOcrApp:
     def _worker_main(self, cfg: JobConfig) -> None:
         # Discover work first so we know which engines we actually need.
         # Building GLMOCR runs an endpoint check; skip it when no Ref ID needs it.
+        skipped: list[SkippedRefId] = []
         if cfg.recurse:
-            items = discover_collection(cfg.input_dir)
-            if not items:
+            items, skipped = discover_collection(cfg.input_dir)
+            for sk in skipped:
+                logger.error("SKIPPED %s: %s", sk.ref_id, sk.reason)
+            if not items and not skipped:
                 logger.error("No Ref IDs with TIFs found inside %s", cfg.input_dir)
                 self._signal_done(success=False)
                 return
@@ -752,7 +761,11 @@ class AltoOcrApp:
         else:
             single = discover_ref_id(cfg.input_dir)
             if single is None:
-                logger.error("No TIFs found in %s", cfg.input_dir)
+                logger.error("No TIFs or PDFs found in %s", cfg.input_dir)
+                self._signal_done(success=False)
+                return
+            if isinstance(single, SkippedRefId):
+                logger.error("%s: %s", single.ref_id, single.reason)
                 self._signal_done(success=False)
                 return
             items = [single]
@@ -791,17 +804,23 @@ class AltoOcrApp:
                     on_page_done=progress.tick,
                 )
                 results.append(r)
-            except Exception:
+            except Exception as e:
                 logger.error("Unhandled error on %s:\n%s",
                              inputs.ref_id, traceback.format_exc())
+                # Mirror the CLI: a crashed Ref ID must appear in the final
+                # accounting, not just scroll by in the log.
+                results.append(failed_ref_result(inputs, cfg.output_dir, e))
             self._set_progress(i, len(items))
 
+        for sk in skipped:
+            results.append(skipped_ref_result(sk, cfg.output_dir))
         ok = sum(1 for r in results if r.ok)
-        failed_pages = sum(len(r.failed_pages) for r in results)
+        failed_pages = sum(r.failed_page_count for r in results)
+        n_total = len(items) + len(skipped)
         verb = "Cancelled" if cancelled else "Done"
         logger.info("%s: %d/%d Ref ID(s) succeeded, %d failed page(s).",
-                    verb, ok, len(items), failed_pages)
-        self._signal_done(success=(not cancelled and ok == len(items)))
+                    verb, ok, n_total, failed_pages)
+        self._signal_done(success=(not cancelled and ok == n_total))
 
     def _build_engine(self, name: str, cfg: JobConfig) -> OCREngine:
         if name == "tesseract":

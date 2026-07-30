@@ -28,6 +28,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
+from xml.sax.saxutils import escape as xml_escape
 
 from ._util import atomic_write_text
 from .mets import PageEntry, build_mets, write_mets
@@ -35,7 +36,7 @@ from .ocr import OCREngine
 from .remediate import has_review_provenance
 from .pdf import rasterize_pdf
 from .preprocess import PreprocessConfig, preprocess
-from .walker import RefIdInputs, _rel_natural_key
+from .walker import RefIdInputs, SkippedRefId, _rel_natural_key
 
 logger = logging.getLogger(__name__)
 
@@ -208,9 +209,62 @@ def _write_failure_stubs(alto_path: Path, txt_path: Path | None, reason: str) ->
     from datetime import datetime, timezone
 
     when = datetime.now(timezone.utc).isoformat()
-    atomic_write_text(alto_path, ALTO_FAILURE_STUB.format(when=when, reason=reason))
+    # Escape the reason: exception text routinely contains <, >, & (Tesseract
+    # stderr, OS errors) and would otherwise make the stub malformed XML.
+    atomic_write_text(alto_path, ALTO_FAILURE_STUB.format(
+        when=when, reason=xml_escape(reason)))
     if txt_path is not None:
         atomic_write_text(txt_path, "")
+
+
+def failed_ref_result(inputs: RefIdInputs, output_root: Path,
+                      exc: BaseException) -> RefIdResult:
+    """Synthesize a failed RefIdResult when a whole Ref ID aborts.
+
+    ``process_ref_id`` isolates per-*page* errors itself; this covers a
+    Ref-ID-level exception (or a crashed pool worker) so one bad object can't
+    abort an unattended multi-hour batch. ``expected_page_count`` is set so the
+    summary reports the object's true input page count (not 1), and a single
+    synthetic failed page carries the error. Shared by the CLI and the GUI.
+    """
+    return RefIdResult(
+        ref_id=inputs.ref_id,
+        output_dir=(output_root / inputs.ref_id).resolve(),
+        expected_page_count=inputs.page_count,
+        pages=[PageResult(
+            stem=f"<Ref ID aborted before page output ({inputs.page_count} page(s))>",
+            order=0,
+            ok=False,
+            error=f"{type(exc).__name__}: {exc}",
+        )],
+    )
+
+
+def record_ref_failure(results: list[RefIdResult], inputs: RefIdInputs,
+                       output_root: Path, exc: BaseException) -> None:
+    """Log a Ref-ID-level failure (with traceback) and append a synthetic
+    failed result so the batch continues.
+
+    Uses ``exc_info=exc`` (not bare ``logger.exception``) so the *passed*
+    exception's traceback is logged even when called outside its except
+    block — the CLI's pool-recovery path records errors while handling a
+    BrokenProcessPool."""
+    logger.error("[%s] Ref ID aborted (recorded as failed, continuing): %s",
+                 inputs.ref_id, exc, exc_info=exc)
+    results.append(failed_ref_result(inputs, output_root, exc))
+
+
+def skipped_ref_result(skip: SkippedRefId, output_root: Path) -> RefIdResult:
+    """RefIdResult for an object dropped at discovery (stem collisions), so
+    summaries and exit codes reflect it instead of the object silently
+    vanishing from the run."""
+    return RefIdResult(
+        ref_id=skip.ref_id,
+        output_dir=(output_root / skip.ref_id).resolve(),
+        expected_page_count=skip.page_count,
+        pages=[PageResult(stem="<skipped at discovery>", order=0, ok=False,
+                          error=skip.reason)],
+    )
 
 
 def process_ref_id(

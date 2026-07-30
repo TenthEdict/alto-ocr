@@ -28,7 +28,15 @@ from .ocr import (
     check_tesseract_version,
     find_tesseract,
 )
-from .pipeline import PageProgressLogger, PageResult, RefIdResult, process_ref_id
+from .pipeline import (
+    PageProgressLogger,
+    PageResult,
+    RefIdResult,
+    failed_ref_result,
+    process_ref_id,
+    record_ref_failure,
+    skipped_ref_result,
+)
 from ._util import force_utf8_output
 from .preprocess import PreprocessConfig
 from .remediate import iter_object_dirs, repackage_object
@@ -41,7 +49,7 @@ from .triage import (
     worst_pages,
     write_csvs,
 )
-from .walker import _natural_key, discover_collection, discover_ref_id
+from .walker import SkippedRefId, _natural_key, discover_collection, discover_ref_id
 
 app = typer.Typer(
     name="alto-ocr",
@@ -315,10 +323,15 @@ def process(
     """Process one Ref ID."""
     _setup_logging(verbose)
 
-    inputs = discover_ref_id(object_dir)
-    if inputs is None:
-        console.print(f"[red]No TIFs found in {object_dir}[/red]")
+    found = discover_ref_id(object_dir)
+    if found is None:
+        console.print(f"[red]No TIFs or PDFs found in {object_dir}[/red]")
         raise typer.Exit(code=1)
+    if isinstance(found, SkippedRefId):
+        # Not "no TIFs" — the object has pages but can't be processed as-is.
+        console.print(f"[red]{found.ref_id}:[/red] {found.reason}")
+        raise typer.Exit(code=1)
+    inputs = found
 
     options = OCROptions(language=ocr_lang, psm=psm, oem=oem)
     engine_obj = _build_engine(
@@ -372,39 +385,19 @@ def _process_one_for_pool(args: tuple) -> RefIdResult:
     )
 
 
-def _failed_ref_result(inputs, output_root: Path, exc: BaseException) -> RefIdResult:
-    """Synthesize a failed RefIdResult when a whole Ref ID aborts.
+def _pool_worker_init(verbose: bool) -> None:
+    """Logging bootstrap for spawned pool workers.
 
-    ``process_ref_id`` isolates per-*page* errors itself; this covers a
-    Ref-ID-level exception (or a crashed pool worker) so one bad object can't
-    abort an unattended multi-hour batch. ``expected_page_count`` is set so the
-    summary reports the object's true input page count (not 1), and a single
-    synthetic failed page carries the error.
+    Workers start with no logging configured, so without this their INFO
+    lines (per-Ref-ID "done" progress, page-failure context) vanish and
+    warnings fall to Python's bare lastResort handler. A plain stderr
+    handler keeps worker output visible and PID-labeled; Rich formatting
+    stays parent-only.
     """
-    return RefIdResult(
-        ref_id=inputs.ref_id,
-        output_dir=(output_root / inputs.ref_id).resolve(),
-        expected_page_count=inputs.page_count,
-        pages=[PageResult(
-            stem=f"<Ref ID aborted before page output ({inputs.page_count} page(s))>",
-            order=0,
-            ok=False,
-            error=f"{type(exc).__name__}: {exc}",
-        )],
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="[worker %(process)d] %(levelname)s %(message)s",
     )
-
-
-def _record_ref_failure(results: list[RefIdResult], inputs, output_root: Path,
-                        exc: BaseException) -> None:
-    """Log a Ref-ID-level failure (with traceback) and append a synthetic failed
-    result so the batch continues. Shared by the single-worker and pool paths.
-
-    Uses ``exc_info=exc`` (not bare ``logger.exception``) so the *passed*
-    exception's traceback is logged even when called outside its except block —
-    the pool-recovery path records errors while handling a BrokenProcessPool."""
-    logger.error("[%s] Ref ID aborted (recorded as failed, continuing): %s",
-                 inputs.ref_id, exc, exc_info=exc)
-    results.append(_failed_ref_result(inputs, output_root, exc))
 
 
 def _classify_broken_pool_futures(futures: dict, harvested_ids: set) -> tuple[list, list, list]:
@@ -478,12 +471,14 @@ def batch(
     """Process every Ref ID in a collection directory."""
     _setup_logging(verbose)
 
-    items = discover_collection(collection_dir)
-    if not items:
+    items, skipped = discover_collection(collection_dir)
+    if not items and not skipped:
         console.print(f"[yellow]No Ref IDs with TIFs found in {collection_dir}[/yellow]")
         raise typer.Exit(code=1)
     console.print(f"Discovered [bold]{len(items)}[/bold] Ref ID(s) "
                   f"({sum(i.page_count for i in items)} pages total).")
+    for sk in skipped:
+        console.print(f"[red]SKIPPED {sk.ref_id}:[/red] {sk.reason}")
 
     options = OCROptions(language=ocr_lang, psm=psm, oem=oem)
     engine_obj = _build_engine(
@@ -519,7 +514,7 @@ def batch(
                     on_page_done=progress.tick,
                 ))
             except Exception as e:  # noqa: BLE001 - one bad Ref ID must not abort the batch
-                _record_ref_failure(results, inputs, output_root, e)
+                record_ref_failure(results, inputs, output_root, e)
     else:
         payloads = [
             (inputs, output_root, engine_obj, cfg,
@@ -531,7 +526,9 @@ def batch(
         # Ref-ID-level exception, or a crashed/broken pool worker) is recorded
         # as a failed Ref ID and the batch keeps going — a single bad object
         # can't throw away hours of an unattended run.
-        with ProcessPoolExecutor(max_workers=workers) as ex:
+        with ProcessPoolExecutor(max_workers=workers,
+                                 initializer=_pool_worker_init,
+                                 initargs=(verbose,)) as ex:
             futures = {ex.submit(_process_one_for_pool, p): p[0] for p in payloads}
             for fut in as_completed(futures):
                 inputs = futures[fut]
@@ -550,7 +547,7 @@ def batch(
                     completed, failed, not_run = _classify_broken_pool_futures(futures, harvested)
                     results.extend(completed)
                     for ri, exc in failed:
-                        _record_ref_failure(results, ri, output_root, exc)
+                        record_ref_failure(results, ri, output_root, exc)
                     if not_run:
                         logger.error("Worker pool died (a worker likely crashed or was OOM-killed). "
                                      "%d Ref ID(s) did NOT run and must be re-run: %s",
@@ -558,7 +555,7 @@ def batch(
                         console.print(f"[red]FATAL: worker pool died — {len(not_run)} Ref ID(s) not "
                                       f"processed; re-run them (lower --workers if it recurs).[/red]")
                         for ri in not_run:
-                            results.append(_failed_ref_result(
+                            results.append(failed_ref_result(
                                 ri, output_root,
                                 RuntimeError("worker pool died before this Ref ID was processed "
                                              "(not OCR'd) — re-run it")))
@@ -567,8 +564,13 @@ def batch(
                                        "completed or been recorded; nothing to re-run.")
                     break
                 except Exception as e:  # noqa: BLE001 - isolate per-Ref-ID failures
-                    _record_ref_failure(results, inputs, output_root, e)
-        results.sort(key=lambda r: r.ref_id)
+                    record_ref_failure(results, inputs, output_root, e)
+
+    # Objects dropped at discovery (stem collisions) surface as failed rows:
+    # a batch must never exit 0 while an object silently vanished from it.
+    for sk in skipped:
+        results.append(skipped_ref_result(sk, output_root))
+    results.sort(key=lambda r: r.ref_id)
 
     conf = _scan_confidence(results)
     _print_summary(results, conf)
@@ -868,32 +870,33 @@ def doctor(
             console.print(f"[red]FAIL[/red] {dep}: {e}")
             dep_failed = True
 
-    # glm-ocr is the DEFAULT engine: confirm Ollama is reachable and the model
-    # is pulled. A miss is a warning, not a hard fail — the user may start
-    # Ollama later or run with --engine tesseract.
-    endpoint = resolve_endpoint(glmocr_endpoint)
-    try:
-        model = check_endpoint(GLMOCRConfig(endpoint=endpoint, model=glmocr_model))
-        console.print(f"[green]OK[/green] glm-ocr (default engine): {endpoint}, model {model!r}")
-        glmocr_ok = True
-    except GLMOCRError as e:
-        console.print(f"[yellow]WARN[/yellow] glm-ocr (default engine): {e}")
-        glmocr_ok = False
-
-    # Tesseract is the optional fallback engine — absence is a warning, not a
-    # failure (it is only needed for --engine tesseract).
+    # Tesseract is the DEFAULT engine — its per-word confidences drive the
+    # remediation triage. Absence is still only a warning: glm-ocr alone can
+    # run handwriting-only jobs.
     try:
         binary = find_tesseract(tesseract_path)
-        console.print(f"[green]OK[/green] tesseract (fallback engine): {binary} "
+        console.print(f"[green]OK[/green] tesseract (default engine): {binary} "
                       f"({check_tesseract_version(binary)})")
         tesseract_ok = True
     except Exception as e:
-        console.print(f"[yellow]WARN[/yellow] tesseract (fallback engine): {e}")
+        console.print(f"[yellow]WARN[/yellow] tesseract (default engine): {e}")
         tesseract_ok = False
+
+    # glm-ocr is the optional handwriting engine (--engine glmocr): confirm
+    # Ollama is reachable and the model is pulled. A miss is a warning —
+    # Tesseract runs never touch it.
+    endpoint = resolve_endpoint(glmocr_endpoint)
+    try:
+        model = check_endpoint(GLMOCRConfig(endpoint=endpoint, model=glmocr_model))
+        console.print(f"[green]OK[/green] glm-ocr (handwriting engine): {endpoint}, model {model!r}")
+        glmocr_ok = True
+    except GLMOCRError as e:
+        console.print(f"[yellow]WARN[/yellow] glm-ocr (handwriting engine): {e}")
+        glmocr_ok = False
 
     if not (glmocr_ok or tesseract_ok):
         console.print("[red]FAIL[/red] no usable OCR engine "
-                      "(need Ollama + glm-ocr, or Tesseract).")
+                      "(need Tesseract, or Ollama + glm-ocr for handwriting).")
 
     raise typer.Exit(code=1 if (dep_failed or not (glmocr_ok or tesseract_ok)) else 0)
 

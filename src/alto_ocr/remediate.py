@@ -110,9 +110,18 @@ class ReviewPage:
     def __init__(self, alto_path: Path, image_size: tuple[int, int]) -> None:
         self.alto_path = Path(alto_path)
         parser = etree.XMLParser(remove_blank_text=True)
-        self.tree = etree.parse(str(self.alto_path), parser)
+        try:
+            self.tree = etree.parse(str(self.alto_path), parser)
+        except etree.XMLSyntaxError as e:
+            raise StubPageError(
+                f"{self.alto_path.name} is not well-formed XML ({e}); "
+                "re-run OCR for this page instead of reviewing it."
+            ) from e
         self.root = self.tree.getroot()
-        self.ns = self.root.nsmap.get(None)
+        # Namespace of the document's ALTO elements, taken from the root's own
+        # qualified name — prefixed ALTO (external editors) works the same as
+        # default-namespace ALTO. nsmap.get(None) would miss prefixed docs.
+        self.ns = etree.QName(self.root).namespace
 
         self.page = self.root.find(f".//{_qname(self.ns, 'Page')}")
         if self.page is None:
@@ -250,7 +259,7 @@ class ReviewPage:
         text_dir = self.alto_path.parent.parent / "Text"
         if text_dir.is_dir():
             txt_path = text_dir / f"{self.alto_path.stem}.txt"
-            atomic_write_text(txt_path, alto_to_text(self.root, self.ns))
+            atomic_write_text(txt_path, alto_to_text(self.root))
 
         self.dirty = False
         self.session_edits = 0
@@ -295,19 +304,23 @@ class ReviewPage:
         )
 
 
-def alto_to_text(root: etree._Element, ns: str | None) -> str:
+def alto_to_text(root: etree._Element) -> str:
     """Canonical transcript rendering of a (corrected) ALTO tree.
 
     Lines are space-joined String CONTENTs, blocks are blank-line separated —
     the same shape Tesseract's own txt renderer produces for flowing text.
-    Used by the review save path and (later) the repackage command, so every
-    tool derives the identical Text/ file from a given ALTO.
+    Used by the review save path and the repackage command, so every tool
+    derives the identical Text/ file from a given ALTO.
+
+    Namespace-agnostic (``{*}`` matches any namespace and none): default-ns,
+    prefixed (external editors), and namespace-less ALTO all render alike —
+    a prefixed file must never silently render as an empty transcript.
     """
     blocks: list[str] = []
-    for tb in root.iter(_qname(ns, "TextBlock")):
+    for tb in root.iter("{*}TextBlock"):
         lines: list[str] = []
-        for tl in tb.iter(_qname(ns, "TextLine")):
-            words = [s.get("CONTENT", "") for s in tl.iter(_qname(ns, "String"))]
+        for tl in tb.iter("{*}TextLine"):
+            words = [s.get("CONTENT", "") for s in tl.iter("{*}String")]
             line = " ".join(w for w in words if w)
             if line:
                 lines.append(line)
@@ -406,7 +419,7 @@ def repackage_object(
             result.problems.append(f"{stem}: unreadable ALTO ({e})")
             continue
         if has_text:
-            txt = alto_to_text(root, root.nsmap.get(None))
+            txt = alto_to_text(root)
             txt_path = text_dir / f"{stem}.txt"
             try:
                 current = txt_path.read_text(encoding="utf-8")

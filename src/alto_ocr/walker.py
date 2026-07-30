@@ -194,8 +194,26 @@ class RefIdInputs:
         return any(s.is_pdf for s in self.sources)
 
 
-def _check_stem_collisions(ref_id: str, sources: list[SourceFile]) -> bool:
-    """Return True if every page's output stem is unique within the Ref ID.
+@dataclass(frozen=True)
+class SkippedRefId:
+    """A real object (it has pages) dropped at discovery, with the reason.
+
+    Currently produced for output-stem collisions only. Distinct from "not
+    an object" (a subdirectory with no images/PDFs anywhere), which stays a
+    plain ``None`` — collection directories legitimately contain non-object
+    folders, but an object with pages must never vanish from a run without
+    a red row in the summary and a nonzero exit code.
+    """
+
+    ref_id: str
+    reason: str
+    page_count: int
+
+
+def _check_stem_collisions(
+    ref_id: str, sources: list[SourceFile],
+) -> list[tuple[str, str, str]]:
+    """Collisions between pages' predicted output stems (``[]`` = all unique).
 
     Output filenames in ALTO/ and Text/ use only the stem (no source
     extension to disambiguate), so two pages sharing a stem would silently
@@ -216,29 +234,39 @@ def _check_stem_collisions(ref_id: str, sources: list[SourceFile]) -> bool:
                 collisions.append((stem, prior, origin))
             else:
                 seen[stem] = origin
-    if collisions:
-        for stem, prior, this in collisions:
-            logger.warning(
-                "[%s] output-stem collision %r: produced by both %s and %s — "
-                "ALTO/TXT outputs would overwrite. Rename at the source.",
-                ref_id, stem, prior, this,
-            )
-        return False
-    return True
+    for stem, prior, this in collisions:
+        logger.warning(
+            "[%s] output-stem collision %r: produced by both %s and %s — "
+            "ALTO/TXT outputs would overwrite. Rename at the source.",
+            ref_id, stem, prior, this,
+        )
+    return collisions
 
 
-def discover_ref_id(ref_id_dir: Path) -> RefIdInputs | None:
+def discover_ref_id(ref_id_dir: Path) -> RefIdInputs | SkippedRefId | None:
     """Build a RefIdInputs for a single Ref ID directory.
 
-    Returns None if no sources were found (a warning is logged) or if the
-    Ref ID has stem collisions that would corrupt the output.
+    Returns ``None`` when the directory holds no images/PDFs at all (not an
+    object — a warning is logged), or a ``SkippedRefId`` when the object HAS
+    pages but output-stem collisions would corrupt its ALTO/Text outputs.
+    Callers must surface a ``SkippedRefId`` in their summary and exit code —
+    an object with real pages must never silently vanish from a run.
     """
     ref_id_dir = ref_id_dir.resolve()
     sources = _find_sources_in(ref_id_dir)
     if not sources:
         return None
-    if not _check_stem_collisions(ref_id_dir.name, sources):
-        return None
+    collisions = _check_stem_collisions(ref_id_dir.name, sources)
+    if collisions:
+        stems = sorted({stem for stem, _prior, _this in collisions})
+        preview = ", ".join(repr(s) for s in stems[:3]) + (", …" if len(stems) > 3 else "")
+        return SkippedRefId(
+            ref_id=ref_id_dir.name,
+            page_count=sum(s.page_count for s in sources),
+            reason=(f"output-stem collision on {len(stems)} stem(s) ({preview}) — "
+                    "two sources would overwrite each other's ALTO/TXT outputs; "
+                    "rename at the source and re-run. Object NOT processed."),
+        )
     return RefIdInputs(
         ref_id=ref_id_dir.name,
         source_dir=ref_id_dir,
@@ -246,13 +274,18 @@ def discover_ref_id(ref_id_dir: Path) -> RefIdInputs | None:
     )
 
 
-def discover_collection(collection_dir: Path) -> list[RefIdInputs]:
-    """Walk a collection directory; return one RefIdInputs per non-empty Ref ID.
+def discover_collection(
+    collection_dir: Path,
+) -> tuple[list[RefIdInputs], list[SkippedRefId]]:
+    """Walk a collection directory; return ``(processable, skipped)``.
 
-    Any immediate subdirectory is treated as a candidate Ref ID. The caller's
-    only structural assumption is "this directory contains per-object
-    subdirectories" — collection-name conventions (MSP*, MSA*, UA*, …) are
-    not enforced here.
+    One RefIdInputs per non-empty, collision-free Ref ID, plus a
+    ``SkippedRefId`` record for every object dropped at discovery (see
+    ``discover_ref_id``) — callers surface those in the run summary and the
+    exit code. Any immediate subdirectory is treated as a candidate Ref ID.
+    The caller's only structural assumption is "this directory contains
+    per-object subdirectories" — collection-name conventions (MSP*, MSA*,
+    UA*, …) are not enforced here.
     """
     collection_dir = collection_dir.resolve()
     if not collection_dir.is_dir():
@@ -269,13 +302,17 @@ def discover_collection(collection_dir: Path) -> list[RefIdInputs]:
         collection_dir,
     )
     results: list[RefIdInputs] = []
+    skipped: list[SkippedRefId] = []
     for i, c in enumerate(candidates, start=1):
         # Progress line per candidate. Network-drive scans can take seconds
         # per Ref ID, and the GUI shows live logs — silence here makes the
         # tool look frozen.
         logger.info("  [%d/%d] scanning %s ...", i, len(candidates), c.name)
         item = discover_ref_id(c)
-        if item is not None:
+        if isinstance(item, SkippedRefId):
+            logger.error("           SKIPPED %s: %s", item.ref_id, item.reason)
+            skipped.append(item)
+        elif item is not None:
             n_pdf = sum(1 for s in item.sources if s.is_pdf)
             n_tif = len(item.sources) - n_pdf
             logger.info(
@@ -284,11 +321,12 @@ def discover_collection(collection_dir: Path) -> list[RefIdInputs]:
             )
             results.append(item)
     logger.info(
-        "Discovered %d Ref ID(s) with TIFs/PDFs in %s (out of %d subdirs)",
+        "Discovered %d Ref ID(s) with TIFs/PDFs in %s (out of %d subdirs%s)",
         len(results),
         collection_dir,
         len(candidates),
+        f"; {len(skipped)} SKIPPED" if skipped else "",
     )
-    return results
+    return results, skipped
 
 
