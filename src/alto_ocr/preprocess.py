@@ -133,14 +133,32 @@ def _load_grayscale(path: Path) -> np.ndarray:
     return arr
 
 
+# A DPI tag below this is metadata garbage, not a physical resolution —
+# OpenCV-written TIFs default XResolution to 1, and some scanning software
+# writes 0. Trusting such a tag makes the upscale factor min_dpi/tag
+# (300x for a tag of 1): a gigapixel-scale Lanczos resize that grinds all
+# cores for hours and stalls the batch with no exception for the per-page
+# isolation to catch. A real page scan below 50 DPI would be illegible to
+# OCR anyway, so below the floor the tag is ignored like a missing one.
+_MIN_PLAUSIBLE_DPI = 50
+
+
 def _upscale_for_dpi(img: np.ndarray, source_dpi: int | None, min_dpi: int) -> tuple[np.ndarray, int]:
     """Upscale so effective DPI ≥ min_dpi. Returns (image, effective_dpi).
 
     If source DPI is unknown we trust the image as-is and report ``min_dpi``
     as the effective value (Tesseract needs *something* to pass via --dpi;
-    its own auto-detect is unreliable on archival scans).
+    its own auto-detect is unreliable on archival scans). An implausibly
+    small DPI tag (< ``_MIN_PLAUSIBLE_DPI``) is treated the same as unknown.
     """
     if source_dpi is None:
+        return img, min_dpi
+    if source_dpi < _MIN_PLAUSIBLE_DPI:
+        logger.warning(
+            "Implausible DPI tag %d (< %d) — ignoring it; image passes through "
+            "un-upscaled with --dpi %d. Check the source file's metadata.",
+            source_dpi, _MIN_PLAUSIBLE_DPI, min_dpi,
+        )
         return img, min_dpi
     if source_dpi >= min_dpi:
         return img, source_dpi

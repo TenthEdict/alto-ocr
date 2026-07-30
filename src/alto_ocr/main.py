@@ -31,6 +31,15 @@ from .ocr import (
 from .pipeline import PageProgressLogger, PageResult, RefIdResult, process_ref_id
 from ._util import force_utf8_output
 from .preprocess import PreprocessConfig
+from .triage import (
+    DEFAULT_LOW_WC,
+    DEFAULT_REVIEW_PC,
+    ObjectConfidence,
+    scan_object,
+    scan_output_root,
+    worst_pages,
+    write_csvs,
+)
 from .walker import _natural_key, discover_collection, discover_ref_id
 
 app = typer.Typer(
@@ -110,8 +119,21 @@ def _build_preprocess_config(
     )
 
 
-def _summary_dict(results: list[RefIdResult]) -> dict:
-    return {
+def _scan_confidence(results: list[RefIdResult]) -> dict[str, ObjectConfidence | None]:
+    """Post-run confidence scan of each result's output directory.
+
+    Reads the WC/PC attributes the Tesseract engine wrote into the ALTO
+    files (report-time defaults for the thresholds; the ``triage`` command
+    exposes the dials). ``None`` for a Ref ID whose ALTO folder doesn't
+    exist (aborted before output)."""
+    return {r.ref_id: scan_object(r.output_dir) for r in results}
+
+
+def _summary_dict(
+    results: list[RefIdResult],
+    conf_by_ref: dict[str, ObjectConfidence | None] | None = None,
+) -> dict:
+    summary = {
         "ref_id_count": len(results),
         "ok_count": sum(1 for r in results if r.ok),
         "failed_page_total": sum(r.failed_page_count for r in results),
@@ -133,24 +155,80 @@ def _summary_dict(results: list[RefIdResult]) -> dict:
             for r in results
         ],
     }
+    if conf_by_ref is not None:
+        objs = [c for c in conf_by_ref.values() if c is not None]
+        total_scored_words = sum(o.scored_words for o in objs)
+        summary["mean_wc"] = (
+            round(sum(p.wc_sum for o in objs for p in o.pages) / total_scored_words, 3)
+            if total_scored_words else None
+        )
+        summary["review_page_total"] = sum(len(o.review_pages) for o in objs)
+        summary["unscored_page_total"] = sum(o.unscored_pages for o in objs)
+        for entry in summary["ref_ids"]:
+            c = conf_by_ref.get(entry["ref_id"])
+            entry["confidence"] = c.summary_dict() if c is not None else None
+    return summary
 
 
-def _print_summary(results: list[RefIdResult]) -> None:
+def _mean_wc_cell(conf: ObjectConfidence | None) -> str:
+    """Rich-formatted Mean WC cell: red < 0.75, yellow < 0.90, dim n/a."""
+    if conf is None or conf.mean_wc is None:
+        return "[dim]n/a[/dim]"
+    v = conf.mean_wc
+    style = "red" if v < 0.75 else ("yellow" if v < 0.90 else "green")
+    return f"[{style}]{v:.3f}[/{style}]"
+
+
+def _print_summary(
+    results: list[RefIdResult],
+    conf_by_ref: dict[str, ObjectConfidence | None] | None = None,
+) -> None:
+    with_conf = conf_by_ref is not None
     table = Table(title="Summary")
     table.add_column("Ref ID", style="bold")
     table.add_column("Pages", justify="right")
     table.add_column("Failed", justify="right")
+    if with_conf:
+        table.add_column("Mean WC", justify="right")
+        table.add_column("Review pgs", justify="right")
     table.add_column("Output")
     for r in results:
         failed = r.failed_page_count
         style = "red" if failed else "green"
-        table.add_row(
+        row = [
             r.ref_id,
             str(r.page_count),
             f"[{style}]{failed}[/{style}]",
-            str(r.output_dir),
-        )
+        ]
+        if with_conf:
+            c = conf_by_ref.get(r.ref_id)
+            n_review = len(c.review_pages) if c is not None else 0
+            row.append(_mean_wc_cell(c))
+            row.append(f"[yellow]{n_review}[/yellow]" if n_review else "0")
+        row.append(str(r.output_dir))
+        table.add_row(*row)
     console.print(table)
+
+
+def _print_triage_hint(
+    conf_by_ref: dict[str, ObjectConfidence | None], output_root: Path,
+) -> None:
+    """One-line pointer to the full triage report after a run."""
+    objs = [c for c in conf_by_ref.values() if c is not None]
+    if not any(o.scored_pages for o in objs):
+        return  # nothing scored (e.g. a GLMOCR run) — no queue to point at
+    n_review = sum(len(o.review_pages) for o in objs)
+    cmd = f'python -m src.alto_ocr.main triage "{output_root}"'
+    if n_review:
+        console.print(
+            f"[yellow]{n_review} page(s) below the review threshold "
+            f"(PC < {DEFAULT_REVIEW_PC:.2f}).[/yellow] Worst-first queue: [bold]{cmd}[/bold]"
+        )
+    else:
+        console.print(
+            f"[dim]No pages below the review threshold (PC < {DEFAULT_REVIEW_PC:.2f}); "
+            f"full report: {cmd}[/dim]"
+        )
 
 
 # ---------- Common option types -------------------------------------------------
@@ -260,10 +338,13 @@ def process(
         on_page_done=progress.tick,
     )
 
-    _print_summary([result])
+    conf = _scan_confidence([result])
+    _print_summary([result], conf)
     if summary_json:
-        summary_json.write_text(json.dumps(_summary_dict([result]), indent=2), encoding="utf-8")
+        summary_json.write_text(json.dumps(_summary_dict([result], conf), indent=2),
+                                encoding="utf-8")
         console.print(f"[dim]summary:[/dim] {summary_json}")
+    _print_triage_hint(conf, output_root)
     raise typer.Exit(code=0 if result.ok else 1)
 
 
@@ -477,14 +558,111 @@ def batch(
                     _record_ref_failure(results, inputs, output_root, e)
         results.sort(key=lambda r: r.ref_id)
 
-    _print_summary(results)
-    summary = _summary_dict(results)
+    conf = _scan_confidence(results)
+    _print_summary(results, conf)
+    summary = _summary_dict(results, conf)
     if summary_json:
         summary_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
         console.print(f"[dim]summary:[/dim] {summary_json}")
+    _print_triage_hint(conf, output_root)
 
     n_failed = sum(1 for r in results if not r.ok)
     raise typer.Exit(code=0 if n_failed == 0 else 1)
+
+
+@app.command()
+def triage(
+    output_root: Path = typer.Argument(..., exists=True, file_okay=False, dir_okay=True,
+                                       help="Output root from process/batch (contains <RefID>/ALTO/), "
+                                            "or a single Ref ID output directory."),
+    low_wc: float = typer.Option(DEFAULT_LOW_WC, "--low-wc",
+                                 help="Words with WC below this count as low-confidence (0..1)."),
+    review_pc: float = typer.Option(DEFAULT_REVIEW_PC, "--review-pc",
+                                    help="Scored pages with PC below this are flagged for review (0..1)."),
+    top: int = typer.Option(15, "--top",
+                            help="How many worst pages to print (the CSV always has every page)."),
+    csv_dir: Optional[Path] = typer.Option(None, "--csv-dir",
+                                           help="Where to write triage_objects.csv / triage_pages.csv "
+                                                "(default: the output root itself)."),
+    no_csv: bool = typer.Option(False, "--no-csv", help="Print only; skip the CSV files."),
+    verbose: bool = VerboseOpt,
+) -> None:
+    """Rank existing OCR output by confidence, worst-first, for remediation.
+
+    Reads the WC/PC attributes Tesseract runs write into the ALTO files.
+    Re-runnable any time against any output tree; thresholds are report-time
+    dials, not baked into the output. Pages show as: scored (has WC — the
+    correction queue), unscored (GLMOCR output, no confidence — needs full
+    proofread), empty (blank page), or failed (pipeline stub — re-run it).
+    """
+    _setup_logging(verbose)
+
+    objects = scan_output_root(output_root, low_wc=low_wc, review_pc=review_pc)
+    if not objects:
+        console.print(f"[red]No ALTO output found under {output_root} "
+                      f"(expected <RefID>/ALTO/*.xml or ALTO/*.xml)[/red]")
+        raise typer.Exit(code=1)
+
+    obj_table = Table(title=f"Objects, worst-first (low WC < {low_wc:.2f}, review PC < {review_pc:.2f})")
+    obj_table.add_column("Ref ID", style="bold")
+    obj_table.add_column("Pages", justify="right")
+    obj_table.add_column("Mean WC", justify="right")
+    obj_table.add_column("Min PC (page)", justify="right")
+    obj_table.add_column("Low words", justify="right")
+    obj_table.add_column("Review pgs", justify="right")
+    obj_table.add_column("Unscored", justify="right")
+    obj_table.add_column("Failed", justify="right")
+    for o in objects:
+        pct_low = (100.0 * o.low_words / o.scored_words) if o.scored_words else None
+        min_pc = f"{o.min_pc:.2f} ({o.min_pc_stem})" if o.min_pc is not None else "—"
+        n_review = len(o.review_pages)
+        obj_table.add_row(
+            o.ref_id,
+            str(o.page_count),
+            _mean_wc_cell(o),
+            min_pc,
+            f"{pct_low:.1f}%" if pct_low is not None else "—",
+            f"[yellow]{n_review}[/yellow]" if n_review else "0",
+            f"[magenta]{o.unscored_pages}[/magenta]" if o.unscored_pages else "0",
+            f"[red]{o.failed_pages}[/red]" if o.failed_pages else "0",
+        )
+    console.print(obj_table)
+
+    queue = [rp for rp in worst_pages(objects) if rp[1].status in ("failed", "scored")]
+    if queue:
+        page_table = Table(title=f"Review queue — worst {min(top, len(queue))} of {len(queue)} pages")
+        page_table.add_column("Ref ID", style="bold")
+        page_table.add_column("Page")
+        page_table.add_column("Status")
+        page_table.add_column("PC", justify="right")
+        page_table.add_column("Words", justify="right")
+        page_table.add_column("Low words", justify="right")
+        for ref_id, p in queue[:top]:
+            page_table.add_row(
+                ref_id,
+                p.stem,
+                "[red]failed[/red]" if p.status == "failed" else "scored",
+                f"{p.pc:.2f}" if p.pc is not None else "—",
+                str(p.words),
+                f"{p.pct_low:.1f}%" if p.pct_low is not None else "—",
+            )
+        console.print(page_table)
+
+    n_unscored = sum(o.unscored_pages for o in objects)
+    if n_unscored:
+        console.print(f"[magenta]{n_unscored} unscored page(s)[/magenta] (no WC — GLMOCR output "
+                      f"or pre-confidence runs): no signal to narrow the proofread.")
+    all_scored = [o for o in objects if o.mean_wc is not None]
+    handwriting = [o for o in all_scored if o.mean_wc < 0.60]
+    if handwriting:
+        console.print(f"[yellow]Handwriting candidates (mean WC < 0.60):[/yellow] "
+                      f"{', '.join(o.ref_id for o in handwriting)} — consider re-running "
+                      f"these Ref IDs with --engine glmocr.")
+
+    if not no_csv:
+        obj_csv, pages_csv = write_csvs(objects, csv_dir or output_root)
+        console.print(f"[dim]csv:[/dim] {obj_csv}")
+        console.print(f"[dim]csv:[/dim] {pages_csv}")
 
 
 _TIF_EXTS = (".tif", ".tiff", ".TIF", ".TIFF")
