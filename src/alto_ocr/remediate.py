@@ -49,6 +49,30 @@ class StubPageError(ValueError):
     is nothing to review; the page needs a re-run, not correction."""
 
 
+class ConcurrentEditError(RuntimeError):
+    """Raised by ``ReviewPage.save`` when the ALTO changed on disk after this
+    page was loaded (a second review session, an external editor, or a forced
+    re-OCR). Saving anyway would silently destroy the other party's work;
+    the caller decides — reload, or ``save(force=True)`` deliberately."""
+
+
+def has_review_provenance(alto_path: Path) -> bool:
+    """True when the ALTO carries the review-session provenance stamped by
+    ``ReviewPage.save`` (``<Processing ID="review">``), i.e. a human has
+    corrected words in this file.
+
+    Namespace-agnostic (``{*}``) so files round-tripped through external
+    editors that emit a prefixed ALTO namespace still count as reviewed.
+    Unreadable/unparseable files return False — a corrupt file's cure is
+    exactly a re-run, so it must not trip the overwrite guard.
+    """
+    try:
+        root = etree.parse(str(alto_path)).getroot()
+    except (OSError, etree.XMLSyntaxError):
+        return False
+    return any(p.get("ID") == "review" for p in root.iter("{*}Processing"))
+
+
 @dataclass
 class Word:
     """One ALTO ``<String>`` with its box mapped into image-pixel space."""
@@ -116,6 +140,11 @@ class ReviewPage:
             except ValueError:
                 continue  # malformed box: not clickable, leave untouched
             self.words.append(Word(el, (h * self.sx, v * self.sy, w * self.sx, ht * self.sy)))
+
+        # Concurrent-edit guard baseline: save() re-stats and refuses (unless
+        # forced) when the file changed on disk after this load. mtime ticks
+        # are coarse on some network shares — best-effort, not a lock.
+        self._loaded_mtime_ns = self.alto_path.stat().st_mtime_ns
 
         self.dirty = False
         self.session_edits = 0  # edits+deletions since load, folded into provenance on save
@@ -189,15 +218,33 @@ class ReviewPage:
 
     # ---------- save ------------------------------------------------------
 
-    def save(self) -> Path | None:
+    def save(self, *, force: bool = False) -> Path | None:
         """Write the ALTO back (institution formatting) and sync the txt.
 
         Returns the path of the regenerated txt, or ``None`` when the object
         has no ``Text/`` folder (``--no-plaintext`` outputs).
+
+        Raises ``ConcurrentEditError`` when the file on disk changed after
+        this page was loaded (another session's save would be silently lost
+        otherwise). ``force=True`` skips the check for a deliberate
+        overwrite; a successful save re-baselines the check.
         """
+        if not force:
+            try:
+                now_ns = self.alto_path.stat().st_mtime_ns
+            except OSError:
+                now_ns = None  # file vanished — let the write recreate it
+            if now_ns is not None and now_ns != self._loaded_mtime_ns:
+                raise ConcurrentEditError(
+                    f"{self.alto_path.name} changed on disk after this page was "
+                    "opened (another review session, or an external tool?). "
+                    "Reload the page to pick up the newer version, or force-save "
+                    "to overwrite it with your edits."
+                )
         self._recompute_pc()
         self._stamp_provenance()
         _serialize_with_tabs(self.tree, self.alto_path)
+        self._loaded_mtime_ns = self.alto_path.stat().st_mtime_ns
 
         txt_path: Path | None = None
         text_dir = self.alto_path.parent.parent / "Text"

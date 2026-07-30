@@ -270,6 +270,11 @@ NoMetsOpt = typer.Option(False, "--no-mets",
 NoPlaintextOpt = typer.Option(False, "--no-plaintext",
                               help="Skip the Text/ folder. ALTO is still produced; METS (if written) "
                                    "omits the Text fileGrp.")
+ForceReocrOpt = typer.Option(False, "--force-reocr",
+                             help="Overwrite output pages that carry human-review corrections. "
+                                  "Without this flag, an object whose existing ALTO has review "
+                                  "provenance is refused (reported as failed, nothing touched) so "
+                                  "a re-run cannot silently destroy correction work.")
 DebugDirOpt = typer.Option(None, "--debug-preprocessed",
                            help="If set, dump the preprocessed images Tesseract actually saw to this directory.")
 VerboseOpt = typer.Option(False, "--verbose", "-v", help="Enable DEBUG logging.")
@@ -302,6 +307,7 @@ def process(
     no_checksums: bool = NoChecksumsOpt,
     no_mets: bool = NoMetsOpt,
     no_plaintext: bool = NoPlaintextOpt,
+    force_reocr: bool = ForceReocrOpt,
     debug_preprocessed: Optional[Path] = DebugDirOpt,
     summary_json: Optional[Path] = SummaryOpt,
     verbose: bool = VerboseOpt,
@@ -336,6 +342,7 @@ def process(
         with_checksums=not no_checksums,
         write_mets_file=not no_mets,
         write_plaintext=not no_plaintext,
+        force_reocr=force_reocr,
         on_page_done=progress.tick,
     )
 
@@ -352,7 +359,7 @@ def process(
 def _process_one_for_pool(args: tuple) -> RefIdResult:
     """Top-level helper so ProcessPoolExecutor can pickle it."""
     (inputs, output_root, engine, cfg, debug_dir,
-     with_checksums, write_mets_file, write_plaintext) = args
+     with_checksums, write_mets_file, write_plaintext, force_reocr) = args
     return process_ref_id(
         inputs, output_root,
         engine=engine,
@@ -361,6 +368,7 @@ def _process_one_for_pool(args: tuple) -> RefIdResult:
         with_checksums=with_checksums,
         write_mets_file=write_mets_file,
         write_plaintext=write_plaintext,
+        force_reocr=force_reocr,
     )
 
 
@@ -462,6 +470,7 @@ def batch(
     no_checksums: bool = NoChecksumsOpt,
     no_mets: bool = NoMetsOpt,
     no_plaintext: bool = NoPlaintextOpt,
+    force_reocr: bool = ForceReocrOpt,
     debug_preprocessed: Optional[Path] = DebugDirOpt,
     summary_json: Optional[Path] = SummaryOpt,
     verbose: bool = VerboseOpt,
@@ -506,6 +515,7 @@ def batch(
                     with_checksums=not no_checksums,
                     write_mets_file=not no_mets,
                     write_plaintext=not no_plaintext,
+                    force_reocr=force_reocr,
                     on_page_done=progress.tick,
                 ))
             except Exception as e:  # noqa: BLE001 - one bad Ref ID must not abort the batch
@@ -513,7 +523,8 @@ def batch(
     else:
         payloads = [
             (inputs, output_root, engine_obj, cfg,
-             debug_preprocessed, not no_checksums, not no_mets, not no_plaintext)
+             debug_preprocessed, not no_checksums, not no_mets, not no_plaintext,
+             force_reocr)
             for inputs in items
         ]
         # Map each future to its RefIdInputs so a worker-side failure (a

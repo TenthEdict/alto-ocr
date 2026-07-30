@@ -27,7 +27,13 @@ from typing import Callable, Optional
 
 from PIL import Image, ImageTk
 
-from .remediate import ReviewPage, StubPageError, Word, index_source_images
+from .remediate import (
+    ConcurrentEditError,
+    ReviewPage,
+    StubPageError,
+    Word,
+    index_source_images,
+)
 from .triage import DEFAULT_LOW_WC, scan_alto_file
 
 # Archival scans are huge; don't trip Pillow's decompression-bomb guard.
@@ -532,6 +538,19 @@ class ReviewFrame(ttk.Frame):
             return
         try:
             txt = self._page.save()
+        except ConcurrentEditError as e:
+            # Someone else wrote this ALTO while it was open here. Only the
+            # corrector can decide whose version wins.
+            if not messagebox.askyesno(
+                "Review",
+                f"{e}\n\nOverwrite the on-disk version with your edits?",
+            ):
+                return
+            try:
+                txt = self._page.save(force=True)
+            except OSError as e2:
+                messagebox.showerror("Review", f"Save failed:\n{e2}")
+                return
         except OSError as e:
             messagebox.showerror("Review", f"Save failed:\n{e}")
             return

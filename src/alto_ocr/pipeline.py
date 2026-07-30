@@ -32,6 +32,7 @@ from typing import Callable
 from ._util import atomic_write_text
 from .mets import PageEntry, build_mets, write_mets
 from .ocr import OCREngine
+from .remediate import has_review_provenance
 from .pdf import rasterize_pdf
 from .preprocess import PreprocessConfig, preprocess
 from .walker import RefIdInputs, _rel_natural_key
@@ -222,11 +223,20 @@ def process_ref_id(
     with_checksums: bool = True,
     write_mets_file: bool = True,
     write_plaintext: bool = True,
+    force_reocr: bool = False,
     on_page_done: Callable[[], None] | None = None,
 ) -> RefIdResult:
     """Run the full pipeline for one Ref ID. Always returns a result object;
     individual page failures are reported in ``result.pages`` rather than
     raised, so a batch run sees them all rather than aborting on the first.
+
+    ``force_reocr=False`` (the default) arms the review-provenance guard:
+    when the object's existing output contains ALTO pages carrying
+    ``<Processing ID="review">`` — human corrections from the Review tab —
+    the whole Ref ID is refused (returned as a failed result, no file
+    touched) so a re-run cannot silently destroy correction work. Pass
+    ``force_reocr=True`` to deliberately discard the corrections and
+    re-OCR; moving the object's output folder aside also works.
 
     ``write_mets_file=False`` skips the per-Ref-ID METS document. The
     ALTO/Text outputs are unaffected — only the ``<RefID>.mets.xml``
@@ -241,6 +251,28 @@ def process_ref_id(
     out_dir = (output_root / inputs.ref_id).resolve()
     alto_dir = out_dir / "ALTO"
     text_dir = out_dir / "Text"
+
+    # Review-provenance guard: never silently overwrite pages a human has
+    # corrected. Cost on a fresh run is zero (no existing ALTO dir).
+    if not force_reocr and alto_dir.is_dir():
+        reviewed = [p.stem for p in sorted(alto_dir.glob("*.xml"))
+                    if has_review_provenance(p)]
+        if reviewed:
+            preview = ", ".join(reviewed[:3]) + (", …" if len(reviewed) > 3 else "")
+            msg = (f"{len(reviewed)} already-reviewed page(s) in the existing "
+                   f"output ({preview}) — refusing to overwrite human "
+                   f"corrections. Re-run with --force-reocr to discard them, "
+                   f"or move {out_dir} aside first.")
+            logger.error("[%s] %s", inputs.ref_id, msg)
+            guarded = RefIdResult(
+                ref_id=inputs.ref_id, output_dir=out_dir,
+                expected_page_count=inputs.page_count,
+            )
+            guarded.pages.append(PageResult(
+                stem="<review-guard>", order=0, ok=False, error=msg,
+            ))
+            return guarded
+
     required_dirs = (alto_dir, text_dir) if write_plaintext else (alto_dir,)
     for d in required_dirs:
         d.mkdir(parents=True, exist_ok=True)
