@@ -1,7 +1,8 @@
 """Small cross-cutting helpers shared by the CLI and the QA scripts.
 
 Kept dependency-free (stdlib only) so a script can import it without pulling
-in typer/rich/opencv. Holds both a runtime helper (``force_utf8_output``) and
+in typer/rich/opencv. Holds the runtime helpers (``force_utf8_output``, the
+``atomic_write_*`` file writers) and
 the glm-ocr chat-commentary pattern (``_CHAT_COMMENTARY_RE``): the engine uses
 it to strip model self-talk, and the QA script (``scripts/scan_output.py``)
 imports it as a regression canary. Sharing one compiled pattern keeps the two
@@ -11,8 +12,11 @@ drag in cv2/numpy.
 
 from __future__ import annotations
 
+import os
 import re
 import sys
+import tempfile
+from pathlib import Path
 
 
 def force_utf8_output() -> None:
@@ -44,6 +48,59 @@ def force_utf8_output() -> None:
             ctypes.windll.kernel32.SetConsoleOutputCP(65001)
         except Exception:  # best effort; never fatal
             pass
+
+
+def atomic_write_bytes(path: Path | str, data: bytes) -> None:
+    """Write ``data`` to ``path`` atomically (temp file + ``os.replace``).
+
+    The destination is never opened for writing, so a crash, disk-full, or
+    network hiccup mid-write cannot truncate an existing file: readers see
+    either the old complete content or the new complete content. That is
+    load-bearing for hand-corrected ALTO, where a truncated file destroys
+    human labor. The temp file lives in the destination's directory so the
+    final rename never crosses filesystems. The parent directory must exist.
+    """
+    path = Path(path)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp",
+    )
+    try:
+        with open(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass  # best effort — some network filesystems refuse fsync
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def atomic_write_text(
+    path: Path | str,
+    text: str,
+    *,
+    encoding: str = "utf-8",
+    newline: str | None = None,
+) -> None:
+    """Atomic drop-in for ``Path.write_text`` (see ``atomic_write_bytes``).
+
+    ``newline=None`` (the default) applies the same platform translation text
+    mode would (``\\n`` -> ``os.linesep``), so a successful write produces
+    byte-identical output to the ``write_text`` call it replaces. Encoding
+    happens before any file is touched, so an encode error leaves the
+    destination untouched and creates no temp file.
+    """
+    if newline is None:
+        text = text.replace("\n", os.linesep)
+    elif newline:
+        text = text.replace("\n", newline)
+    atomic_write_bytes(path, text.encode(encoding))
 
 
 # Chat-style commentary glm-ocr appends AFTER (or interleaves with) a real

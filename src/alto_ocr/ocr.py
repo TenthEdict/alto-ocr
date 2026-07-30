@@ -45,6 +45,7 @@ from lxml import etree
 
 from dataclasses import replace as dc_replace
 
+from ._util import atomic_write_text
 from .glmocr import GLMOCRConfig, transcribe
 from .line_detect import DetectParams, LineBox, TextBlock, _clean_mask, detect_blocks
 from .markup import normalize_markup
@@ -365,6 +366,10 @@ def _serialize_with_tabs(tree: etree._ElementTree, alto_path: Path) -> None:
     lxml's ``pretty_print`` uses 2-space indents and its XML declaration
     uses single quotes; the institution's reference samples use tabs and
     double quotes. We post-process the serialized string to match.
+
+    The write is atomic (``_util.atomic_write_text``): a crash or I/O error
+    mid-save can never truncate an existing ALTO — load-bearing once a file
+    carries hand corrections.
     """
     body = etree.tostring(
         tree, pretty_print=True, encoding="utf-8", xml_declaration=False,
@@ -375,8 +380,8 @@ def _serialize_with_tabs(tree: etree._ElementTree, alto_path: Path) -> None:
         body,
         flags=re.MULTILINE,
     )
-    alto_path.write_text(
-        '<?xml version="1.0" encoding="UTF-8"?>\n' + body, encoding="utf-8",
+    atomic_write_text(
+        alto_path, '<?xml version="1.0" encoding="UTF-8"?>\n' + body,
     )
 
 
@@ -1096,8 +1101,8 @@ class GLMOCREngine:
 
         alto_path = output_base.with_suffix(".xml")
         txt_path = output_base.with_suffix(".txt")
-        alto_path.write_text(alto_xml, encoding="utf-8")
-        txt_path.write_text(txt_out, encoding="utf-8")
+        atomic_write_text(alto_path, alto_xml)
+        atomic_write_text(txt_path, txt_out)
         _convert_to_institution_format(
             alto_path, page_index, dpi=dpi, source_filename=source_filename,
         )

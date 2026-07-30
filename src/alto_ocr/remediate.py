@@ -36,6 +36,7 @@ from pathlib import Path
 
 from lxml import etree
 
+from ._util import atomic_write_text
 from .mets import METS_NS, PageEntry, build_mets, write_mets
 from .ocr import _ATTR_ORDER, _qname, _reorder_attrs, _serialize_with_tabs
 from .walker import IMAGE_SUFFIXES, _natural_key
@@ -202,7 +203,7 @@ class ReviewPage:
         text_dir = self.alto_path.parent.parent / "Text"
         if text_dir.is_dir():
             txt_path = text_dir / f"{self.alto_path.stem}.txt"
-            txt_path.write_text(alto_to_text(self.root, self.ns), encoding="utf-8")
+            atomic_write_text(txt_path, alto_to_text(self.root, self.ns))
 
         self.dirty = False
         self.session_edits = 0
@@ -365,7 +366,7 @@ def repackage_object(
             except (OSError, UnicodeDecodeError):
                 current = None
             if current != txt:
-                txt_path.write_text(txt, encoding="utf-8")
+                atomic_write_text(txt_path, txt)
                 result.txt_written += 1
 
     if write_mets_file:

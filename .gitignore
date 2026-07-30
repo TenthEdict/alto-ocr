@@ -39,3 +39,6 @@ build.log
 .claude/settings.local.json
 CLAUDE.md
 
+
+# Local test input data (collection scans) — never commit
+input/

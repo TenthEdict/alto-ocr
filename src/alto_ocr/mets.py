@@ -30,6 +30,7 @@ from pathlib import Path
 from lxml import etree
 
 from . import __version__
+from ._util import atomic_write_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -259,11 +260,16 @@ def build_mets(
 
 
 def write_mets(tree: etree._ElementTree, dest: Path) -> None:
-    """Serialize METS to disk with stable formatting."""
+    """Serialize METS to disk with stable formatting.
+
+    Atomic (``_util.atomic_write_bytes``): a crash mid-write can't leave a
+    truncated METS behind. ``etree.tostring`` with these arguments produces
+    exactly the bytes ``tree.write`` used to.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
-    tree.write(
-        str(dest),
+    atomic_write_bytes(dest, etree.tostring(
+        tree,
         xml_declaration=True,
         encoding="UTF-8",
         pretty_print=True,
-    )
+    ))

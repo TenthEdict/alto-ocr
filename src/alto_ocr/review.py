@@ -285,6 +285,9 @@ class ReviewFrame(ttk.Frame):
             return False
         if ans:
             self._save_page()
+            # A failed save (the error dialog came from _save_page) leaves
+            # the page dirty — stay on it instead of discarding the edits.
+            return not self._page.dirty
         return True
 
     def _open_page(self, stem: str) -> None:

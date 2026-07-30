@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from ._util import atomic_write_text
 from .mets import PageEntry, build_mets, write_mets
 from .ocr import OCREngine
 from .pdf import rasterize_pdf
@@ -206,9 +207,9 @@ def _write_failure_stubs(alto_path: Path, txt_path: Path | None, reason: str) ->
     from datetime import datetime, timezone
 
     when = datetime.now(timezone.utc).isoformat()
-    alto_path.write_text(ALTO_FAILURE_STUB.format(when=when, reason=reason), encoding="utf-8")
+    atomic_write_text(alto_path, ALTO_FAILURE_STUB.format(when=when, reason=reason))
     if txt_path is not None:
-        txt_path.write_text("", encoding="utf-8")
+        atomic_write_text(txt_path, "")
 
 
 def process_ref_id(
@@ -318,7 +319,7 @@ def process_ref_id(
                         shutil.move(str(produced_txt), str(text_dest))
                     else:
                         logger.warning("Expected text output missing for %s/%s", inputs.ref_id, stem)
-                        text_dest.write_text("", encoding="utf-8")
+                        atomic_write_text(text_dest, "")
                 else:
                     # User opted out of plaintext — drop the engine's .txt rather
                     # than leaving it stranded next to the ALTO file.
