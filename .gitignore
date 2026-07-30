@@ -37,7 +37,6 @@ build.log
 
 # Local Claude settings (keep shared config, drop machine-local perms)
 .claude/settings.local.json
-CLAUDE.md
 
 
 # Local test input data (collection scans) — never commit
