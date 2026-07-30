@@ -39,6 +39,7 @@ from .ocr import (
 )
 from .pipeline import PageProgressLogger, RefIdResult, process_ref_id
 from .preprocess import PreprocessConfig
+from .review import ReviewFrame
 from .walker import discover_collection, discover_ref_id
 
 APP_TITLE = "Alto OCR"
@@ -209,7 +210,13 @@ class AltoOcrApp:
         nb.add(tab_advanced, text="Advanced settings")
         self._build_run_tab(tab_run)
         self._build_advanced_tab(tab_advanced)
+        self.review = ReviewFrame(nb, self._settings,
+                                  lambda: _save_settings(self._settings))
+        nb.add(self.review, text="Review")
         paned.add(nb, minsize=240, stretch="never")
+        self._paned = paned
+        self._nb = nb
+        nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
         log_frame = ttk.LabelFrame(paned, text="Log", padding=4)
         log_frame.columnconfigure(0, weight=1)
@@ -540,6 +547,18 @@ class AltoOcrApp:
         self.var_status.set("Cancelling — finishing current Ref ID…")
         self.btn_cancel.configure(state="disabled")
 
+    def _on_tab_changed(self, _event: object) -> None:
+        # The Review tab needs canvas height, but the default layout gives
+        # extra space to the log pane. On switching to Review with a short
+        # notebook pane, drop the sash so the notebook gets ~72% of the
+        # paned area; the user can still drag it back.
+        try:
+            if (self._nb.select() == str(self.review)
+                    and self._nb.winfo_height() < 500):
+                self._paned.sash_place(0, 0, int(self._paned.winfo_height() * 0.72))
+        except tk.TclError:
+            pass
+
     def _on_close(self) -> None:
         if self._worker and self._worker.is_alive():
             if not messagebox.askyesno(
@@ -549,6 +568,8 @@ class AltoOcrApp:
             ):
                 return
             self._cancel_event.set()
+        if not self.review.confirm_close():
+            return
         self.root.destroy()
 
     def _collect_config(self) -> JobConfig | None:
@@ -708,8 +729,11 @@ class AltoOcrApp:
             s.pop("tesseract_path", None)
 
         if s != self._settings:
-            self._settings = s
-            _save_settings(s)
+            # Update in place: the Review tab holds a reference to this dict
+            # (its keys ride along in `s` via the dict(...) copy above).
+            self._settings.clear()
+            self._settings.update(s)
+            _save_settings(self._settings)
 
     # ---------- Worker (off the main thread) -----------------------------------
 
