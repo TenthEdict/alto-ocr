@@ -12,11 +12,49 @@ drag in cv2/numpy.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import sys
 import tempfile
+import time
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# os.replace onto an existing file intermittently fails on Windows/SMB shares
+# when something else briefly holds a handle on the destination — an antivirus
+# scanner, the Search indexer, or an oplock break still in flight. Windows
+# surfaces that as ERROR_ACCESS_DENIED (5) as often as ERROR_SHARING_VIOLATION
+# (32), so the errno alone can't distinguish it from a real permission problem;
+# the retry does, since a genuine ACL denial fails every attempt. Observed
+# 2026-07-30 writing ALTO to \\wl.mydata.purdue.edu (3 of 41 pages in one
+# object, while pages written seconds either side succeeded).
+_REPLACE_ATTEMPTS = 6
+_REPLACE_BACKOFF_S = 0.05
+_TRANSIENT_WINERRORS = frozenset({5, 32})
+
+
+def _replace_with_retry(tmp_name: str, path: Path) -> None:
+    """``os.replace`` with bounded backoff for transient Windows/SMB failures.
+
+    Retries only errors that a concurrent handle can plausibly cause. A real
+    permission problem still raises — it just takes ~1.5s of retries first,
+    which is nothing next to an OCR pass and buys robustness on network drives.
+    """
+    delay = _REPLACE_BACKOFF_S
+    for attempt in range(1, _REPLACE_ATTEMPTS + 1):
+        try:
+            os.replace(tmp_name, path)
+            if attempt > 1:
+                logger.debug("replace of %s succeeded on attempt %d", path.name, attempt)
+            return
+        except OSError as e:
+            transient = getattr(e, "winerror", None) in _TRANSIENT_WINERRORS
+            if not transient or attempt == _REPLACE_ATTEMPTS:
+                raise
+            time.sleep(delay)
+            delay *= 2
 
 
 def force_utf8_output() -> None:
@@ -59,6 +97,9 @@ def atomic_write_bytes(path: Path | str, data: bytes) -> None:
     load-bearing for hand-corrected ALTO, where a truncated file destroys
     human labor. The temp file lives in the destination's directory so the
     final rename never crosses filesystems. The parent directory must exist.
+
+    The final rename retries briefly (see ``_replace_with_retry``) because on
+    SMB shares it intermittently fails with a transient access-denied.
     """
     path = Path(path)
     fd, tmp_name = tempfile.mkstemp(
@@ -72,7 +113,7 @@ def atomic_write_bytes(path: Path | str, data: bytes) -> None:
                 os.fsync(f.fileno())
             except OSError:
                 pass  # best effort — some network filesystems refuse fsync
-        os.replace(tmp_name, path)
+        _replace_with_retry(tmp_name, path)
     except BaseException:
         try:
             os.unlink(tmp_name)
