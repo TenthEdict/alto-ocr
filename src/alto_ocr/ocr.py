@@ -580,9 +580,27 @@ class TesseractEngine:
             self.options = OCROptions()
 
     def adjust_preprocess(self, config: PreprocessConfig) -> PreprocessConfig:
-        # Tesseract benefits from the full default preprocessing chain
-        # (deskew + denoise + CLAHE + binarize + border crop).
-        return config
+        # Drop the two FRAME-CHANGING stages. ALTO coordinates are emitted in
+        # the preprocessed image's frame, and every consumer — the public
+        # archive's hit boxes, the Review tab, the QA overlays — maps them
+        # onto the ORIGINAL image via the image-px / Page-dims ratio; only
+        # the uniform DPI upscale cancels in that mapping. Deskew (rotation)
+        # and border-crop (translation + resize) do not cancel: measured on
+        # ZeffPapers 2026-07-30, deskew fired on 36% of pages (median 1.1°,
+        # max 4.4°) and put word boxes a full line off their words near the
+        # page edges. The A/B on the worst-skew pages showed disabling it
+        # also RAISES mean WC (+0.03 overall, +0.11 on the 4.4° page):
+        # Tesseract's own baseline fitting reads these angles fine, while
+        # the deskew rotation's resampling blurred glyphs before binarize.
+        # Border-crop fired on 0/119 probed pages (adaptive binarize hollows
+        # out solid borders before the crop ever sees them) — no accuracy
+        # cost either. Denoise/CLAHE/binarize stay per user config: they
+        # change pixel VALUES, not positions. Mirrors GLMOCREngine, which
+        # documented this hazard first. If a collection ever appears whose
+        # skew genuinely breaks recognition, the fix is to keep deskew for
+        # recognition and inverse-transform coordinates at emission (the
+        # handoff's "v2") — not to re-enable deskew here.
+        return dc_replace(config, do_deskew=False, do_border_crop=False)
 
     def ocr(
         self,
