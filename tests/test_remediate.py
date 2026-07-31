@@ -2,10 +2,12 @@
 
 Covers: mm10→pixel word geometry, edit semantics (CONTENT + WC=1.00 +
 attribute order), whitespace handling, deletion with SP cleanup and
-container cascade (stopping at PrintSpace), undo via revert_word, save
-round-trip (tab serialization, PC recompute, review provenance with a
-cumulative count, Text/ regeneration), the canonical ALTO→text rendering,
-stub detection, and the source-image index.
+container cascade (stopping at PrintSpace), word insertion (add_word:
+line/block/PrintSpace placement, SP rebuild, fresh institution IDs, bbox
+expansion, undo_add), undo via revert_word, save round-trip (tab
+serialization, PC recompute, review provenance with a cumulative count,
+Text/ regeneration), the canonical ALTO→text rendering, stub detection,
+and the source-image index.
 
 Run from the repo root (so ``src.alto_ocr`` resolves):
 
@@ -64,6 +66,13 @@ _ALTO = """<?xml version="1.0" encoding="UTF-8"?>
 
 _IMG_SIZE = (2550, 3300)
 _SX = 2550 / 2159
+_SY = 3300 / 2794
+
+
+def _px_box(hpos: float, vpos: float, w: float, h: float) -> tuple:
+    """An image-pixel box that maps back to the given ALTO (mm10) box —
+    what the GUI hands add_word after the corrector draws on the scan."""
+    return (hpos * _SX, vpos * _SY, w * _SX, h * _SY)
 
 
 class _PageFixture(unittest.TestCase):
@@ -139,6 +148,90 @@ class EditTests(_PageFixture):
         self.assertIn("P1_PS00001", xml)     # PrintSpace survives
         self.assertIn("P1_TB00001", xml)     # block with remaining words survives
         self.assertEqual([w.content for w in self.page.words], ["Board", "1927"])
+
+
+class AddWordTests(_PageFixture):
+    def test_add_into_existing_line(self) -> None:
+        # Box to the right of "cf" inside TL00001's vertical band.
+        word = self.page.add_word(_px_box(500, 105, 100, 55), " and ")
+        self.assertEqual(word.content, "and")
+        self.assertEqual(word.elem.get("WC"), "1.00")
+        self.assertEqual(word.elem.get("ID"), "P1_ST00005")  # past max ST
+        self.assertTrue(self.page.dirty)
+        self.assertEqual(self.page.session_edits, 1)
+        # Reading order maintained in self.words (line 1 gains the word).
+        self.assertEqual([w.content for w in self.page.words],
+                         ["Board", "cf", "and", "1927", "Lone"])
+        # Landed in TL00001, after "cf", with the SP run rebuilt from the
+        # current gaps: Board..cf gap 20, cf..and gap 30.
+        line = word.elem.getparent()
+        self.assertEqual(line.get("ID"), "P1_TL00001")
+        kinds = [(etree.QName(k).localname, k.get("CONTENT")) for k in line]
+        self.assertEqual(kinds, [("String", "Board"), ("SP", None),
+                                 ("String", "cf"), ("SP", None),
+                                 ("String", "and")])
+        sps = line.findall("{*}SP")
+        self.assertEqual([sp.get("WIDTH") for sp in sps], ["20", "30"])
+        # Verified words aren't flagged.
+        self.assertNotIn(word, self.page.flagged(0.99))
+
+    def test_add_makes_new_line_in_overlapping_block(self) -> None:
+        # Below both of TB00001's lines but overlapping its bbox (y 100-300).
+        word = self.page.add_word(_px_box(150, 285, 200, 20), "added")
+        line = word.elem.getparent()
+        block = line.getparent()
+        self.assertEqual(etree.QName(line).localname, "TextLine")
+        self.assertEqual(line.get("ID"), "P1_TL00004")
+        self.assertEqual(block.get("ID"), "P1_TB00001")
+        # Appended after the block's existing lines (VPOS order)…
+        self.assertEqual([tl.get("ID") for tl in block.findall("{*}TextLine")],
+                         ["P1_TL00001", "P1_TL00002", "P1_TL00004"])
+        # …and the block bbox grew to cover the word (y2 300 -> 305).
+        self.assertEqual(block.get("HEIGHT"), "205")
+        self.assertEqual([w.content for w in self.page.words],
+                         ["Board", "cf", "1927", "added", "Lone"])
+
+    def test_add_far_from_everything_makes_new_block(self) -> None:
+        word = self.page.add_word(_px_box(1200, 1000, 300, 60), "margin")
+        line = word.elem.getparent()
+        block = line.getparent()
+        self.assertEqual(block.get("ID"), "P1_TB00003")
+        self.assertEqual(etree.QName(block.getparent()).localname, "PrintSpace")
+        # After TB00002 (VPOS 500 < 1000) in reading order.
+        ps = block.getparent()
+        self.assertEqual([tb.get("ID") for tb in ps.findall("{*}TextBlock")],
+                         ["P1_TB00001", "P1_TB00002", "P1_TB00003"])
+        self.assertEqual(self.page.words[-1].content, "margin")
+        self.assertEqual(alto_to_text(self.page.root),
+                         "Board cf\n1927\n\nLone\n\nmargin\n")
+
+    def test_add_empty_text_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            self.page.add_word(_px_box(500, 105, 100, 55), "   ")
+        self.assertFalse(self.page.dirty)
+
+    def test_undo_add_restores_document(self) -> None:
+        word = self.page.add_word(_px_box(500, 105, 100, 55), "and")
+        self.page.undo_add(word)
+        self.assertEqual([w.content for w in self.page.words],
+                         ["Board", "cf", "1927", "Lone"])
+        self.assertEqual(self.page.session_edits, 0)
+        xml = etree.tostring(self.page.root).decode()
+        self.assertNotIn('CONTENT="and"', xml)
+        # The line keeps exactly one SP between its two surviving words.
+        line = self.page.words[0].elem.getparent()
+        self.assertEqual(len(line.findall("{*}SP")), 1)
+
+    def test_save_after_add_updates_pc_provenance_and_txt(self) -> None:
+        self.page.add_word(_px_box(500, 105, 100, 55), "and")
+        txt_path = self.page.save()
+        body = self.alto.read_text(encoding="utf-8")
+        self.assertIn('CONTENT="and" WC="1.00"', body)
+        # PC = mean(0.96, 0.40, 1.00, 0.85) = 0.8025 -> 0.80.
+        self.assertIn('PC="0.80"', body)
+        self.assertIn("human review: 1 word(s) corrected", body)
+        self.assertEqual(txt_path.read_text(encoding="utf-8"),
+                         "Board cf and\n1927\n\nLone\n")
 
 
 class SaveTests(_PageFixture):

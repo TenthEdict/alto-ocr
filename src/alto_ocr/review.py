@@ -13,6 +13,14 @@ next flagged word, **Escape** deselects, **n/p** step through flagged words
 (canvas focus), **Ctrl+Z** undoes the last edit. Deletions (hallucinated
 words) confirm first and are undone only by reloading the page.
 
+**Add word** mode (toolbar toggle, or ``a`` with canvas focus) covers words
+the OCR missed entirely: drag a box around the word on the scan, type it,
+press Enter — the word is inserted into the ALTO at the drawn position
+(``remediate.ReviewPage.add_word`` picks the line/block) with ``WC="1.00"``.
+Ctrl+Z removes it again. A glyph palette under the editor inserts math and
+engineering characters (π Σ √ ° …) correctors can't reach on a US keyboard
+— common in the institution's lab-notebook material.
+
 All ALTO mutation/save semantics live in ``remediate.py`` (headless,
 unit-tested); this module is only Tk plumbing.
 """
@@ -49,6 +57,14 @@ _MAX_RENDER_PX = 40_000_000
 logger = logging.getLogger("alto_ocr.review")
 
 _ZOOMS: tuple[str, ...] = ("Fit", "50%", "75%", "100%", "150%", "200%")
+
+# Characters correctors can't type on a US keyboard but the collections
+# need — engineering notebooks (math), lab reports (units), typescripts
+# (dashes/fractions). One click inserts at the editor cursor.
+_GLYPHS: tuple[str, ...] = (
+    "π", "Σ", "Δ", "θ", "Ω", "μ", "√", "∫", "∞", "±", "×", "÷",
+    "≈", "≠", "≤", "≥", "°", "·", "²", "³", "½", "¼", "¾", "—",
+)
 
 # WC → outline color. Blue marks words edited this session (WC becomes 1.00
 # on disk, but the corrector should still see what they touched).
@@ -90,7 +106,14 @@ class ReviewFrame(ttk.Frame):
         self._rect_by_word: dict[int, int] = {}   # id(Word) -> canvas item
         self._word_by_rect: dict[int, Word] = {}
         self._selected: Optional[Word] = None
-        self._undo: list[tuple[Word, str, float | None]] = []
+        # Undo stack: (word, old_content, old_wc) for edits; old_content is
+        # None for an added word (undo removes it again).
+        self._undo: list[tuple[Word, str | None, float | None]] = []
+        # Add-word mode state: the drag in progress and the finalized box
+        # (image-pixel space) awaiting its text.
+        self._drag_start: Optional[tuple[float, float]] = None
+        self._drag_item: Optional[int] = None
+        self._pending_box: Optional[tuple[float, float, float, float]] = None
 
         self.var_object = tk.StringVar(value=str(settings.get("review_object_dir", "")))
         self.var_source = tk.StringVar(value=str(settings.get("review_source_dir", "")))
@@ -98,6 +121,7 @@ class ReviewFrame(ttk.Frame):
         self.var_threshold = tk.DoubleVar(
             value=float(settings.get("review_threshold", DEFAULT_LOW_WC)))
         self.var_show_all = tk.BooleanVar(value=False)
+        self.var_add_mode = tk.BooleanVar(value=False)
         self.var_zoom = tk.StringVar(value="Fit")
         self.var_status = tk.StringVar(value="Pick an output object folder and its source images.")
         self.var_edit = tk.StringVar()
@@ -167,6 +191,8 @@ class ReviewFrame(ttk.Frame):
         ttk.Button(bar, text="Next ▶", command=lambda: self._goto_flagged(+1)).pack(
             side="left", padx=(4, 10))
         ttk.Button(bar, text="Undo", command=self._undo_edit).pack(side="left")
+        ttk.Checkbutton(bar, text="Add word (a)", variable=self.var_add_mode,
+                        command=self._on_add_mode_toggled).pack(side="left", padx=(10, 0))
         self.btn_save = ttk.Button(bar, text="Save page", command=self._save_page,
                                    state="disabled")
         self.btn_save.pack(side="right")
@@ -179,11 +205,14 @@ class ReviewFrame(ttk.Frame):
         hs.grid(row=2, column=0, sticky="ew")
         self.canvas.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
         self.canvas.bind("<Button-1>", self._on_canvas_click)
+        self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
         self.canvas.bind("<Configure>", lambda _e: self._render_if_fit())
         self.canvas.bind("<MouseWheel>", self._on_wheel)
         self.canvas.bind("<Shift-MouseWheel>", self._on_wheel_h)
         self.canvas.bind("<Key-n>", lambda _e: self._goto_flagged(+1))
         self.canvas.bind("<Key-p>", lambda _e: self._goto_flagged(-1))
+        self.canvas.bind("<Key-a>", lambda _e: self._toggle_add_mode())
         self.canvas.bind("<Control-z>", lambda _e: self._undo_edit())
 
         # -- Row 2: editor bar
@@ -197,7 +226,7 @@ class ReviewFrame(ttk.Frame):
         self.ent_edit = ttk.Entry(editor, textvariable=self.var_edit, font=("Consolas", 12))
         self.ent_edit.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(0, 8))
         self.ent_edit.bind("<Return>", lambda _e: self._apply_edit(advance=True))
-        self.ent_edit.bind("<Escape>", lambda _e: self._select_word(None))
+        self.ent_edit.bind("<Escape>", lambda _e: self._on_escape())
         self.ent_edit.bind("<Control-z>", lambda _e: self._undo_edit())
         btns = ttk.Frame(editor)
         btns.grid(row=1, column=3, sticky="e")
@@ -205,6 +234,11 @@ class ReviewFrame(ttk.Frame):
                    command=lambda: self._apply_edit(advance=True)).pack(side="left")
         ttk.Button(btns, text="Delete word", command=self._delete_word).pack(
             side="left", padx=(6, 0))
+        glyphs = ttk.Frame(editor)
+        glyphs.grid(row=2, column=1, columnspan=3, sticky="w", pady=(4, 0))
+        for ch in _GLYPHS:
+            ttk.Button(glyphs, text=ch, width=2, style="Toolbutton",
+                       command=lambda c=ch: self._insert_glyph(c)).pack(side="left")
 
         ttk.Label(self, textvariable=self.var_status, foreground="#555").grid(
             row=3, column=0, sticky="w", pady=(4, 0))
@@ -251,6 +285,7 @@ class ReviewFrame(ttk.Frame):
         self._stem = None
         self._selected = None
         self._undo.clear()
+        self._cancel_pending_add()
         self.canvas.delete("all")
         self.btn_save.configure(state="disabled")
         self._refresh_page_list()
@@ -334,6 +369,7 @@ class ReviewFrame(ttk.Frame):
         self._pil = pil
         self._selected = None
         self._undo.clear()
+        self._cancel_pending_add()
         self.btn_save.configure(state="disabled")
         self._render()
         self._update_editor()
@@ -387,6 +423,18 @@ class ReviewFrame(ttk.Frame):
             self._rect_by_word[id(word)] = item
             self._word_by_rect[item] = word
 
+        # A pending add-word box survives re-renders (zoom, threshold
+        # changes) — redraw it; canvas.delete("all") above dropped the item.
+        if self._pending_box is not None:
+            x, y, bw, bh = self._pending_box
+            self._drag_item = self.canvas.create_rectangle(
+                x * self._scale, y * self._scale,
+                (x + bw) * self._scale, (y + bh) * self._scale,
+                outline=_COLOR_EDITED, width=2, dash=(4, 2),
+            )
+        else:
+            self._drag_item = None
+
     def _threshold(self) -> float:
         try:
             return max(0.0, min(1.0, float(self.var_threshold.get())))
@@ -411,11 +459,111 @@ class ReviewFrame(ttk.Frame):
         self.canvas.focus_set()
         if self._page is None:
             return
+        if self.var_add_mode.get():
+            # Add mode: the click starts a rubber-band drag, not a selection.
+            self._cancel_pending_add()
+            self._drag_start = (self.canvas.canvasx(event.x),
+                                self.canvas.canvasy(event.y))
+            return
         x = self.canvas.canvasx(event.x) / self._scale
         y = self.canvas.canvasy(event.y) / self._scale
         self._select_word(self._page.word_at(x, y))
 
+    # ---------- add-word mode ---------------------------------------------
+
+    def _toggle_add_mode(self) -> None:
+        self.var_add_mode.set(not self.var_add_mode.get())
+        self._on_add_mode_toggled()
+
+    def _on_add_mode_toggled(self) -> None:
+        on = self.var_add_mode.get()
+        self.canvas.configure(cursor="crosshair" if on else "")
+        if not on:
+            self._cancel_pending_add()
+        elif self._page is not None:
+            self.var_status.set(
+                "Add word: drag a box around the missed word on the scan, "
+                "type the word, press Enter.")
+
+    def _cancel_pending_add(self) -> None:
+        self._drag_start = None
+        if self._drag_item is not None:
+            self.canvas.delete(self._drag_item)
+            self._drag_item = None
+        if self._pending_box is not None:
+            self._pending_box = None
+            self._update_editor()
+
+    def _on_canvas_drag(self, event: tk.Event) -> None:
+        if self._drag_start is None:
+            return
+        x0, y0 = self._drag_start
+        x1, y1 = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        if self._drag_item is None:
+            self._drag_item = self.canvas.create_rectangle(
+                x0, y0, x1, y1, outline=_COLOR_EDITED, width=2, dash=(4, 2))
+        else:
+            self.canvas.coords(self._drag_item, x0, y0, x1, y1)
+
+    def _on_canvas_release(self, event: tk.Event) -> None:
+        if self._drag_start is None:
+            return
+        x0, y0 = self._drag_start
+        x1, y1 = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        self._drag_start = None
+        box = (min(x0, x1) / self._scale, min(y0, y1) / self._scale,
+               abs(x1 - x0) / self._scale, abs(y1 - y0) / self._scale)
+        if box[2] < 3 or box[3] < 3:  # a stray click, not a drawn box
+            self._cancel_pending_add()
+            return
+        self._pending_box = box
+        self._selected = None
+        self._update_editor()
+        self.var_status.set("Type the word for the drawn box, then press Enter "
+                            "(Escape cancels).")
+        self.ent_edit.focus_set()
+
+    def _commit_add(self) -> None:
+        if self._page is None or self._pending_box is None:
+            return
+        text = self.var_edit.get()
+        if not text.strip():
+            self._cancel_pending_add()
+            self.var_status.set("Add word cancelled (no text).")
+            return
+        try:
+            word = self._page.add_word(self._pending_box, text)
+        except ValueError as e:
+            self.var_status.set(str(e))
+            return
+        self._undo.append((word, None, None))  # None content marks an addition
+        self._cancel_pending_add()
+        self.btn_save.configure(state="normal")
+        self._render()
+        self._select_word(word)
+        self._update_status()
+
+    def _on_escape(self) -> None:
+        if self._pending_box is not None:
+            self._cancel_pending_add()
+            self.canvas.focus_set()
+        else:
+            self._select_word(None)
+
+    def _insert_glyph(self, ch: str) -> None:
+        """Type a palette glyph into the edit box at the cursor."""
+        self.ent_edit.insert("insert", ch)
+        self.ent_edit.focus_set()
+
+    # ---------- selection -------------------------------------------------
+
     def _select_word(self, word: Optional[Word]) -> None:
+        if word is not None and self._pending_box is not None:
+            # Selecting a real word supersedes an un-committed add box.
+            self._pending_box = None
+            if self._drag_item is not None:
+                self.canvas.delete(self._drag_item)
+                self._drag_item = None
         prev = self._selected
         self._selected = word
         for w, width in ((prev, 2), (word, 3)):
@@ -439,15 +587,8 @@ class ReviewFrame(ttk.Frame):
         self.canvas.xview_moveto(max(0.0, min(1.0, cx)))
         self.canvas.yview_moveto(max(0.0, min(1.0, cy)))
 
-    def _update_editor(self) -> None:
-        word = self._selected
-        if word is None or self._pil is None:
-            self.lbl_snippet.configure(image="")
-            self._snippet_photo = None
-            self.lbl_wc.configure(text="—")
-            self.var_edit.set("")
-            return
-        x, y, bw, bh = word.box_px
+    def _set_snippet(self, x: float, y: float, bw: float, bh: float) -> None:
+        """Show a magnified crop of the scan region in the editor bar."""
         pad = 8
         crop = self._pil.crop((
             max(0, int(x - pad)), max(0, int(y - pad)),
@@ -459,11 +600,29 @@ class ReviewFrame(ttk.Frame):
         crop = crop.resize((max(int(crop.width * scale), 1), target_h), Image.LANCZOS)
         self._snippet_photo = ImageTk.PhotoImage(crop)
         self.lbl_snippet.configure(image=self._snippet_photo)
+
+    def _update_editor(self) -> None:
+        if self._pending_box is not None and self._pil is not None:
+            self._set_snippet(*self._pending_box)
+            self.lbl_wc.configure(text="new word")
+            self.var_edit.set("")
+            return
+        word = self._selected
+        if word is None or self._pil is None:
+            self.lbl_snippet.configure(image="")
+            self._snippet_photo = None
+            self.lbl_wc.configure(text="—")
+            self.var_edit.set("")
+            return
+        self._set_snippet(*word.box_px)
         self.lbl_wc.configure(
             text=f"WC {word.wc:.2f}" if word.wc is not None else "WC —  (unscored)")
         self.var_edit.set(word.content)
 
     def _apply_edit(self, advance: bool = False) -> None:
+        if self._pending_box is not None:
+            self._commit_add()
+            return
         word = self._selected
         if word is None or self._page is None:
             return
@@ -493,7 +652,12 @@ class ReviewFrame(ttk.Frame):
         ):
             return
         nxt = self._next_after(word)
-        self._page.delete_word(word)
+        if any(w is word and c is None for w, c, _wc in self._undo):
+            # Deleting a word added this session: net it out of the
+            # provenance count instead of counting an add plus a delete.
+            self._page.undo_add(word)
+        else:
+            self._page.delete_word(word)
         self._undo = [(w, c, wc) for (w, c, wc) in self._undo if w is not word]
         self._selected = None
         self.btn_save.configure(state="normal")
@@ -505,6 +669,16 @@ class ReviewFrame(ttk.Frame):
         if not self._undo or self._page is None:
             return
         word, old_content, old_wc = self._undo.pop()
+        if old_content is None:  # the entry was an added word — remove it again
+            self._page.undo_add(word)
+            if self._selected is word:
+                self._selected = None
+            if self._page.session_edits == 0 and not self._page.dirty:
+                self.btn_save.configure(state="disabled")
+            self._render()
+            self._update_editor()
+            self._update_status()
+            return
         self._page.revert_word(word, old_content, old_wc)
         item = self._rect_by_word.get(id(word))
         if item is not None:

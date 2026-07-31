@@ -17,8 +17,13 @@ Stages, in order:
    scan grain.
 5. **Contrast** — CLAHE (adaptive histogram equalization). Helps faded or
    unevenly-lit pages.
-6. **Binarize** — adaptive Gaussian threshold. Better than global Otsu when
-   pages have shadows or warped lighting.
+6. **Binarize** — adaptive Gaussian threshold. **Off by default** (v0.8.8):
+   Tesseract 5's LSTM thresholds internally, and A/B runs on the fixtures
+   plus the MSA00018 pilot showed pre-binarized input *lowers* mean WC on
+   every collection tried (ZeffPapers 0.83→0.91 off, MSA00005 0.45→0.95)
+   — faint strokes vanish and paper grain turns into punctuation speckle
+   the LSTM reads as text. Available per-collection via ``--binarize``
+   for the rare scan CLAHE can't normalize.
 7. **Border crop** — trim solid black scanning margins that touch the page
    edge and confuse layout analysis.
 
@@ -50,7 +55,11 @@ class PreprocessConfig:
     do_deskew: bool = True
     do_denoise: bool = True
     do_clahe: bool = True
-    do_binarize: bool = True
+    # OFF by default since v0.8.8 — measured WC drop with pre-binarized
+    # input on every fixture + pilot collection (see module docstring).
+    # Locked by tests/test_preprocess_defaults.py; don't re-enable without
+    # re-measuring.
+    do_binarize: bool = False
     do_border_crop: bool = True
 
     deskew_min_angle_deg: float = 0.2  # below this, skip rotation

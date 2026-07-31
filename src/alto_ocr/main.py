@@ -116,14 +116,14 @@ def _build_engine(
 def _build_preprocess_config(
     min_dpi: int,
     no_deskew: bool, no_denoise: bool, no_clahe: bool,
-    no_binarize: bool, no_border_crop: bool,
+    binarize: bool, no_border_crop: bool,
 ) -> PreprocessConfig:
     return PreprocessConfig(
         min_dpi=min_dpi,
         do_deskew=not no_deskew,
         do_denoise=not no_denoise,
         do_clahe=not no_clahe,
-        do_binarize=not no_binarize,
+        do_binarize=binarize,
         do_border_crop=not no_border_crop,
     )
 
@@ -270,7 +270,11 @@ MinDpiOpt = typer.Option(300, "--min-dpi", help="Upscale low-DPI scans to at lea
 NoDeskewOpt = typer.Option(False, "--no-deskew", help="Skip deskew stage.")
 NoDenoiseOpt = typer.Option(False, "--no-denoise", help="Skip bilateral denoise stage.")
 NoClaheOpt = typer.Option(False, "--no-clahe", help="Skip CLAHE contrast normalization.")
-NoBinarizeOpt = typer.Option(False, "--no-binarize", help="Skip adaptive thresholding (feed grayscale to OCR).")
+BinarizeOpt = typer.Option(False, "--binarize/--no-binarize",
+                           help="Adaptive-threshold the image before OCR. OFF by default since "
+                                "v0.8.8: Tesseract 5 thresholds internally, and pre-binarized "
+                                "input measurably lowered WC on every collection tried. Both "
+                                "spellings accepted so existing --no-binarize scripts keep working.")
 NoBorderCropOpt = typer.Option(False, "--no-border-crop", help="Skip black-border auto-crop.")
 NoChecksumsOpt = typer.Option(False, "--no-checksums", help="Skip MD5 checksums in METS (faster on large objects).")
 NoMetsOpt = typer.Option(False, "--no-mets",
@@ -310,7 +314,7 @@ def process(
     no_deskew: bool = NoDeskewOpt,
     no_denoise: bool = NoDenoiseOpt,
     no_clahe: bool = NoClaheOpt,
-    no_binarize: bool = NoBinarizeOpt,
+    binarize: bool = BinarizeOpt,
     no_border_crop: bool = NoBorderCropOpt,
     no_checksums: bool = NoChecksumsOpt,
     no_mets: bool = NoMetsOpt,
@@ -344,7 +348,7 @@ def process(
         glmocr_num_predict=glmocr_num_predict,
     )
 
-    cfg = _build_preprocess_config(min_dpi, no_deskew, no_denoise, no_clahe, no_binarize, no_border_crop)
+    cfg = _build_preprocess_config(min_dpi, no_deskew, no_denoise, no_clahe, binarize, no_border_crop)
 
     progress = PageProgressLogger(inputs.page_count)
     result = process_ref_id(
@@ -458,7 +462,7 @@ def batch(
     no_deskew: bool = NoDeskewOpt,
     no_denoise: bool = NoDenoiseOpt,
     no_clahe: bool = NoClaheOpt,
-    no_binarize: bool = NoBinarizeOpt,
+    binarize: bool = BinarizeOpt,
     no_border_crop: bool = NoBorderCropOpt,
     no_checksums: bool = NoChecksumsOpt,
     no_mets: bool = NoMetsOpt,
@@ -491,7 +495,7 @@ def batch(
         glmocr_num_predict=glmocr_num_predict,
     )
 
-    cfg = _build_preprocess_config(min_dpi, no_deskew, no_denoise, no_clahe, no_binarize, no_border_crop)
+    cfg = _build_preprocess_config(min_dpi, no_deskew, no_denoise, no_clahe, binarize, no_border_crop)
 
     results: list[RefIdResult] = []
     if workers <= 1:

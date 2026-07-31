@@ -84,6 +84,24 @@ def _load_settings() -> dict:
         return {}
 
 
+def _migrate_settings(s: dict) -> dict:
+    """One-shot migrations for changed defaults.
+
+    v0.8.8 flipped the binarize default OFF (adaptive thresholding
+    measurably hurt Tesseract 5 on every fixture + pilot collection).
+    Saved GUI settings outrank dataclass defaults, so a pre-0.8.8 saved
+    ``do_binarize: true`` — usually just the old default echoed back by a
+    save — would silently keep binarization on forever. Drop the key once;
+    the marker means any value present afterwards was chosen by the user
+    under the new default and is kept. Pure function of the dict so it
+    stays testable without Tk.
+    """
+    if not s.get("_migrated_binarize_default_off"):
+        s.pop("do_binarize", None)
+        s["_migrated_binarize_default_off"] = True
+    return s
+
+
 def _save_settings(data: dict) -> None:
     try:
         SETTINGS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -123,7 +141,7 @@ class AltoOcrApp:
 
         # All settings — basic and advanced — restore from the persisted
         # JSON on launch so users keep their preferred recipe across runs.
-        self._settings = _load_settings()
+        self._settings = _migrate_settings(_load_settings())
         s = self._settings
         pp = PreprocessConfig()  # source of truth for preprocessing defaults
         oo = OCROptions()        # source of truth for Tesseract option defaults

@@ -16,6 +16,13 @@ Semantics (agreed 2026-07-30):
   the ``<String>`` plus its neighboring ``<SP>``, and cascades upward:
   a ``<TextLine>``/``<TextBlock>``/``<ComposedBlock>`` left with no text
   content is removed too, keeping the ALTO schema-shaped.
+* **Adding a word** (2026-07-31; OCR missed it entirely) takes a box the
+  corrector drew on the page image, maps it back into ALTO units via the
+  same image-px/Page-dims ratio the display uses, and inserts a
+  ``<String>`` at the right spot: into the TextLine whose vertical band
+  best overlaps the box, else a new TextLine in the best-overlapping
+  TextBlock, else a new TextBlock in PrintSpace. Like an edit, the added
+  word is human-verified (``WC="1.00"``) and counts toward provenance.
 * **Saving** re-serializes with the institution conventions (tab indent,
   reference attribute order — reusing ``ocr.py``'s helpers), recomputes
   ``Page/@PC`` as the mean of current ``WC`` values (so partially-corrected
@@ -195,6 +202,13 @@ class ReviewPage:
 
     def delete_word(self, word: Word) -> None:
         """Remove a hallucinated word (plus a neighboring SP; cascade empties)."""
+        self._remove_string(word)
+        self.dirty = True
+        self.session_edits += 1
+
+    def _remove_string(self, word: Word) -> None:
+        """Detach a word's ``<String>`` plus a neighboring ``<SP>``, cascading
+        away emptied containers. Shared by ``delete_word`` and ``undo_add``."""
         el = word.elem
         parent = el.getparent()
         sp_tag = qname(self.ns, "SP")
@@ -217,8 +231,240 @@ class ReviewPage:
             node = up
 
         self.words.remove(word)
+
+    # ---------- word insertion (missed-word corrections) ------------------
+
+    _ID_CODES = {"ComposedBlock": "CB", "TextBlock": "TB",
+                 "TextLine": "TL", "String": "ST", "SP": "SP"}
+
+    def add_word(self, box_px: tuple[float, float, float, float], text: str) -> Word:
+        """Insert a word the OCR missed, boxed by the corrector in image px.
+
+        ``box_px`` is (x, y, w, h) on the source image — the box the
+        corrector drew. It converts to ALTO units by the inverse of the
+        display scaling, so the stored coordinates land exactly where the
+        box was drawn on the original scan. Placement: the String joins the
+        TextLine whose vertical band best overlaps the box (left-to-right
+        order, the line's ``<SP>`` run rebuilt); failing that, a new
+        TextLine in the TextBlock with the largest box overlap; failing
+        that, a new TextBlock in PrintSpace at its top-to-bottom position.
+        Ancestor bboxes grow to cover the new word. A human put the word
+        there, so it carries ``WC="1.00"`` and counts toward the review
+        provenance total like any other correction. Returns the new Word,
+        placed in reading order in ``self.words``.
+        """
+        content = " ".join(text.split())
+        if not content:
+            raise ValueError("Empty text — nothing to add.")
+        x, y, w, h = box_px
+        hpos = max(0, int(round(x / self.sx)))
+        vpos = max(0, int(round(y / self.sy)))
+        width = max(1, int(round(w / self.sx)))
+        height = max(1, int(round(h / self.sy)))
+
+        el = etree.Element(qname(self.ns, "String"))
+        el.set("ID", self._next_id("String"))
+        for attr, val in (("HPOS", hpos), ("VPOS", vpos),
+                          ("WIDTH", width), ("HEIGHT", height)):
+            el.set(attr, str(val))
+        el.set("CONTENT", content)
+        el.set("WC", "1.00")
+        reorder_attrs(el, ATTR_ORDER["String"])
+
+        line = self._best_line(hpos, vpos, width, height)
+        if line is not None:
+            self._insert_into_line(line, el)
+        else:
+            self._new_line_for(el, hpos, vpos, width, height)
+        self._expand_ancestors(el, hpos, vpos, width, height)
+
+        word = Word(el, (hpos * self.sx, vpos * self.sy,
+                         width * self.sx, height * self.sy))
+        # Keep self.words in document (reading) order — flagged() and the
+        # GUI's next-word stepping rely on it.
+        order = {id(s): i
+                 for i, s in enumerate(self.root.iter(qname(self.ns, "String")))}
+        pos = sum(1 for existing in self.words
+                  if order.get(id(existing.elem), -1) < order[id(el)])
+        self.words.insert(pos, word)
+
         self.dirty = True
         self.session_edits += 1
+        return word
+
+    def undo_add(self, word: Word) -> None:
+        """Undo one ``add_word`` (GUI undo stack): detach the String again
+        and un-count the edit. ``dirty`` stays as-is, like ``revert_word`` —
+        other unsaved changes may exist; reloading is the full reset."""
+        self._remove_string(word)
+        self.session_edits = max(0, self.session_edits - 1)
+
+    @staticmethod
+    def _box_of(el: etree._Element) -> tuple[int, int, int, int] | None:
+        try:
+            return (int(el.get("HPOS", "")), int(el.get("VPOS", "")),
+                    int(el.get("WIDTH", "")), int(el.get("HEIGHT", "")))
+        except ValueError:
+            return None
+
+    def _next_id(self, local: str) -> str:
+        """Fresh institution-style ID (e.g. ``P1_ST00005``): continue past
+        the highest existing number for the element type; never reuse an ID
+        (deleted words leave gaps, which is fine — nothing renumbers)."""
+        prefix = f"{self.page.get('ID', 'P1')}_{self._ID_CODES[local]}"
+        used = {e.get("ID") for e in self.root.iter() if e.get("ID") is not None}
+        pat = re.compile(re.escape(prefix) + r"(\d+)$")
+        n = 0
+        for uid in used:
+            m = pat.match(uid)
+            if m:
+                n = max(n, int(m.group(1)))
+        n += 1
+        while f"{prefix}{n:05d}" in used:
+            n += 1
+        return f"{prefix}{n:05d}"
+
+    def _best_line(self, hpos: int, vpos: int, width: int, height: int
+                   ) -> etree._Element | None:
+        """TextLine whose vertical band overlaps at least half the shorter
+        of (line, word) heights; best = most overlap, then nearest
+        horizontally. Handwritten baselines wobble, so the criterion is a
+        band test, not containment."""
+        best = None
+        best_key: tuple[float, float] | None = None
+        for line in self.root.iter(qname(self.ns, "TextLine")):
+            b = self._box_of(line)
+            if b is None:
+                continue
+            lx, ly, lw, lh = b
+            overlap = min(ly + lh, vpos + height) - max(ly, vpos)
+            if overlap < 0.5 * min(max(lh, 1), max(height, 1)):
+                continue
+            h_gap = max(lx - (hpos + width), hpos - (lx + lw), 0)
+            key = (-overlap, float(h_gap))
+            if best_key is None or key < best_key:
+                best, best_key = line, key
+        return best
+
+    def _insert_into_line(self, line: etree._Element, el: etree._Element) -> None:
+        hpos = int(el.get("HPOS"))
+        anchor = None
+        for s in line.findall(qname(self.ns, "String")):
+            try:
+                if int(s.get("HPOS", "")) > hpos:
+                    anchor = s
+                    break
+            except ValueError:
+                continue
+        if anchor is not None:
+            anchor.addprevious(el)
+        else:
+            line.append(el)
+        self._rebuild_line_sps(line)
+
+    def _rebuild_line_sps(self, line: etree._Element) -> None:
+        """Regenerate the line's ``<SP>`` run from its current Strings —
+        simpler and safer than splicing around one insertion point. SP
+        geometry is derived (the gap between neighbors) and nothing
+        references SP IDs, so rebuilding is loss-free."""
+        sp_tag = qname(self.ns, "SP")
+        for sp in line.findall(sp_tag):
+            line.remove(sp)
+        strings = line.findall(qname(self.ns, "String"))
+        for left, right in zip(strings, strings[1:]):
+            lb, rb = self._box_of(left), self._box_of(right)
+            if lb is None or rb is None:
+                continue
+            sp = etree.Element(sp_tag)
+            sp.set("ID", self._next_id("SP"))
+            sp.set("HPOS", str(lb[0] + lb[2]))
+            sp.set("VPOS", str(lb[1]))
+            sp.set("WIDTH", str(max(0, rb[0] - (lb[0] + lb[2]))))
+            left.addnext(sp)
+
+    def _new_line_for(self, el: etree._Element,
+                      hpos: int, vpos: int, width: int, height: int) -> None:
+        """House ``el`` in a new TextLine boxed to the word — inside the
+        best-overlapping TextBlock, or a new TextBlock in PrintSpace when
+        nothing overlaps (marginalia, annotations on blank areas)."""
+        line = etree.Element(qname(self.ns, "TextLine"))
+        line.set("ID", self._next_id("TextLine"))
+        for attr, val in (("HPOS", hpos), ("VPOS", vpos),
+                          ("WIDTH", width), ("HEIGHT", height)):
+            line.set(attr, str(val))
+        line.append(el)
+
+        block = self._best_block(hpos, vpos, width, height)
+        if block is None:
+            block = etree.Element(qname(self.ns, "TextBlock"))
+            block.set("ID", self._next_id("TextBlock"))
+            for attr, val in (("HPOS", hpos), ("VPOS", vpos),
+                              ("WIDTH", width), ("HEIGHT", height)):
+                block.set(attr, str(val))
+            ps = self.page.find(qname(self.ns, "PrintSpace"))
+            if ps is None:
+                # Degenerate ALTO (no PrintSpace at all — some blank-page
+                # variants). Text must live somewhere; create one page-sized.
+                ps = etree.SubElement(self.page, qname(self.ns, "PrintSpace"))
+                ps.set("ID", f"{self.page.get('ID', 'P1')}_PS00001")
+                for attr, val in (("HPOS", "0"), ("VPOS", "0"),
+                                  ("WIDTH", self.page.get("WIDTH", "0")),
+                                  ("HEIGHT", self.page.get("HEIGHT", "0"))):
+                    ps.set(attr, val)
+            self._insert_by_vpos(ps, block, vpos, ("TextBlock", "ComposedBlock"))
+        self._insert_by_vpos(block, line, vpos, ("TextLine",))
+
+    def _best_block(self, hpos: int, vpos: int, width: int, height: int
+                    ) -> etree._Element | None:
+        """TextBlock with the largest intersection area, or None."""
+        best, best_area = None, 0
+        for block in self.root.iter(qname(self.ns, "TextBlock")):
+            b = self._box_of(block)
+            if b is None:
+                continue
+            bx, by, bw, bh = b
+            ix = min(bx + bw, hpos + width) - max(bx, hpos)
+            iy = min(by + bh, vpos + height) - max(by, vpos)
+            area = ix * iy if (ix > 0 and iy > 0) else 0
+            if area > best_area:
+                best, best_area = block, area
+        return best
+
+    @staticmethod
+    def _insert_by_vpos(parent: etree._Element, el: etree._Element,
+                        vpos: int, localnames: tuple[str, ...]) -> None:
+        """Insert ``el`` before the first ``localnames`` child whose VPOS is
+        below the new element's — keeping top-to-bottom reading order."""
+        for child in parent:
+            if etree.QName(child).localname not in localnames:
+                continue
+            try:
+                if int(child.get("VPOS", "")) > vpos:
+                    child.addprevious(el)
+                    return
+            except ValueError:
+                continue
+        parent.append(el)
+
+    def _expand_ancestors(self, el: etree._Element,
+                          hpos: int, vpos: int, width: int, height: int) -> None:
+        """Grow TextLine/TextBlock/ComposedBlock bboxes to cover the new
+        word. PrintSpace and margins stay untouched — the institution
+        converter owns those, and consumers only read Page dims + String
+        boxes."""
+        node = el.getparent()
+        grow = {"TextLine", "TextBlock", "ComposedBlock"}
+        while node is not None and etree.QName(node).localname in grow:
+            b = self._box_of(node)
+            if b is not None:
+                nx, ny = min(b[0], hpos), min(b[1], vpos)
+                nx2 = max(b[0] + b[2], hpos + width)
+                ny2 = max(b[1] + b[3], vpos + height)
+                node.set("HPOS", str(nx))
+                node.set("VPOS", str(ny))
+                node.set("WIDTH", str(nx2 - nx))
+                node.set("HEIGHT", str(ny2 - ny))
+            node = node.getparent()
 
     def revert_word(self, word: Word, old_content: str, old_wc: float | None) -> None:
         """Undo one ``edit_word`` (GUI undo stack): restore the exact prior
