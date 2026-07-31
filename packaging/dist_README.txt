@@ -86,6 +86,11 @@ Running the GUI
     - "Save page" writes the corrected ALTO and keeps the plain-text
       transcript in sync. Corrected pages are protected: a later OCR
       run refuses to overwrite that object unless explicitly forced.
+    - When you're done reviewing an object, click "Repackage" (next to
+      "Load object"). It refreshes the METS file's sizes and checksums
+      so the package matches your corrected files — do this before the
+      object is uploaded. Pointing "Output object" at the parent output
+      folder repackages every object under it in one go.
 
 Running the CLI
 ---------------
@@ -99,8 +104,9 @@ Running the CLI
 
   triage ranks existing output worst-first for review and writes
   triage_objects.csv / triage_pages.csv next to the outputs.
-  repackage regenerates the transcripts + METS from corrected ALTO
-  (run it after editing ALTO in an external tool).
+  repackage regenerates the transcripts + METS from corrected ALTO —
+  the same thing as the Review tab's Repackage button (the CLI form
+  matters mainly after editing ALTO in an external tool).
 
   alto-ocr.exe --help            (overview)
   alto-ocr.exe process --help    (process-command flags)

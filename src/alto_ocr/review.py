@@ -21,6 +21,12 @@ paper texture was read as thousands of garbage words. The page saves as an
 empty transcript and re-classifies as ``empty`` in triage
 (``remediate.ReviewPage.clear_words``).
 
+**Repackage** (next to "Load object") refreshes everything derived from
+the corrected ALTO — METS sizes/checksums, drifted transcripts — via
+``remediate.repackage_object``, so correctors never need the CLI. Runs on
+a worker thread (checksumming a big object over SMB takes seconds) with
+results polled back on the Tk main loop, mirroring ``gui.py``'s model.
+
 **Add word** mode (toolbar toggle, or ``a`` with canvas focus) covers words
 the OCR missed entirely: drag a box around the word on the scan, type it,
 press Enter — the word is inserted into the ALTO at the drawn position
@@ -36,6 +42,8 @@ unit-tested); this module is only Tk plumbing.
 from __future__ import annotations
 
 import logging
+import queue
+import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -45,10 +53,13 @@ from PIL import Image, ImageTk
 
 from .remediate import (
     ConcurrentEditError,
+    RepackageResult,
     ReviewPage,
     StubPageError,
     Word,
     index_source_images,
+    iter_object_dirs,
+    repackage_object,
 )
 from .triage import DEFAULT_LOW_WC, scan_alto_file
 from .walker import natural_chunks, natural_key
@@ -122,6 +133,10 @@ class ReviewFrame(ttk.Frame):
         self._drag_start: Optional[tuple[float, float]] = None
         self._drag_item: Optional[int] = None
         self._pending_box: Optional[tuple[float, float, float, float]] = None
+        # Repackage runs on a worker thread; the result list comes back
+        # through this queue, polled on the Tk main loop (gui.py's model).
+        self._repack_worker: Optional[threading.Thread] = None
+        self._repack_queue: "queue.Queue[list[RepackageResult]]" = queue.Queue()
 
         self.var_object = tk.StringVar(value=str(settings.get("review_object_dir", "")))
         self.var_source = tk.StringVar(value=str(settings.get("review_source_dir", "")))
@@ -158,6 +173,9 @@ class ReviewFrame(ttk.Frame):
             row=1, column=2, padx=(6, 0), pady=(4, 0))
         ttk.Button(paths, text="Load object", command=self.load_object).grid(
             row=0, column=3, rowspan=2, padx=(10, 0), sticky="ns")
+        self.btn_repackage = ttk.Button(paths, text="Repackage",
+                                        command=self._repackage)
+        self.btn_repackage.grid(row=0, column=4, rowspan=2, padx=(6, 0), sticky="ns")
 
         # -- Row 1: page list | canvas
         body = ttk.Frame(self)
@@ -824,6 +842,77 @@ class ReviewFrame(ttk.Frame):
             f"{self._stem}: {len(self._page.words)} words, {n_flagged} flagged "
             f"below {self._threshold():.2f}{dirty}"
         )
+
+    # ---------- repackage -------------------------------------------------
+
+    def _repackage(self) -> None:
+        """Refresh METS sizes/checksums (and any drifted transcripts) from
+        the corrected ALTO — the Review-tab face of the CLI ``repackage``
+        command, for the end of an object's review session. Accepts either
+        one object folder or an output root holding several."""
+        if self._repack_worker is not None and self._repack_worker.is_alive():
+            return  # already running
+        path = Path(self.var_object.get().strip())
+        dirs = iter_object_dirs(path) if path.is_dir() else []
+        if not dirs:
+            messagebox.showerror(
+                "Review",
+                f"No ALTO folder found under:\n{path}\n\n"
+                "Point 'Output object' at an OCR output object folder "
+                "(or an output root containing them) first.")
+            return
+        if self._page is not None and self._page.dirty:
+            ans = messagebox.askyesnocancel(
+                "Review",
+                f"{self._stem} has unsaved changes.\n\n"
+                "Save it first so the repackaged METS covers them?")
+            if ans is None:
+                return
+            if ans:
+                self._save_page()
+                if self._page.dirty:  # save failed; its error dialog already showed
+                    return
+        self.btn_repackage.configure(state="disabled")
+        self.var_status.set(f"Repackaging {len(dirs)} object(s)…")
+        self._repack_worker = threading.Thread(
+            target=self._repackage_worker, args=(dirs, self._repack_queue),
+            daemon=True)
+        self._repack_worker.start()
+        self.after(150, self._poll_repackage)
+
+    @staticmethod
+    def _repackage_worker(dirs: list[Path],
+                          q: "queue.Queue[list[RepackageResult]]") -> None:
+        results: list[RepackageResult] = []
+        for d in dirs:
+            try:
+                results.append(repackage_object(d))
+            except Exception as e:  # noqa: BLE001 — report per object, never crash the thread
+                logger.exception("repackage failed for %s", d)
+                results.append(RepackageResult(
+                    ref_id=d.name, object_dir=d, pages=0, txt_written=0,
+                    mets_written=False, problems=[str(e)]))
+        q.put(results)
+
+    def _poll_repackage(self) -> None:
+        try:
+            results = self._repack_queue.get_nowait()
+        except queue.Empty:
+            self.after(150, self._poll_repackage)
+            return
+        self.btn_repackage.configure(state="normal")
+        mets = sum(1 for r in results if r.mets_written)
+        txt = sum(r.txt_written for r in results)
+        msg = (f"Repackaged {len(results)} object(s): {mets} METS refreshed, "
+               f"{txt} transcript(s) updated.")
+        problems = [f"{r.ref_id}: {p}" for r in results for p in r.problems]
+        if problems:
+            shown = "\n".join(problems[:12])
+            if len(problems) > 12:
+                shown += f"\n… and {len(problems) - 12} more"
+            messagebox.showwarning("Review", f"{msg}\n\nProblems:\n{shown}")
+            msg += f"  {len(problems)} problem(s) — see warning."
+        self.var_status.set(msg)
 
     # ---------- app integration ------------------------------------------
 
