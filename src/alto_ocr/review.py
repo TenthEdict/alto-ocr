@@ -11,7 +11,15 @@ the editor bar with a magnified snippet of the actual scan region.
 Keyboard flow for correctors: **Enter** commits the edit and jumps to the
 next flagged word, **Escape** deselects, **n/p** step through flagged words
 (canvas focus), **Ctrl+Z** undoes the last edit. Deletions (hallucinated
-words) confirm first and are undone only by reloading the page.
+words) confirm first and are undone only by reloading the page. On the
+canvas, plain scroll pans vertically, **Shift+scroll** horizontally, and
+**Ctrl+scroll** zooms about the mouse cursor.
+
+**Clear page** (toolbar, confirm-gated) bulk-deletes every word on a page
+whose OCR is wholly hallucinated — covers and photographs where fabric or
+paper texture was read as thousands of garbage words. The page saves as an
+empty transcript and re-classifies as ``empty`` in triage
+(``remediate.ReviewPage.clear_words``).
 
 **Add word** mode (toolbar toggle, or ``a`` with canvas focus) covers words
 the OCR missed entirely: drag a box around the word on the scan, type it,
@@ -196,6 +204,8 @@ class ReviewFrame(ttk.Frame):
         self.btn_save = ttk.Button(bar, text="Save page", command=self._save_page,
                                    state="disabled")
         self.btn_save.pack(side="right")
+        ttk.Button(bar, text="Clear page…", command=self._clear_page).pack(
+            side="right", padx=(0, 6))
 
         self.canvas = tk.Canvas(center, background="#404040", highlightthickness=0)
         self.canvas.grid(row=1, column=0, sticky="nsew")
@@ -210,6 +220,7 @@ class ReviewFrame(ttk.Frame):
         self.canvas.bind("<Configure>", lambda _e: self._render_if_fit())
         self.canvas.bind("<MouseWheel>", self._on_wheel)
         self.canvas.bind("<Shift-MouseWheel>", self._on_wheel_h)
+        self.canvas.bind("<Control-MouseWheel>", self._on_wheel_zoom)
         self.canvas.bind("<Key-n>", lambda _e: self._goto_flagged(+1))
         self.canvas.bind("<Key-p>", lambda _e: self._goto_flagged(-1))
         self.canvas.bind("<Key-a>", lambda _e: self._toggle_add_mode())
@@ -453,6 +464,25 @@ class ReviewFrame(ttk.Frame):
     def _on_wheel_h(self, event: tk.Event) -> None:
         self.canvas.xview_scroll(-1 if event.delta > 0 else 1, "units")
 
+    def _on_wheel_zoom(self, event: tk.Event) -> None:
+        """Ctrl+scroll: zoom about the mouse cursor, ~20% per notch.
+        Steps the zoom percentage (leaving "Fit" mode) and re-anchors the
+        view so the image point under the cursor stays put."""
+        if self._pil is None:
+            return
+        ix = self.canvas.canvasx(event.x) / self._scale
+        iy = self.canvas.canvasy(event.y) / self._scale
+        factor = 1.2 if event.delta > 0 else 1 / 1.2
+        pct = max(5, min(400, round(self._scale * factor * 100)))
+        if pct == round(self._scale * 100):
+            return  # already at the zoom limit in this direction
+        self.var_zoom.set(f"{pct}%")
+        self._render()
+        w = max(int(self._pil.width * self._scale), 1)
+        h = max(int(self._pil.height * self._scale), 1)
+        self.canvas.xview_moveto(max(0.0, min(1.0, (ix * self._scale - event.x) / w)))
+        self.canvas.yview_moveto(max(0.0, min(1.0, (iy * self._scale - event.y) / h)))
+
     # ---------- selection / editing --------------------------------------
 
     def _on_canvas_click(self, event: tk.Event) -> None:
@@ -664,6 +694,34 @@ class ReviewFrame(ttk.Frame):
         self._render()
         self._select_word(nxt)
         self._update_status()
+
+    def _clear_page(self) -> None:
+        """Bulk-delete every word — for pages whose OCR is wholly
+        hallucinated (covers, photographs: texture read as text)."""
+        if self._page is None:
+            return
+        n = len(self._page.words)
+        if n == 0:
+            self.var_status.set("Page has no words to clear.")
+            return
+        if not messagebox.askyesno(
+            "Review",
+            f"Remove all {n} word(s) from this page?\n\n"
+            "Use this when the whole page is hallucinated OCR — texture or "
+            "noise read as text on covers, photographs, or blank pages.\n\n"
+            "This can't be undone except by reloading the page unsaved.",
+        ):
+            return
+        removed = self._page.clear_words()
+        self._undo.clear()
+        self._selected = None
+        self._cancel_pending_add()
+        self.btn_save.configure(state="normal")
+        self._render()
+        self._update_editor()
+        self.var_status.set(
+            f"{self._stem}: cleared {removed} word(s) — page is now empty. "
+            "Save page to keep this.")
 
     def _undo_edit(self) -> None:
         if not self._undo or self._page is None:

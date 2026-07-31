@@ -16,6 +16,13 @@ Semantics (agreed 2026-07-30):
   the ``<String>`` plus its neighboring ``<SP>``, and cascades upward:
   a ``<TextLine>``/``<TextBlock>``/``<ComposedBlock>`` left with no text
   content is removed too, keeping the ALTO schema-shaped.
+* **Clearing a page** (2026-07-31; the whole page is hallucinated OCR —
+  covers/photographs where texture was read as thousands of garbage
+  words) bulk-deletes every word in one operation, leaving the
+  Page/PrintSpace skeleton like an engine-produced blank page. The stale
+  ``PC`` is dropped (no words → no page confidence), so triage
+  re-classifies the page as ``empty`` instead of ranking its garbage
+  score; each removed word counts toward provenance like a deletion.
 * **Adding a word** (2026-07-31; OCR missed it entirely) takes a box the
   corrector drew on the page image, maps it back into ALTO units via the
   same image-px/Page-dims ratio the display uses, and inserts a
@@ -231,6 +238,41 @@ class ReviewPage:
             node = up
 
         self.words.remove(word)
+
+    def clear_words(self) -> int:
+        """Remove every word on the page — bulk rejection for pages whose
+        OCR is wholly hallucinated (book covers, photographs, blank pages
+        where paper or fabric texture was read as text; the observed case
+        was a cloth cover producing ~1,900 garbage words nobody should
+        delete one at a time). Equivalent to deleting each word
+        individually — every removed word counts toward the review
+        provenance total like ``delete_word`` — but in one operation.
+
+        The Page/PrintSpace skeleton survives, matching an engine-produced
+        blank page, and the stale ``PC`` is dropped (no words → no page
+        confidence), so the page re-classifies as ``empty`` in triage
+        instead of ranking by its garbage score. Returns the number of
+        ``<String>`` elements removed (this can exceed ``len(words)`` when
+        the file held malformed-box Strings the loader skipped — a cleared
+        page rejects those too).
+        """
+        strings = list(self.root.iter(qname(self.ns, "String")))
+        if not strings:
+            return 0
+        removable = {"TextLine", "TextBlock", "ComposedBlock"}
+        for el in strings:
+            top = el
+            node = el.getparent()
+            while node is not None and etree.QName(node).localname in removable:
+                top, node = node, node.getparent()
+            parent = top.getparent()
+            if parent is not None:  # a sibling String already took this container out
+                parent.remove(top)
+        self.words.clear()
+        self.page.attrib.pop("PC", None)
+        self.dirty = True
+        self.session_edits += len(strings)
+        return len(strings)
 
     # ---------- word insertion (missed-word corrections) ------------------
 

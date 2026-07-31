@@ -2,12 +2,13 @@
 
 Covers: mm10→pixel word geometry, edit semantics (CONTENT + WC=1.00 +
 attribute order), whitespace handling, deletion with SP cleanup and
-container cascade (stopping at PrintSpace), word insertion (add_word:
-line/block/PrintSpace placement, SP rebuild, fresh institution IDs, bbox
-expansion, undo_add), undo via revert_word, save round-trip (tab
-serialization, PC recompute, review provenance with a cumulative count,
-Text/ regeneration), the canonical ALTO→text rendering, stub detection,
-and the source-image index.
+container cascade (stopping at PrintSpace), page clearing (clear_words:
+bulk rejection of hallucinated pages, PC drop, empty triage status),
+word insertion (add_word: line/block/PrintSpace placement, SP rebuild,
+fresh institution IDs, bbox expansion, undo_add), undo via revert_word,
+save round-trip (tab serialization, PC recompute, review provenance with
+a cumulative count, Text/ regeneration), the canonical ALTO→text
+rendering, stub detection, and the source-image index.
 
 Run from the repo root (so ``src.alto_ocr`` resolves):
 
@@ -32,6 +33,7 @@ from src.alto_ocr.remediate import (  # noqa: E402
     alto_to_text,
     index_source_images,
 )
+from src.alto_ocr.triage import scan_alto_file  # noqa: E402
 
 # Institution-style ALTO v2 in mm10: Page 2159x2794 (letter), image at
 # 300 DPI is 2550x3300 px → sx = 2550/2159, sy = 3300/2794.
@@ -148,6 +150,50 @@ class EditTests(_PageFixture):
         self.assertIn("P1_PS00001", xml)     # PrintSpace survives
         self.assertIn("P1_TB00001", xml)     # block with remaining words survives
         self.assertEqual([w.content for w in self.page.words], ["Board", "1927"])
+
+
+class ClearPageTests(_PageFixture):
+    def test_clear_removes_all_words_keeps_skeleton(self) -> None:
+        removed = self.page.clear_words()
+        self.assertEqual(removed, 4)
+        self.assertEqual(self.page.words, [])
+        self.assertTrue(self.page.dirty)
+        self.assertEqual(self.page.session_edits, 4)
+        xml = etree.tostring(self.page.root).decode()
+        self.assertNotIn("String", xml)
+        self.assertNotIn("TextBlock", xml)
+        self.assertIn("P1_PS00001", xml)             # PrintSpace survives
+        self.assertIsNone(self.page.page.get("PC"))  # stale score dropped
+
+    def test_clear_save_renders_empty_txt_and_triage_empty(self) -> None:
+        self.page.clear_words()
+        txt_path = self.page.save()
+        self.assertEqual(txt_path.read_text(encoding="utf-8"), "")
+        body = self.alto.read_text(encoding="utf-8")
+        self.assertIn("human review: 4 word(s) corrected", body)
+        self.assertNotIn('PC="', body)
+        info = scan_alto_file(self.alto)
+        self.assertEqual(info.status, "empty")
+        self.assertEqual(info.words, 0)
+
+    def test_clear_on_empty_page_is_a_noop(self) -> None:
+        self.page.clear_words()
+        self.page.save()
+        reopened = ReviewPage(self.alto, _IMG_SIZE)
+        self.assertEqual(reopened.clear_words(), 0)
+        self.assertFalse(reopened.dirty)
+
+    def test_add_word_after_clear_builds_block_in_printspace(self) -> None:
+        # Cover-page workflow: wipe the garbage, then hand-add the few
+        # words the page really shows (spine labels, stamps).
+        self.page.clear_words()
+        word = self.page.add_word(_px_box(500, 400, 300, 60), "SPECIFICATIONS")
+        self.assertEqual([w.content for w in self.page.words], ["SPECIFICATIONS"])
+        line = word.elem.getparent()
+        self.assertEqual(etree.QName(line).localname, "TextLine")
+        block = line.getparent()
+        self.assertEqual(etree.QName(block).localname, "TextBlock")
+        self.assertEqual(etree.QName(block.getparent()).localname, "PrintSpace")
 
 
 class AddWordTests(_PageFixture):
