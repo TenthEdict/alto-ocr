@@ -276,10 +276,12 @@ NoDeskewOpt = typer.Option(False, "--no-deskew", help="Skip deskew stage.")
 NoDenoiseOpt = typer.Option(False, "--no-denoise", help="Skip bilateral denoise stage.")
 NoClaheOpt = typer.Option(False, "--no-clahe", help="Skip CLAHE contrast normalization.")
 BinarizeOpt = typer.Option(False, "--binarize/--no-binarize",
-                           help="Adaptive-threshold the image before OCR. OFF by default since "
-                                "v0.8.8: Tesseract 5 thresholds internally, and pre-binarized "
-                                "input measurably lowered WC on every collection tried. Both "
-                                "spellings accepted so existing --no-binarize scripts keep working.")
+                           help="Apply adaptive thresholding before OCR. OFF by default since "
+                                "v0.8.8 — Tesseract 5 does its own thresholding and scores higher "
+                                "on grayscale; ours turns paper grain into speckle. Opt in only if "
+                                "a collection measurably benefits (check mean WC with the triage "
+                                "command). Both spellings accepted so existing --no-binarize "
+                                "scripts keep working.")
 NoBorderCropOpt = typer.Option(False, "--no-border-crop", help="Skip black-border auto-crop.")
 NoChecksumsOpt = typer.Option(False, "--no-checksums", help="Skip MD5 checksums in METS (faster on large objects).")
 NoMetsOpt = typer.Option(False, "--no-mets",

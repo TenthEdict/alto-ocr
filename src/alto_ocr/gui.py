@@ -79,29 +79,44 @@ class JobConfig:
     glmocr_timeout: int = DEFAULT_TIMEOUT_S
 
 
-def _load_settings() -> dict:
-    try:
-        return json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+# Bumped when a saved preference has to be retired rather than merely
+# defaulted. Saved settings normally win over dataclass defaults, so a
+# default flip alone would never reach anyone who has run the GUI before.
+_BINARIZE_MIGRATION_KEY = "_migrated_binarize_default_off"
+# The 2026-07-30 branch build shipped the same migration under this marker
+# name; honor it too, or a settings file that build already migrated would
+# be migrated again — clearing a do_binarize the user deliberately re-chose.
+_BINARIZE_MIGRATION_KEY_2026_07_30 = "binarize_default_2026_07_30"
 
 
 def _migrate_settings(s: dict) -> dict:
-    """One-shot migrations for changed defaults.
+    """Retire a persisted ``do_binarize: true`` (one-shot).
 
-    v0.8.8 flipped the binarize default OFF (adaptive thresholding
-    measurably hurt Tesseract 5 on every fixture + pilot collection).
-    Saved GUI settings outrank dataclass defaults, so a pre-0.8.8 saved
-    ``do_binarize: true`` — usually just the old default echoed back by a
-    save — would silently keep binarization on forever. Drop the key once;
-    the marker means any value present afterwards was chosen by the user
-    under the new default and is kept. Pure function of the dict so it
-    stays testable without Tk.
+    Binarization was default-on until v0.8.8 (2026-07-30), when it was
+    measured to cost accuracy on every collection tested (see
+    PreprocessConfig.do_binarize). A plain default flip would not reach
+    existing users, whose saved settings take precedence — so drop the
+    stale preference once and record that we did. Anyone who deliberately
+    re-checks the box afterwards keeps it: the marker means this runs only
+    the first time. Pure function of the dict so it stays testable
+    without Tk.
     """
-    if not s.get("_migrated_binarize_default_off"):
+    if s.get(_BINARIZE_MIGRATION_KEY) or s.get(_BINARIZE_MIGRATION_KEY_2026_07_30):
+        return s
+    if s.get("do_binarize"):
         s.pop("do_binarize", None)
-        s["_migrated_binarize_default_off"] = True
+        logger.info("Binarize is no longer on by default (it lowered OCR accuracy on every "
+                    "collection measured); your saved preference for it has been cleared. "
+                    "Re-check the box if a collection needs it.")
+    s[_BINARIZE_MIGRATION_KEY] = True
     return s
+
+
+def _load_settings() -> dict:
+    try:
+        return _migrate_settings(json.loads(SETTINGS_PATH.read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return {}
 
 
 def _save_settings(data: dict) -> None:
@@ -143,7 +158,7 @@ class AltoOcrApp:
 
         # All settings — basic and advanced — restore from the persisted
         # JSON on launch so users keep their preferred recipe across runs.
-        self._settings = _migrate_settings(_load_settings())
+        self._settings = _load_settings()  # migrations applied inside
         s = self._settings
         pp = PreprocessConfig()  # source of truth for preprocessing defaults
         oo = OCROptions()        # source of truth for Tesseract option defaults

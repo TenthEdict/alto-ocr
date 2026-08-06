@@ -197,6 +197,18 @@ def scan_alto_file(alto_path: Path, *, low_wc: float = DEFAULT_LOW_WC) -> PageCo
         status = "scored"
     else:
         status = "unscored"
+
+    if pc is None and scored > 0:
+        # A page with per-word WC but no Page/@PC means the confidence merge
+        # wrote the words and then failed before stamping the page mean —
+        # Tesseract's own ALTO renderer emits WC natively, ours adds PC. Left
+        # as None the page drops out of review_pages entirely and no corrector
+        # ever sees it, which is the worst possible failure mode for a page we
+        # know nothing good about. Recompute the mean from the WCs on hand:
+        # exactly what the merge would have stored, and the same derivation
+        # remediate already applies when it rewrites PC after an edit.
+        pc = wc_sum / scored
+
     return PageConfidence(alto_path.stem, status, pc, words, scored, low, wc_sum)
 
 

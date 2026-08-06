@@ -55,10 +55,19 @@ class PreprocessConfig:
     do_deskew: bool = True
     do_denoise: bool = True
     do_clahe: bool = True
-    # OFF by default since v0.8.8 — measured WC drop with pre-binarized
-    # input on every fixture + pilot collection (see module docstring).
-    # Locked by tests/test_preprocess_defaults.py; don't re-enable without
-    # re-measuring.
+    # OFF by default since v0.8.8: Tesseract 5's LSTM engine does its own
+    # thresholding and reads grayscale better than anything we hand it
+    # pre-binarized. Measured 2026-07-30 across three unrelated collections
+    # (mean WC, adaptive-threshold ON -> OFF): ZeffPapers/MSP00074
+    # 0.828 -> 0.909, MSA00005 0.583 -> 0.781 and 0.453 -> 0.945, MSA00018
+    # 0.803 -> 0.919. Pages needing review fell 28 -> 6, 9 -> 3 and 25 -> 6
+    # respectively. The mechanism is speckle: on toned or grainy paper the
+    # adaptive window flips background grain to ink, which Tesseract emits as
+    # stray punctuation ('.', '|', ':') and glues onto real words ('the.',
+    # 'of.'). Token analysis confirmed the words that disappear when it is
+    # off are those artifacts, while real words are gained. Turn back on per
+    # collection with --binarize if one ever benefits; locked by
+    # tests/test_preprocess_defaults.py — don't re-enable without re-measuring.
     do_binarize: bool = False
     do_border_crop: bool = True
 
