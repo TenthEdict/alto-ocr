@@ -74,6 +74,13 @@ Running the GUI
     - "Add word (a)": drag a box around a word the OCR missed, type
       it, press Enter. The glyph palette under the editor inserts
       math/engineering characters you can't type on a US keyboard.
+    - "Reading order (r)": fix transcripts whose words are right but
+      ordered wrong (wrong column sequence, captions read out of
+      place). A side panel lists the page's blocks — and the selected
+      block's lines — in reading order; select one (click it on the
+      page or in the list) and Move Up/Down (or Ctrl+Up/Ctrl+Down).
+      Ctrl+Z undoes moves. Word boxes and geometry are untouched;
+      only the transcript order changes.
     - "Clear page…": removes ALL words on the page in one step. Use it
       when the whole page is hallucinated OCR — covers, photographs,
       or blank pages where the engine read texture or noise as

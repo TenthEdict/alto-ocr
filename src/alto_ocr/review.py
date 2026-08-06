@@ -35,6 +35,16 @@ Ctrl+Z removes it again. A glyph palette under the editor inserts math and
 engineering characters (π Σ √ ° …) correctors can't reach on a US keyboard
 — common in the institution's lab-notebook material.
 
+**Reading order** mode (toolbar toggle, or ``r`` with canvas focus; mutually
+exclusive with Add word) fixes transcripts whose words are right but ordered
+wrong — wrong column sequence, captions interleaved into the body. A side
+panel lists the page's blocks (and the selected block's lines) in reading
+order with Move Up/Down buttons (Ctrl+Up/Ctrl+Down); the canvas
+shows numbered outlines instead of word boxes, and clicking a block selects
+it in the panel. Moves relocate elements in the ALTO document order
+(``remediate.ReviewPage.move_element`` — geometry and IDs untouched) and
+Ctrl+Z undoes them, interleaved with word edits.
+
 All ALTO mutation/save semantics live in ``remediate.py`` (headless,
 unit-tested); this module is only Tk plumbing.
 """
@@ -45,6 +55,7 @@ import logging
 import queue
 import threading
 import tkinter as tk
+from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable, Optional
@@ -89,6 +100,27 @@ _GLYPHS: tuple[str, ...] = (
 # on disk, but the corrector should still see what they touched).
 _COLOR_EDITED = "#1f6feb"
 _COLOR_UNSCORED = "#c026d3"  # no WC (GLMOCR output): needs eyes everywhere
+_COLOR_ORDER = "#7c3aed"     # reading-order mode: block/line outlines + badges
+
+
+# Undo-stack entries. One interleaved stack so a single Ctrl+Z always
+# reverses the most recent action, whatever kind it was.
+@dataclass
+class _EditEntry:
+    word: Word
+    old_content: str
+    old_wc: float | None
+
+
+@dataclass
+class _AddEntry:
+    word: Word
+
+
+@dataclass
+class _MoveEntry:
+    el: object  # the moved lxml element — opaque here; remediate owns lxml
+    delta: int
 
 
 def _wc_color(wc: float | None) -> str:
@@ -125,9 +157,12 @@ class ReviewFrame(ttk.Frame):
         self._rect_by_word: dict[int, int] = {}   # id(Word) -> canvas item
         self._word_by_rect: dict[int, Word] = {}
         self._selected: Optional[Word] = None
-        # Undo stack: (word, old_content, old_wc) for edits; old_content is
-        # None for an added word (undo removes it again).
-        self._undo: list[tuple[Word, str | None, float | None]] = []
+        self._undo: list[_EditEntry | _AddEntry | _MoveEntry] = []
+        # Reading-order mode state: the selected block plus parallel
+        # listbox-row -> element lists (the _sorted_stems idiom).
+        self._order_block: Optional[object] = None
+        self._order_blocks: list = []
+        self._order_lines: list = []
         # Add-word mode state: the drag in progress and the finalized box
         # (image-pixel space) awaiting its text.
         self._drag_start: Optional[tuple[float, float]] = None
@@ -145,6 +180,7 @@ class ReviewFrame(ttk.Frame):
             value=float(settings.get("review_threshold", DEFAULT_LOW_WC)))
         self.var_show_all = tk.BooleanVar(value=False)
         self.var_add_mode = tk.BooleanVar(value=False)
+        self.var_reorder_mode = tk.BooleanVar(value=False)
         self.var_zoom = tk.StringVar(value="Fit")
         self.var_status = tk.StringVar(value="Pick an output object folder and its source images.")
         self.var_edit = tk.StringVar()
@@ -219,6 +255,8 @@ class ReviewFrame(ttk.Frame):
         ttk.Button(bar, text="Undo", command=self._undo_edit).pack(side="left")
         ttk.Checkbutton(bar, text="Add word (a)", variable=self.var_add_mode,
                         command=self._on_add_mode_toggled).pack(side="left", padx=(10, 0))
+        ttk.Checkbutton(bar, text="Reading order (r)", variable=self.var_reorder_mode,
+                        command=self._on_reorder_toggled).pack(side="left", padx=(10, 0))
         self.btn_save = ttk.Button(bar, text="Save page", command=self._save_page,
                                    state="disabled")
         self.btn_save.pack(side="right")
@@ -242,7 +280,51 @@ class ReviewFrame(ttk.Frame):
         self.canvas.bind("<Key-n>", lambda _e: self._goto_flagged(+1))
         self.canvas.bind("<Key-p>", lambda _e: self._goto_flagged(-1))
         self.canvas.bind("<Key-a>", lambda _e: self._toggle_add_mode())
+        self.canvas.bind("<Key-r>", lambda _e: self._toggle_reorder_mode())
         self.canvas.bind("<Control-z>", lambda _e: self._undo_edit())
+
+        # Reading-order side panel: hidden until the mode is toggled on.
+        self.order_panel = ttk.Frame(body)
+        self.order_panel.grid(row=0, column=2, sticky="ns", padx=(8, 0))
+        self.order_panel.rowconfigure(1, weight=3)
+        self.order_panel.rowconfigure(4, weight=2)
+        ttk.Label(self.order_panel, text="Blocks (reading order)").grid(
+            row=0, column=0, sticky="w")
+        self.lst_blocks = tk.Listbox(self.order_panel, width=34, exportselection=False)
+        self.lst_blocks.grid(row=1, column=0, sticky="ns")
+        sb_blocks = ttk.Scrollbar(self.order_panel, orient="vertical",
+                                  command=self.lst_blocks.yview)
+        sb_blocks.grid(row=1, column=1, sticky="ns")
+        self.lst_blocks.configure(yscrollcommand=sb_blocks.set)
+        self.lst_blocks.bind("<<ListboxSelect>>", self._on_order_block_selected)
+        blk_btns = ttk.Frame(self.order_panel)
+        blk_btns.grid(row=2, column=0, sticky="ew", pady=(4, 8))
+        ttk.Button(blk_btns, text="▲ Up",
+                   command=lambda: self._move_selected(self.lst_blocks, -1)).pack(side="left")
+        ttk.Button(blk_btns, text="▼ Down",
+                   command=lambda: self._move_selected(self.lst_blocks, +1)).pack(
+            side="left", padx=(6, 0))
+        ttk.Label(self.order_panel, text="Lines in selected block").grid(
+            row=3, column=0, sticky="w")
+        self.lst_lines = tk.Listbox(self.order_panel, width=34, exportselection=False)
+        self.lst_lines.grid(row=4, column=0, sticky="ns")
+        sb_lines = ttk.Scrollbar(self.order_panel, orient="vertical",
+                                 command=self.lst_lines.yview)
+        sb_lines.grid(row=4, column=1, sticky="ns")
+        self.lst_lines.configure(yscrollcommand=sb_lines.set)
+        ln_btns = ttk.Frame(self.order_panel)
+        ln_btns.grid(row=5, column=0, sticky="ew", pady=(4, 0))
+        ttk.Button(ln_btns, text="▲ Up",
+                   command=lambda: self._move_selected(self.lst_lines, -1)).pack(side="left")
+        ttk.Button(ln_btns, text="▼ Down",
+                   command=lambda: self._move_selected(self.lst_lines, +1)).pack(
+            side="left", padx=(6, 0))
+        for lst in (self.lst_blocks, self.lst_lines):
+            lst.bind("<Control-Up>",
+                     lambda _e, l=lst: self._move_selected(l, -1) or "break")
+            lst.bind("<Control-Down>",
+                     lambda _e, l=lst: self._move_selected(l, +1) or "break")
+        self.order_panel.grid_remove()
 
         # -- Row 2: editor bar
         editor = ttk.LabelFrame(self, text="Selected word", padding=6)
@@ -315,6 +397,9 @@ class ReviewFrame(ttk.Frame):
         self._selected = None
         self._undo.clear()
         self._cancel_pending_add()
+        self._order_block = None
+        if self.var_reorder_mode.get():
+            self._refresh_order_panel()
         self.canvas.delete("all")
         self.btn_save.configure(state="disabled")
         self._refresh_page_list()
@@ -389,6 +474,9 @@ class ReviewFrame(ttk.Frame):
             self._page = None
             self._stem = stem
             self._pil = None
+            self._order_block = None
+            if self.var_reorder_mode.get():
+                self._refresh_order_panel()
             self.canvas.delete("all")
             self.var_status.set(str(e))
             return
@@ -399,6 +487,9 @@ class ReviewFrame(ttk.Frame):
         self._selected = None
         self._undo.clear()
         self._cancel_pending_add()
+        self._order_block = None
+        if self.var_reorder_mode.get():
+            self._refresh_order_panel()
         self.btn_save.configure(state="disabled")
         self._render()
         self._update_editor()
@@ -436,8 +527,14 @@ class ReviewFrame(ttk.Frame):
 
         self._rect_by_word.clear()
         self._word_by_rect.clear()
+        if self.var_reorder_mode.get():
+            # Structure view: block/line outlines instead of word boxes.
+            self._draw_order_overlays()
+            self._drag_item = None
+            return
         threshold = self._threshold()
-        edited = {id(w) for w, _c, _wc in self._undo}
+        edited = {id(e.word) for e in self._undo
+                  if isinstance(e, (_EditEntry, _AddEntry))}
         for word in self._page.words:
             flagged = word.needs_review(threshold)
             if not (flagged or self.var_show_all.get() or id(word) in edited):
@@ -507,6 +604,22 @@ class ReviewFrame(ttk.Frame):
         self.canvas.focus_set()
         if self._page is None:
             return
+        if self.var_reorder_mode.get():
+            # Reorder mode: a click picks the block under the cursor.
+            x = self.canvas.canvasx(event.x) / self._scale
+            y = self.canvas.canvasy(event.y) / self._scale
+            blk = self._block_at(x, y)
+            if blk is not None:
+                for i, cand in enumerate(self._order_blocks):
+                    if cand is blk:
+                        self.lst_blocks.selection_clear(0, "end")
+                        self.lst_blocks.selection_set(i)
+                        self.lst_blocks.see(i)
+                        break
+                self._order_block = blk
+                self._refresh_order_panel()
+                self._render()
+            return
         if self.var_add_mode.get():
             # Add mode: the click starts a rubber-band drag, not a selection.
             self._cancel_pending_add()
@@ -525,6 +638,10 @@ class ReviewFrame(ttk.Frame):
 
     def _on_add_mode_toggled(self) -> None:
         on = self.var_add_mode.get()
+        if on and self.var_reorder_mode.get():
+            # The two canvas modes are mutually exclusive.
+            self.var_reorder_mode.set(False)
+            self._teardown_reorder()
         self.canvas.configure(cursor="crosshair" if on else "")
         if not on:
             self._cancel_pending_add()
@@ -532,6 +649,141 @@ class ReviewFrame(ttk.Frame):
             self.var_status.set(
                 "Add word: drag a box around the missed word on the scan, "
                 "type the word, press Enter.")
+
+    # ---------- reading-order mode ----------------------------------------
+
+    def _toggle_reorder_mode(self) -> None:
+        self.var_reorder_mode.set(not self.var_reorder_mode.get())
+        self._on_reorder_toggled()
+
+    def _on_reorder_toggled(self) -> None:
+        if not self.var_reorder_mode.get():
+            self._teardown_reorder()
+            return
+        if self.var_add_mode.get():
+            self.var_add_mode.set(False)
+            self._on_add_mode_toggled()
+        self._select_word(None)
+        self._cancel_pending_add()
+        self.order_panel.grid()
+        self._refresh_order_panel()
+        self._render()
+        if self._page is not None:
+            self.var_status.set(
+                "Reading order: select a block (click it on the page or in the "
+                "list), then Move Up/Down or Ctrl+Up/Ctrl+Down. Ctrl+Z undoes.")
+
+    def _teardown_reorder(self) -> None:
+        self._order_block = None
+        self.order_panel.grid_remove()
+        self._render()
+
+    def _refresh_order_panel(self) -> None:
+        """Rebuild both listboxes from the tree, keeping the block selection
+        (by element identity) when it survived the change."""
+        self.lst_blocks.delete(0, "end")
+        self.lst_lines.delete(0, "end")
+        if self._page is None:
+            self._order_blocks = []
+            self._order_lines = []
+            self._order_block = None
+            return
+        self._order_blocks = self._page.flow_children()
+        if self._order_block is not None and not any(
+                b is self._order_block for b in self._order_blocks):
+            self._order_block = None
+        for i, el in enumerate(self._order_blocks):
+            self.lst_blocks.insert("end", f"{i + 1}. {self._page.text_preview(el)}")
+            if el is self._order_block:
+                self.lst_blocks.selection_set(i)
+                self.lst_blocks.see(i)
+        self._order_lines = (
+            self._page.flow_children(self._order_block)
+            if self._order_block is not None else [])
+        for i, el in enumerate(self._order_lines):
+            self.lst_lines.insert("end", f"{i + 1}. {self._page.text_preview(el)}")
+
+    def _on_order_block_selected(self, _event: object) -> None:
+        sel = self.lst_blocks.curselection()
+        if not sel or sel[0] >= len(self._order_blocks):
+            return
+        self._order_block = self._order_blocks[sel[0]]
+        self._refresh_order_panel()
+        self._render()
+
+    def _move_selected(self, listbox: tk.Listbox, delta: int) -> None:
+        if self._page is None:
+            return
+        elems = self._order_blocks if listbox is self.lst_blocks else self._order_lines
+        sel = listbox.curselection()
+        if not sel or sel[0] >= len(elems):
+            return
+        el = elems[sel[0]]
+        if not self._page.move_element(el, delta):
+            self.var_status.set("Already first." if delta < 0 else "Already last.")
+            return
+        self._undo.append(_MoveEntry(el, delta))
+        self.btn_save.configure(state="normal")
+        if listbox is self.lst_blocks:
+            self._order_block = el
+        self._refresh_order_panel()
+        # Keep the moved entry selected in its (re-numbered) list.
+        elems = self._order_blocks if listbox is self.lst_blocks else self._order_lines
+        for i, cand in enumerate(elems):
+            if cand is el:
+                listbox.selection_clear(0, "end")
+                listbox.selection_set(i)
+                listbox.see(i)
+                break
+        self._render()
+        self._update_status()
+
+    def _block_at(self, x: float, y: float) -> Optional[object]:
+        """Smallest listed block whose box contains the image-px point."""
+        hits = []
+        for el in self._order_blocks:
+            b = self._page.box_px_of(el)
+            if b is not None and b[0] <= x <= b[0] + b[2] and b[1] <= y <= b[1] + b[3]:
+                hits.append((b[2] * b[3], el))
+        return min(hits, key=lambda t: t[0])[1] if hits else None
+
+    def _draw_order_overlays(self) -> None:
+        """Numbered outlines for blocks (and the selected block's lines) —
+        redrawn from state inside _render, like the pending add-word box."""
+        s = self._scale
+        for i, el in enumerate(self._order_blocks):
+            b = self._page.box_px_of(el)
+            if b is None:
+                continue
+            x, y, bw, bh = (v * s for v in b)
+            selected = el is self._order_block
+            self.canvas.create_rectangle(
+                x, y, x + bw, y + bh, outline=_COLOR_ORDER,
+                width=3 if selected else 2)
+            self._draw_order_badge(x, y, str(i + 1), large=True)
+            if selected:
+                for j, ln in enumerate(self._order_lines):
+                    lb = self._page.box_px_of(ln)
+                    if lb is None:
+                        continue
+                    lx, ly, lw, lh = (v * s for v in lb)
+                    self.canvas.create_rectangle(
+                        lx, ly, lx + lw, ly + lh, outline=_COLOR_ORDER,
+                        width=1, dash=(4, 2))
+                    self._draw_order_badge(lx, ly, str(j + 1), large=False)
+
+    def _draw_order_badge(self, x: float, y: float, label: str, *, large: bool) -> None:
+        font = ("Segoe UI", 11 if large else 8, "bold")
+        pad = 4 if large else 2
+        # Size the badge to its text so two-digit numbers fit.
+        probe = self.canvas.create_text(0, 0, text=label, font=font, anchor="nw")
+        x0, y0, x1, y1 = self.canvas.bbox(probe)
+        self.canvas.delete(probe)
+        w, h = (x1 - x0) + 2 * pad, (y1 - y0) + 2 * pad
+        self.canvas.create_rectangle(x, y, x + w, y + h,
+                                     fill=_COLOR_ORDER, outline=_COLOR_ORDER)
+        self.canvas.create_text(x + w / 2, y + h / 2, text=label,
+                                fill="white", font=font)
 
     def _cancel_pending_add(self) -> None:
         self._drag_start = None
@@ -584,7 +836,7 @@ class ReviewFrame(ttk.Frame):
         except ValueError as e:
             self.var_status.set(str(e))
             return
-        self._undo.append((word, None, None))  # None content marks an addition
+        self._undo.append(_AddEntry(word))
         self._cancel_pending_add()
         self.btn_save.configure(state="normal")
         self._render()
@@ -679,7 +931,7 @@ class ReviewFrame(ttk.Frame):
             self._delete_word()
             return
         if " ".join(new_text.split()) != word.content:
-            self._undo.append((word, word.content, word.wc))
+            self._undo.append(_EditEntry(word, word.content, word.wc))
             self._page.edit_word(word, new_text)
             item = self._rect_by_word.get(id(word))
             if item is not None:
@@ -700,13 +952,14 @@ class ReviewFrame(ttk.Frame):
         ):
             return
         nxt = self._next_after(word)
-        if any(w is word and c is None for w, c, _wc in self._undo):
+        if any(isinstance(e, _AddEntry) and e.word is word for e in self._undo):
             # Deleting a word added this session: net it out of the
             # provenance count instead of counting an add plus a delete.
             self._page.undo_add(word)
         else:
             self._page.delete_word(word)
-        self._undo = [(w, c, wc) for (w, c, wc) in self._undo if w is not word]
+        self._undo = [e for e in self._undo
+                      if getattr(e, "word", None) is not word]
         self._selected = None
         self.btn_save.configure(state="normal")
         self._render()
@@ -734,6 +987,9 @@ class ReviewFrame(ttk.Frame):
         self._undo.clear()
         self._selected = None
         self._cancel_pending_add()
+        self._order_block = None
+        if self.var_reorder_mode.get():
+            self._refresh_order_panel()
         self.btn_save.configure(state="normal")
         self._render()
         self._update_editor()
@@ -744,30 +1000,44 @@ class ReviewFrame(ttk.Frame):
     def _undo_edit(self) -> None:
         if not self._undo or self._page is None:
             return
-        word, old_content, old_wc = self._undo.pop()
-        if old_content is None:  # the entry was an added word — remove it again
-            self._page.undo_add(word)
-            if self._selected is word:
+        entry = self._undo.pop()
+        if isinstance(entry, _MoveEntry):
+            self._page.undo_move(entry.el, entry.delta)
+            self._maybe_disable_save()
+            if self.var_reorder_mode.get():
+                self._refresh_order_panel()
+            self._render()
+            self._update_status()
+            return
+        if isinstance(entry, _AddEntry):  # remove the added word again
+            self._page.undo_add(entry.word)
+            if self._selected is entry.word:
                 self._selected = None
-            if self._page.session_edits == 0 and not self._page.dirty:
-                self.btn_save.configure(state="disabled")
+            self._maybe_disable_save()
+            if self.var_reorder_mode.get():  # the add's containers may be gone
+                self._refresh_order_panel()
             self._render()
             self._update_editor()
             self._update_status()
             return
-        self._page.revert_word(word, old_content, old_wc)
-        item = self._rect_by_word.get(id(word))
+        self._page.revert_word(entry.word, entry.old_content, entry.old_wc)
+        item = self._rect_by_word.get(id(entry.word))
         if item is not None:
-            self.canvas.itemconfigure(item, outline=_wc_color(word.wc))
-        if self._page.session_edits == 0 and not self._page.dirty:
-            self.btn_save.configure(state="disabled")
-        self._select_word(word)
+            self.canvas.itemconfigure(item, outline=_wc_color(entry.word.wc))
+        self._maybe_disable_save()
+        self._select_word(entry.word)
         self._update_status()
+
+    def _maybe_disable_save(self) -> None:
+        if (self._page.session_edits == 0 and self._page.session_moves == 0
+                and not self._page.dirty):
+            self.btn_save.configure(state="disabled")
 
     def _flagged_now(self) -> list[Word]:
         if self._page is None:
             return []
-        edited = {id(w) for w, _c, _wc in self._undo}
+        edited = {id(e.word) for e in self._undo
+                  if isinstance(e, (_EditEntry, _AddEntry))}
         return [w for w in self._page.flagged(self._threshold()) if id(w) not in edited]
 
     def _next_after(self, word: Word) -> Optional[Word]:

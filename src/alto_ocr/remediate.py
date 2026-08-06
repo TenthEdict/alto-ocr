@@ -30,6 +30,17 @@ Semantics (agreed 2026-07-30):
   best overlaps the box, else a new TextLine in the best-overlapping
   TextBlock, else a new TextBlock in PrintSpace. Like an edit, the added
   word is human-verified (``WC="1.00"``) and counts toward provenance.
+* **Reordering** (2026-08-06; OCR read the page in the wrong order —
+  wrong column sequence, captions/margin notes interleaved into the
+  body) moves a TextBlock/ComposedBlock among its sibling blocks or a
+  TextLine within its TextBlock. Reading order *is* document order
+  (``alto_to_text`` ignores coordinates and ``<SP>`` entirely), so a
+  pure sibling relocation is the whole fix: geometry, IDs, and SP runs
+  are untouched — the boxes still land on the same pixels. A
+  ComposedBlock moves as one atomic unit; the TextBlocks inside it are
+  themselves reorderable (``flow_children``). Reorders are counted
+  separately from word corrections in the review provenance
+  ("… N reading-order change(s)").
 * **Saving** re-serializes with the institution conventions (tab indent,
   reference attribute order — reusing ``ocr.py``'s helpers), recomputes
   ``Page/@PC`` as the mean of current ``WC`` values (so partially-corrected
@@ -178,6 +189,7 @@ class ReviewPage:
 
         self.dirty = False
         self.session_edits = 0  # edits+deletions since load, folded into provenance on save
+        self.session_moves = 0  # reading-order moves since load, folded into provenance on save
 
     # ---------- queries ---------------------------------------------------
 
@@ -520,6 +532,102 @@ class ReviewPage:
         reorder_attrs(word.elem, ATTR_ORDER["String"])
         self.session_edits = max(0, self.session_edits - 1)
 
+    # ---------- reading order ---------------------------------------------
+
+    # Which child elements form the reorderable "flow" of a container.
+    _FLOW_BY_PARENT = {"PrintSpace": ("TextBlock", "ComposedBlock"),
+                       "ComposedBlock": ("TextBlock", "ComposedBlock"),
+                       "TextBlock": ("TextLine",)}
+
+    def flow_children(self, parent: etree._Element | None = None) -> list[etree._Element]:
+        """Reorderable children of ``parent`` in document (reading) order.
+
+        ``None`` means the page's PrintSpace (``[]`` when absent — failure
+        stubs, cleared-to-skeleton edge cases). PrintSpace/ComposedBlock
+        yield their TextBlock+ComposedBlock units; a TextBlock yields its
+        TextLines. Two-level UI note: lines inside a TextBlock that is
+        nested in a ComposedBlock are reachable only via that inner block.
+        """
+        if parent is None:
+            parent = self.page.find(qname(self.ns, "PrintSpace"))
+            if parent is None:
+                return []
+        flow = self._FLOW_BY_PARENT.get(etree.QName(parent).localname)
+        if flow is None:
+            return []
+        return [c for c in parent
+                if isinstance(c.tag, str) and etree.QName(c).localname in flow]
+
+    def _move_flow(self, el: etree._Element, delta: int) -> bool:
+        """Relocate ``el`` ``delta`` positions among its flow siblings.
+        Pure sibling reorder — geometry, IDs, and SPs untouched. False (no
+        state change) at a boundary, for delta 0, or when ``el`` is
+        detached or not a flow element. Exactly inverted by ``-delta``."""
+        parent = el.getparent()
+        if parent is None or delta == 0:
+            return False
+        local = etree.QName(el).localname
+        if local == "TextLine":
+            flow = ("TextLine",)
+        elif local in ("TextBlock", "ComposedBlock"):
+            flow = ("TextBlock", "ComposedBlock")
+        else:
+            return False
+        sibs = [c for c in parent
+                if isinstance(c.tag, str) and etree.QName(c).localname in flow]
+        j = sibs.index(el) + delta
+        if not 0 <= j < len(sibs):
+            return False
+        if delta < 0:
+            sibs[j].addprevious(el)
+        else:
+            sibs[j].addnext(el)
+        # Keep self.words in document (reading) order — flagged() and the
+        # GUI's next-word stepping rely on it.
+        order = {id(s): i
+                 for i, s in enumerate(self.root.iter(qname(self.ns, "String")))}
+        self.words.sort(key=lambda w: order.get(id(w.elem), 1 << 30))
+        self.dirty = True
+        return True
+
+    def move_element(self, el: etree._Element, delta: int) -> bool:
+        """Move a block/line in reading order (see ``_move_flow``). Counts
+        toward the provenance reading-order total on success."""
+        if self._move_flow(el, delta):
+            self.session_moves += 1
+            return True
+        return False
+
+    def undo_move(self, el: etree._Element, delta: int) -> bool:
+        """Undo one ``move_element`` (GUI undo stack): apply the inverse
+        move and un-count it. ``dirty`` stays as-is, like ``revert_word`` —
+        other unsaved changes may exist; reloading is the full reset."""
+        if self._move_flow(el, -delta):
+            self.session_moves = max(0, self.session_moves - 1)
+            return True
+        return False
+
+    def box_px_of(self, el: etree._Element) -> tuple[float, float, float, float] | None:
+        """An element's box scaled to image pixels (like ``Word.box_px``);
+        None for malformed boxes. For the GUI's block/line overlays."""
+        b = self._box_of(el)
+        if b is None:
+            return None
+        h, v, w, ht = b
+        return (h * self.sx, v * self.sy, w * self.sx, ht * self.sy)
+
+    def text_preview(self, el: etree._Element, limit: int = 30) -> str:
+        """First words of an element's text content, truncated — labels the
+        GUI's reading-order panel entries."""
+        text = " ".join(
+            s.get("CONTENT", "")
+            for s in el.iter(qname(self.ns, "String"))
+            if s.get("CONTENT")
+        )
+        if not text:
+            return "(no text)"
+        return text[:limit] + "…" if len(text) > limit else text
+
     # ---------- save ------------------------------------------------------
 
     def save(self, *, force: bool = False) -> Path | None:
@@ -548,10 +656,11 @@ class ReviewPage:
         self._recompute_pc()
         self._stamp_provenance()
         # The session's edits are folded into the tree's cumulative count
-        # now — zero the counter BEFORE the writes, so a failed txt write
+        # now — zero the counters BEFORE the writes, so a failed txt write
         # followed by a retried save can't fold the same edits in twice
-        # (_stamp_provenance re-reads the tree's total as `prior`).
+        # (_stamp_provenance re-reads the tree's totals as `prior`).
         self.session_edits = 0
+        self.session_moves = 0
         serialize_with_tabs(self.tree, self.alto_path)
         self._loaded_mtime_ns = self.alto_path.stat().st_mtime_ns
 
@@ -583,6 +692,7 @@ class ReviewPage:
                 proc = el
                 break
         prior = 0
+        prior_moves = 0
         if proc is None:
             proc = etree.SubElement(desc, qname(self.ns, "Processing"), {"ID": "review"})
             for tag in ("processingDateTime", "processingAgency", "processingStepDescription"):
@@ -592,15 +702,21 @@ class ReviewPage:
             if step is not None and step.text:
                 m = re.search(r"(\d+) word", step.text)
                 prior = int(m.group(1)) if m else 0
+                m = re.search(r"(\d+) reading-order", step.text)
+                prior_moves = int(m.group(1)) if m else 0
 
         total = prior + self.session_edits
+        total_moves = prior_moves + self.session_moves
+        # The moves clause never contains "word", so the "(\d+) word" parse
+        # above keeps finding the corrected-word count on the next save.
+        step_text = f"human review: {total} word(s) corrected"
+        if total_moves:
+            step_text += f"; {total_moves} reading-order change(s)"
         proc.find(qname(self.ns, "processingDateTime")).text = (
             datetime.now(timezone.utc).isoformat()
         )
         proc.find(qname(self.ns, "processingAgency")).text = "alto_ocr"
-        proc.find(qname(self.ns, "processingStepDescription")).text = (
-            f"human review: {total} word(s) corrected"
-        )
+        proc.find(qname(self.ns, "processingStepDescription")).text = step_text
 
 
 def alto_to_text(root: etree._Element) -> str:
