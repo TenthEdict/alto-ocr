@@ -16,21 +16,24 @@ from rich.logging import RichHandler
 from rich.table import Table
 
 from .glmocr import (
-    DEFAULT_NUM_PREDICT, GLMOCRConfig, GLMOCRError, check_endpoint, resolve_endpoint,
+    DEFAULT_MODEL,
+    DEFAULT_NUM_PREDICT,
+    DEFAULT_TIMEOUT_S,
+    GLMOCRConfig,
+    GLMOCRError,
+    check_endpoint,
+    resolve_endpoint,
 )
-from .line_detect import DetectParams
 from .alto_format import convert_to_institution_format
 from .ocr import (
-    GLMOCREngine,
     OCREngine,
     OCROptions,
-    TesseractEngine,
+    build_engine,
     check_tesseract_version,
     find_tesseract,
 )
 from .pipeline import (
     PageProgressLogger,
-    PageResult,
     RefIdResult,
     failed_ref_result,
     process_ref_id,
@@ -38,7 +41,7 @@ from .pipeline import (
     skipped_ref_result,
 )
 from ._util import force_utf8_output
-from .preprocess import PreprocessConfig
+from .preprocess import PreprocessConfig, _read_dpi
 from .remediate import iter_object_dirs, repackage_object
 from .triage import (
     DEFAULT_LOW_WC,
@@ -84,33 +87,35 @@ def _build_engine(
     glmocr_timeout: int,
     glmocr_num_predict: int = DEFAULT_NUM_PREDICT,
 ) -> OCREngine:
-    """Resolve an engine name into a concrete OCREngine. Errors are reported
-    to the user via typer.Exit so the message is actionable."""
-    name = engine_name.lower().strip()
-    if name == "tesseract":
-        binary = find_tesseract(tesseract_path)
-        console.print(f"[dim]engine:[/dim] tesseract  "
-                      f"[dim]binary:[/dim] {binary} ({check_tesseract_version(binary)})")
-        return TesseractEngine(binary=binary, options=ocr_options)
-    if name == "glmocr":
-        endpoint = resolve_endpoint(glmocr_endpoint)
-        config = GLMOCRConfig(
-            endpoint=endpoint,
-            model=glmocr_model,
-            timeout_s=glmocr_timeout,
-            num_predict=glmocr_num_predict,
+    """CLI face of ``ocr.build_engine``: shared construction + startup
+    checks, with failures reported via typer.Exit so the message is
+    actionable."""
+    try:
+        built = build_engine(
+            engine_name,
+            tesseract_path=tesseract_path,
+            ocr_options=ocr_options,
+            glmocr_endpoint=glmocr_endpoint,
+            glmocr_model=glmocr_model,
+            glmocr_timeout=glmocr_timeout,
+            glmocr_num_predict=glmocr_num_predict,
         )
-        try:
-            check_endpoint(config)
-        except GLMOCRError as e:
-            console.print(f"[red]glmocr setup error:[/red] {e}")
-            raise typer.Exit(code=2)
+    except GLMOCRError as e:
+        console.print(f"[red]glmocr setup error:[/red] {e}")
+        raise typer.Exit(code=2)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=2)
+    if built.kind == "tesseract":
+        console.print(f"[dim]engine:[/dim] tesseract  "
+                      f"[dim]binary:[/dim] {built.tesseract_binary} "
+                      f"({built.tesseract_version})")
+    else:
+        gc = built.glmocr_config
         console.print(f"[dim]engine:[/dim] glmocr  "
-                      f"[dim]endpoint:[/dim] {endpoint}  "
-                      f"[dim]model:[/dim] {config.model}")
-        return GLMOCREngine(config=config, detect_params=DetectParams())
-    console.print(f"[red]unknown engine: {engine_name!r} (valid: tesseract, glmocr)[/red]")
-    raise typer.Exit(code=2)
+                      f"[dim]endpoint:[/dim] {gc.endpoint}  "
+                      f"[dim]model:[/dim] {gc.model}")
+    return built.engine
 
 
 def _build_preprocess_config(
@@ -254,9 +259,9 @@ TesseractOpt = typer.Option(None, "--tesseract-path",
 GLMOCREndpointOpt = typer.Option(None, "--glmocr-endpoint",
                                  help="Ollama HTTP endpoint for the glm-ocr engine. "
                                       "Default: $OLLAMA_HOST or http://localhost:11434.")
-GLMOCRModelOpt = typer.Option("glm-ocr:q8_0", "--glmocr-model",
+GLMOCRModelOpt = typer.Option(DEFAULT_MODEL, "--glmocr-model",
                               help="Ollama model tag for the glm-ocr engine.")
-GLMOCRTimeoutOpt = typer.Option(120, "--glmocr-timeout",
+GLMOCRTimeoutOpt = typer.Option(DEFAULT_TIMEOUT_S, "--glmocr-timeout",
                                 help="Per-page glm-ocr request timeout in seconds.")
 GLMOCRNumPredictOpt = typer.Option(
     DEFAULT_NUM_PREDICT, "--glmocr-num-predict",
@@ -738,22 +743,16 @@ _TIF_EXTS = (".tif", ".tiff", ".TIF", ".TIFF")
 def _resolve_dpi_from_tif(tif_path: Path | None, *, min_dpi: int) -> int:
     """Read DPI from a TIF; if missing or below ``min_dpi``, return ``min_dpi``.
 
-    Mirrors ``preprocess.preprocess()``'s effective-DPI logic so the
-    reformat command converts coordinates to mm10 with the same DPI the
-    pipeline used at OCR time.
+    Uses ``preprocess._read_dpi`` — the same reader the pipeline used at
+    OCR time — so the reformat command converts coordinates to mm10 with
+    the identical per-page DPI (an implausibly small tag falls below
+    ``min_dpi`` and is floored away, matching the pipeline's effective-DPI
+    outcome).
     """
     if tif_path is None or not tif_path.is_file():
         return min_dpi
-    try:
-        from PIL import Image
-        with Image.open(tif_path) as img:
-            d = img.info.get("dpi")
-            if d:
-                src = int(round(float(d[0])))
-                return max(src, min_dpi)
-    except Exception:
-        pass
-    return min_dpi
+    src = _read_dpi(tif_path)
+    return max(src, min_dpi) if src is not None else min_dpi
 
 
 def _find_source_tif(alto_path: Path, source_tiff_dir: Path | None) -> Path | None:

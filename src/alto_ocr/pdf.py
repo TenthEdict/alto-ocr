@@ -97,7 +97,3 @@ def rasterize_pdf(
 
 
 PDF_SUFFIXES = frozenset({".pdf"})
-
-
-def is_pdf(path: Path) -> bool:
-    return path.suffix.lower() in PDF_SUFFIXES

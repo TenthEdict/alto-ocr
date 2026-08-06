@@ -46,10 +46,8 @@ from lxml import etree
 from dataclasses import replace as dc_replace
 
 from ._util import atomic_write_text
-from .alto_format import (  # noqa: F401  — ALTO_NS/ALTO_NS_V3 re-exported for compat
-    ALTO_NS,
+from .alto_format import (
     ALTO_NS_V2,
-    ALTO_NS_V3,
     ALTO_V2_SCHEMA_URL,
     XLINK_NS,
     XSI_NS,
@@ -59,7 +57,15 @@ from .alto_format import (  # noqa: F401  — ALTO_NS/ALTO_NS_V3 re-exported for
     qname,
     serialize_with_tabs,
 )
-from .glmocr import GLMOCRConfig, transcribe
+from .glmocr import (
+    DEFAULT_MODEL,
+    DEFAULT_NUM_PREDICT,
+    DEFAULT_TIMEOUT_S,
+    GLMOCRConfig,
+    check_endpoint,
+    resolve_endpoint,
+    transcribe,
+)
 from .line_detect import DetectParams, LineBox, TextBlock, _clean_mask, detect_blocks
 from .markup import normalize_markup
 from .preprocess import PreprocessConfig
@@ -859,3 +865,67 @@ class GLMOCREngine:
             alto_path, page_index, dpi=dpi, source_filename=source_filename,
         )
         return alto_path, txt_path
+
+
+# --- shared engine construction -----------------------------------------------
+
+@dataclass(frozen=True)
+class BuiltEngine:
+    """A constructed, startup-checked engine plus the facts callers log.
+
+    Presentation stays caller-side (the CLI prints a rich console line, the
+    GUI logs through its queue handler); only construction and the startup
+    checks are shared.
+    """
+
+    engine: "TesseractEngine | GLMOCREngine"
+    kind: str  # "tesseract" | "glmocr"
+    tesseract_binary: Path | None = None
+    tesseract_version: str | None = None
+    glmocr_config: GLMOCRConfig | None = None
+
+
+def build_engine(
+    engine_name: str,
+    *,
+    tesseract_path: str | Path | None = None,
+    ocr_options: OCROptions | None = None,
+    glmocr_endpoint: str | None = None,
+    glmocr_model: str = DEFAULT_MODEL,
+    glmocr_timeout: int = DEFAULT_TIMEOUT_S,
+    glmocr_num_predict: int = DEFAULT_NUM_PREDICT,
+) -> BuiltEngine:
+    """Resolve an engine name into a ready, startup-checked engine.
+
+    The single construction path for the CLI and the GUI, so engine
+    options can never drift between the two (the GUI once lacked the
+    num_predict pass-through the CLI had). Performs the startup checks —
+    Tesseract binary lookup + version probe, Ollama endpoint + model
+    check — so failures surface before the first page, and raises
+    ``TesseractNotFoundError`` / ``GLMOCRError`` / ``ValueError`` (unknown
+    name) for callers to wrap in their own error-reporting idiom.
+    """
+    name = engine_name.lower().strip()
+    if name == "tesseract":
+        binary = find_tesseract(tesseract_path)
+        return BuiltEngine(
+            engine=TesseractEngine(binary=binary,
+                                   options=ocr_options or OCROptions()),
+            kind="tesseract",
+            tesseract_binary=binary,
+            tesseract_version=check_tesseract_version(binary),
+        )
+    if name == "glmocr":
+        config = GLMOCRConfig(
+            endpoint=resolve_endpoint(glmocr_endpoint),
+            model=glmocr_model,
+            timeout_s=glmocr_timeout,
+            num_predict=glmocr_num_predict,
+        )
+        check_endpoint(config)
+        return BuiltEngine(
+            engine=GLMOCREngine(config=config, detect_params=DetectParams()),
+            kind="glmocr",
+            glmocr_config=config,
+        )
+    raise ValueError(f"Unknown engine: {engine_name!r} (valid: tesseract, glmocr)")

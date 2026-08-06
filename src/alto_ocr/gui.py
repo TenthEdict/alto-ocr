@@ -26,16 +26,18 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
-from .glmocr import GLMOCRConfig, GLMOCRError, check_endpoint, resolve_endpoint
-from .line_detect import DetectParams
+from .glmocr import (
+    DEFAULT_MODEL,
+    DEFAULT_TIMEOUT_S,
+    GLMOCRConfig,
+    GLMOCRError,
+    resolve_endpoint,
+)
 from .ocr import (
-    GLMOCREngine,
     OCREngine,
     OCROptions,
-    TesseractEngine,
     TesseractNotFoundError,
-    check_tesseract_version,
-    find_tesseract,
+    build_engine,
 )
 from .pipeline import (
     PageProgressLogger,
@@ -73,8 +75,8 @@ class JobConfig:
     debug_preprocessed_dir: Optional[Path] = None
     ocr_options: OCROptions = field(default_factory=OCROptions)
     glmocr_endpoint: Optional[str] = None
-    glmocr_model: str = "glm-ocr:q8_0"
-    glmocr_timeout: int = 120
+    glmocr_model: str = DEFAULT_MODEL
+    glmocr_timeout: int = DEFAULT_TIMEOUT_S
 
 
 def _load_settings() -> dict:
@@ -841,36 +843,39 @@ class AltoOcrApp:
         self._signal_done(success=(not cancelled and ok == n_total))
 
     def _build_engine(self, name: str, cfg: JobConfig) -> OCREngine:
-        if name == "tesseract":
-            try:
-                binary = find_tesseract(cfg.tesseract_path)
-            except TesseractNotFoundError as e:
-                raise RuntimeError(str(e))
+        """GUI face of ``ocr.build_engine``: shared construction + startup
+        checks; failures become RuntimeError for the worker's error path."""
+        try:
+            built = build_engine(
+                name,
+                tesseract_path=cfg.tesseract_path,
+                ocr_options=cfg.ocr_options,
+                glmocr_endpoint=cfg.glmocr_endpoint,
+                glmocr_model=cfg.glmocr_model,
+                glmocr_timeout=cfg.glmocr_timeout,
+            )
+        except TesseractNotFoundError as e:
+            raise RuntimeError(str(e))
+        except GLMOCRError as e:
+            raise RuntimeError(
+                f"GLMOCR endpoint check failed: {e}\n\n"
+                f"Make sure Ollama is running at "
+                f"{resolve_endpoint(cfg.glmocr_endpoint)} and the "
+                f"{cfg.glmocr_model} model is pulled."
+            )
+        except ValueError as e:
+            raise RuntimeError(str(e))
+        if built.kind == "tesseract":
             logger.info(
                 "Tesseract: %s (%s) lang=%s psm=%d oem=%d",
-                binary, check_tesseract_version(binary),
+                built.tesseract_binary, built.tesseract_version,
                 cfg.ocr_options.language, cfg.ocr_options.psm, cfg.ocr_options.oem,
             )
-            return TesseractEngine(binary=binary, options=cfg.ocr_options)
-        if name == "glmocr":
-            endpoint = resolve_endpoint(cfg.glmocr_endpoint)
-            config = GLMOCRConfig(
-                endpoint=endpoint,
-                model=cfg.glmocr_model,
-                timeout_s=cfg.glmocr_timeout,
-            )
-            try:
-                check_endpoint(config)
-            except GLMOCRError as e:
-                raise RuntimeError(
-                    f"GLMOCR endpoint check failed: {e}\n\n"
-                    f"Make sure Ollama is running at {endpoint} and the "
-                    f"{config.model} model is pulled."
-                )
+        else:
+            gc = built.glmocr_config
             logger.info("GLMOCR: %s (model %s, timeout %ds)",
-                        endpoint, config.model, config.timeout_s)
-            return GLMOCREngine(config=config, detect_params=DetectParams())
-        raise RuntimeError(f"Unknown engine: {name!r}")
+                        gc.endpoint, gc.model, gc.timeout_s)
+        return built.engine
 
     def _set_progress(self, current: int, total: int) -> None:
         self._progress_queue.put((current, total))

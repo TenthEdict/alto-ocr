@@ -40,6 +40,7 @@ from pathlib import Path
 from lxml import etree
 
 from .alto_format import hardened_parser
+from .remediate import iter_object_dirs
 from .walker import natural_chunks, natural_key
 
 logger = logging.getLogger(__name__)
@@ -47,8 +48,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_LOW_WC = 0.50
 DEFAULT_REVIEW_PC = 0.80
 
-# Worst-first ordering for the page-level review queue.
-_STATUS_RANK = {"failed": 0, "scored": 1, "unscored": 2, "empty": 3}
+# Worst-first ordering for the page-level review queue. Shared with the
+# Review tab's page list so the two queues always sort statuses alike.
+STATUS_RANK = {"failed": 0, "scored": 1, "unscored": 2, "empty": 3}
 
 
 @dataclass(frozen=True)
@@ -236,15 +238,15 @@ def scan_output_root(
     Returns objects sorted worst-first: lowest mean WC first, objects with
     no confidence data (all-GLMOCR / all-empty) after the scored ones.
     """
-    if (output_root / "ALTO").is_dir():
-        one = scan_object(output_root, low_wc=low_wc, review_pc=review_pc)
-        return [one] if one else []
     objects = []
-    for child in sorted(output_root.iterdir()):
-        if not child.is_dir():
+    for obj_dir in iter_object_dirs(output_root):
+        obj = scan_object(obj_dir, low_wc=low_wc, review_pc=review_pc)
+        if obj is None:
             continue
-        obj = scan_object(child, low_wc=low_wc, review_pc=review_pc)
-        if obj is not None and obj.page_count > 0:
+        # A directly-targeted object is reported even with zero pages (the
+        # 0-page row is the diagnostic); in a root scan, page-less objects
+        # are just noise and are dropped.
+        if obj.page_count > 0 or obj_dir == output_root:
             objects.append(obj)
     objects.sort(key=lambda o: (o.mean_wc is None, o.mean_wc if o.mean_wc is not None else 0.0))
     return objects
@@ -256,7 +258,7 @@ def worst_pages(objects: list[ObjectConfidence]) -> list[tuple[str, PageConfiden
     unscored (GLMOCR — full proofread), then empty pages last."""
     rows = [(o.ref_id, p) for o in objects for p in o.pages]
     rows.sort(key=lambda rp: (
-        _STATUS_RANK.get(rp[1].status, 9),
+        STATUS_RANK.get(rp[1].status, 9),
         rp[1].pc if rp[1].pc is not None else 2.0,
         rp[0],
         natural_chunks(rp[1].stem),

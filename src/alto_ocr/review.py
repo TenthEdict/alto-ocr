@@ -72,7 +72,7 @@ from .remediate import (
     iter_object_dirs,
     repackage_object,
 )
-from .triage import DEFAULT_LOW_WC, scan_alto_file
+from .triage import DEFAULT_LOW_WC, STATUS_RANK, scan_alto_file
 from .walker import natural_chunks, natural_key
 
 # Archival scans are huge (hundreds of megapixels), so raise Pillow's
@@ -155,7 +155,6 @@ class ReviewFrame(ttk.Frame):
         self._snippet_photo: Optional[ImageTk.PhotoImage] = None
         self._scale = 1.0
         self._rect_by_word: dict[int, int] = {}   # id(Word) -> canvas item
-        self._word_by_rect: dict[int, Word] = {}
         self._selected: Optional[Word] = None
         self._undo: list[_EditEntry | _AddEntry | _MoveEntry] = []
         # Reading-order mode state: the selected block plus parallel
@@ -411,7 +410,7 @@ class ReviewFrame(ttk.Frame):
     def _page_sort_key(self, entry: tuple[str, float | None, str]) -> tuple:
         stem, pc, status = entry
         if self.var_worst_first.get():
-            rank = {"failed": 0, "scored": 1, "unscored": 2, "empty": 3}.get(status, 4)
+            rank = STATUS_RANK.get(status, 4)
             return (rank, pc if pc is not None else 2.0, natural_chunks(stem))
         return (natural_chunks(stem),)
 
@@ -526,7 +525,6 @@ class ReviewFrame(ttk.Frame):
         self.canvas.configure(scrollregion=(0, 0, w, h))
 
         self._rect_by_word.clear()
-        self._word_by_rect.clear()
         if self.var_reorder_mode.get():
             # Structure view: block/line outlines instead of word boxes.
             self._draw_order_overlays()
@@ -547,7 +545,6 @@ class ReviewFrame(ttk.Frame):
                 outline=color, width=3 if word is self._selected else 2,
             )
             self._rect_by_word[id(word)] = item
-            self._word_by_rect[item] = word
 
         # A pending add-word box survives re-renders (zoom, threshold
         # changes) — redraw it; canvas.delete("all") above dropped the item.
