@@ -12,6 +12,14 @@ Semantics (agreed 2026-07-30):
   human verifies a word, the confidence is no longer an OCR estimate. This
   also drops the word out of every low-confidence view (GUI stepping,
   triage) so remaining effort concentrates on what nobody has looked at.
+* **Confirming a word** (2026-08-14; the OCR was right, the confidence was
+  just low) stamps the same ``WC="1.00"`` without touching ``CONTENT`` —
+  a human read it against the scan, so it is no longer an estimate and the
+  word drops out of the review queue. Correct-but-flagged words are common
+  enough (faint type, tight kerning) that without this a corrector can walk
+  a page forever and never empty it. Counted *separately* from corrections
+  in the provenance ("N word(s) confirmed"), so the record of how many
+  words were actually changed stays honest.
 * **Deleting a word** (OCR hallucinated text on noise/marginalia) removes
   the ``<String>`` plus its neighboring ``<SP>``, and cascades upward:
   a ``<TextLine>``/``<TextBlock>``/``<ComposedBlock>`` left with no text
@@ -190,6 +198,7 @@ class ReviewPage:
         self.dirty = False
         self.session_edits = 0  # edits+deletions since load, folded into provenance on save
         self.session_moves = 0  # reading-order moves since load, folded into provenance on save
+        self.session_verifies = 0  # confirmed-as-correct words, counted apart from edits
 
     # ---------- queries ---------------------------------------------------
 
@@ -206,6 +215,45 @@ class ReviewPage:
         ]
         return min(hits, key=lambda w: w.box_px[2] * w.box_px[3]) if hits else None
 
+    def doc_index(self, word: Word) -> int | None:
+        """Position of a word in document (reading) order; None once it has
+        been removed from the page."""
+        for i, w in enumerate(self.words):
+            if w is word:
+                return i
+        return None
+
+    def step_from(self, current: Word, candidates: list[Word],
+                  delta: int) -> Word | None:
+        """The nearest word from *candidates* lying after (``delta`` > 0) or
+        before (``delta`` < 0) *current* in document order, wrapping at the
+        page ends. *current* itself is never returned; ``None`` means there
+        is nowhere else to go (no other candidate on the page).
+
+        Stepping is by **position, not list membership**: correcting a word
+        stamps ``WC="1.00"``, which drops it out of the flagged set the
+        instant it is edited, so "where is the corrector on the page" cannot
+        be answered by looking *current* up in *candidates*. Answering it
+        that way sent the corrector back to the page's first flagged word
+        after every single correction — forward progress through a page was
+        impossible (fixed 2026-08-14). *candidates* need not be sorted; a
+        word missing from the page (just deleted) anchors at the page start.
+        """
+        pos = {id(w.elem): i for i, w in enumerate(self.words)}
+        end = len(self.words)
+        pool = sorted((w for w in candidates if w is not current),
+                      key=lambda w: pos.get(id(w.elem), end))
+        if not pool:
+            return None
+        here = pos.get(id(current.elem))
+        if here is None:  # current is gone from the page (deleted)
+            return pool[0] if delta > 0 else pool[-1]
+        if delta > 0:
+            later = [w for w in pool if pos.get(id(w.elem), -1) > here]
+            return later[0] if later else pool[0]
+        earlier = [w for w in pool if pos.get(id(w.elem), end) < here]
+        return earlier[-1] if earlier else pool[-1]
+
     # ---------- edits -----------------------------------------------------
 
     def edit_word(self, word: Word, new_text: str) -> None:
@@ -218,6 +266,31 @@ class ReviewPage:
         reorder_attrs(word.elem, ATTR_ORDER["String"])
         self.dirty = True
         self.session_edits += 1
+
+    def verify_word(self, word: Word) -> bool:
+        """Confirm a low-confidence word the OCR actually got right: stamp
+        ``WC="1.00"``, leaving ``CONTENT`` alone.
+
+        The claim is the same one an edit makes — a human read this word
+        against the scan and it is correct — so the word leaves every
+        low-confidence view (GUI stepping, triage) and lifts the recomputed
+        page ``PC``. Without it a correct-but-flagged word is re-served on
+        every pass through the page and no amount of reviewing ever empties
+        the queue.
+
+        Counted apart from corrections (``session_verifies``, its own
+        provenance clause): the archive's record of how many words a human
+        *changed* has to stay honest. Returns False, recording nothing, for
+        a word already at 1.00.
+        """
+        wc = word.wc
+        if wc is not None and wc >= 1.0:
+            return False
+        word.elem.set("WC", "1.00")
+        reorder_attrs(word.elem, ATTR_ORDER["String"])
+        self.dirty = True
+        self.session_verifies += 1
+        return True
 
     def delete_word(self, word: Word) -> None:
         """Remove a hallucinated word (plus a neighboring SP; cascade empties)."""
@@ -532,6 +605,17 @@ class ReviewPage:
         reorder_attrs(word.elem, ATTR_ORDER["String"])
         self.session_edits = max(0, self.session_edits - 1)
 
+    def unverify_word(self, word: Word, old_wc: float | None) -> None:
+        """Undo one ``verify_word`` (GUI undo stack): restore the engine's
+        WC and un-count the confirmation. ``dirty`` stays as-is, like
+        ``revert_word`` — reloading the page is the full reset."""
+        if old_wc is None:
+            word.elem.attrib.pop("WC", None)
+        else:
+            word.elem.set("WC", f"{old_wc:.2f}")
+        reorder_attrs(word.elem, ATTR_ORDER["String"])
+        self.session_verifies = max(0, self.session_verifies - 1)
+
     # ---------- reading order ---------------------------------------------
 
     # Which child elements form the reorderable "flow" of a container.
@@ -661,6 +745,7 @@ class ReviewPage:
         # (_stamp_provenance re-reads the tree's totals as `prior`).
         self.session_edits = 0
         self.session_moves = 0
+        self.session_verifies = 0
         serialize_with_tabs(self.tree, self.alto_path)
         self._loaded_mtime_ns = self.alto_path.stat().st_mtime_ns
 
@@ -693,6 +778,7 @@ class ReviewPage:
                 break
         prior = 0
         prior_moves = 0
+        prior_verifies = 0
         if proc is None:
             proc = etree.SubElement(desc, qname(self.ns, "Processing"), {"ID": "review"})
             for tag in ("processingDateTime", "processingAgency", "processingStepDescription"):
@@ -700,16 +786,26 @@ class ReviewPage:
         else:
             step = proc.find(qname(self.ns, "processingStepDescription"))
             if step is not None and step.text:
-                m = re.search(r"(\d+) word", step.text)
+                # Each clause is parsed by its own verb: the corrected count
+                # stays the leading "(\d+) word" for anything reading these
+                # files loosely, but "N word(s) confirmed" can't be mistaken
+                # for it here.
+                m = re.search(r"(\d+) word\(s\) corrected", step.text) or \
+                    re.search(r"(\d+) word", step.text)
                 prior = int(m.group(1)) if m else 0
+                m = re.search(r"(\d+) word\(s\) confirmed", step.text)
+                prior_verifies = int(m.group(1)) if m else 0
                 m = re.search(r"(\d+) reading-order", step.text)
                 prior_moves = int(m.group(1)) if m else 0
 
         total = prior + self.session_edits
         total_moves = prior_moves + self.session_moves
-        # The moves clause never contains "word", so the "(\d+) word" parse
-        # above keeps finding the corrected-word count on the next save.
+        total_verifies = prior_verifies + self.session_verifies
+        # Corrected leads, so the loose "(\d+) word" parse above still finds
+        # it; the moves clause never contains "word" at all.
         step_text = f"human review: {total} word(s) corrected"
+        if total_verifies:
+            step_text += f"; {total_verifies} word(s) confirmed"
         if total_moves:
             step_text += f"; {total_moves} reading-order change(s)"
         proc.find(qname(self.ns, "processingDateTime")).text = (

@@ -1,7 +1,11 @@
 """Tests for the headless review/remediation logic (remediate.py).
 
 Covers: mm10→pixel word geometry, edit semantics (CONTENT + WC=1.00 +
-attribute order), whitespace handling, deletion with SP cleanup and
+attribute order), confirming a correct-but-flagged word (verify_word:
+WC only, its own provenance clause and session counter, undo via
+unverify_word), next/previous-word stepping by document position
+(step_from/doc_index — a corrected word must not restart the page),
+whitespace handling, deletion with SP cleanup and
 container cascade (stopping at PrintSpace), page clearing (clear_words:
 bulk rejection of hallucinated pages, PC drop, empty triage status),
 word insertion (add_word: line/block/PrintSpace placement, SP rebuild,
@@ -154,6 +158,154 @@ class EditTests(_PageFixture):
         self.assertIn("P1_PS00001", xml)     # PrintSpace survives
         self.assertIn("P1_TB00001", xml)     # block with remaining words survives
         self.assertEqual([w.content for w in self.page.words], ["Board", "1927"])
+
+
+class VerifyTests(_PageFixture):
+    """Confirming a flagged word the OCR already got right (Enter on an
+    unchanged word in the GUI)."""
+
+    def test_confirm_stamps_wc_without_touching_content(self) -> None:
+        word = self.page.words[1]  # "cf" @ 0.40
+        self.assertTrue(self.page.verify_word(word))
+        self.assertEqual(word.content, "cf")
+        self.assertEqual(word.elem.get("WC"), "1.00")
+        self.assertTrue(self.page.dirty)
+        keys = list(word.elem.attrib)
+        self.assertLess(keys.index("CONTENT"), keys.index("WC"))
+
+    def test_confirm_counts_apart_from_corrections(self) -> None:
+        self.page.verify_word(self.page.words[1])
+        self.page.verify_word(self.page.words[2])  # unscored word, no WC
+        self.assertEqual(self.page.session_verifies, 2)
+        self.assertEqual(self.page.session_edits, 0)
+
+    def test_confirmed_word_leaves_the_review_queue(self) -> None:
+        word = self.page.words[1]
+        self.page.verify_word(word)
+        self.assertNotIn(word, self.page.flagged(0.50))
+
+    def test_already_verified_word_records_nothing(self) -> None:
+        word = self.page.words[1]
+        self.page.verify_word(word)
+        self.assertFalse(self.page.verify_word(word))
+        self.assertEqual(self.page.session_verifies, 1)
+
+    def test_unverify_restores_engine_confidence(self) -> None:
+        scored, unscored = self.page.words[1], self.page.words[2]
+        self.page.verify_word(scored)
+        self.page.verify_word(unscored)
+        self.page.unverify_word(scored, 0.40)
+        self.page.unverify_word(unscored, None)
+        self.assertEqual(scored.elem.get("WC"), "0.40")
+        self.assertIsNone(unscored.elem.get("WC"))
+        self.assertEqual(self.page.session_verifies, 0)
+
+    def test_save_records_confirmations_in_their_own_clause(self) -> None:
+        self.page.edit_word(self.page.words[1], "of")
+        self.page.verify_word(self.page.words[3])  # "Lone" @ 0.85, correct
+        self.page.save()
+        body = self.alto.read_text(encoding="utf-8")
+        self.assertIn("human review: 1 word(s) corrected; 1 word(s) confirmed",
+                      body)
+        # Confirmed words count as 1.00 in the page score, like edits:
+        # mean(0.96, 1.00, —, 1.00) over scored words = 0.9866… → 0.99.
+        self.assertIn('PC="0.99"', body)
+
+    def test_confirmations_accumulate_across_sessions(self) -> None:
+        self.page.verify_word(self.page.words[1])
+        self.page.save()
+        reopened = ReviewPage(self.alto, _IMG_SIZE)
+        reopened.verify_word(reopened.words[2])
+        reopened.edit_word(reopened.words[0], "Boards")
+        reopened.move_element(reopened.flow_children()[1], -1)
+        reopened.save()
+        body = self.alto.read_text(encoding="utf-8")
+        self.assertIn("human review: 1 word(s) corrected; 2 word(s) confirmed; "
+                      "1 reading-order change(s)", body)
+        self.assertEqual(body.count('<Processing ID="review">'), 1)
+
+    def test_confirm_only_page_is_protected_from_re_ocr(self) -> None:
+        # Confirming is human work too — a re-run must not overwrite it.
+        self.page.verify_word(self.page.words[1])
+        self.page.save()
+        body = self.alto.read_text(encoding="utf-8")
+        self.assertIn("human review: 0 word(s) corrected; 1 word(s) confirmed",
+                      body)
+        self.assertTrue(has_review_provenance(self.alto))
+
+    def test_no_confirmations_leaves_the_clause_out(self) -> None:
+        self.page.edit_word(self.page.words[1], "of")
+        self.page.save()
+        body = self.alto.read_text(encoding="utf-8")
+        self.assertIn("human review: 1 word(s) corrected", body)
+        self.assertNotIn("confirmed", body)
+
+
+class StepFromTests(_PageFixture):
+    """Next/previous-word stepping (the GUI's Enter / n / p). Threshold 0.99
+    flags all four fixture words, so a corrected word in the *middle* of the
+    page is distinguishable from the page's first flagged word."""
+
+    def _flagged(self) -> list:
+        return self.page.flagged(0.99)
+
+    def test_step_after_edit_goes_to_the_next_word_not_the_page_top(self) -> None:
+        # The reported bug: correcting a word stamps WC=1.00, dropping it out
+        # of the flagged list — stepping used to restart at the page's first
+        # flagged word ("Board") instead of continuing down the page.
+        cf = self.page.words[1]
+        self.page.edit_word(cf, "of")
+        flagged = self._flagged()
+        self.assertNotIn(cf, flagged)
+        nxt = self.page.step_from(cf, flagged, +1)
+        self.assertEqual(nxt.content, "1927")
+
+    def test_step_backward_from_a_corrected_word(self) -> None:
+        cf = self.page.words[1]
+        self.page.edit_word(cf, "of")
+        prev = self.page.step_from(cf, self._flagged(), -1)
+        self.assertEqual(prev.content, "Board")
+
+    def test_step_walks_the_page_front_to_back(self) -> None:
+        # Correct every word in turn: each step must land on the next word
+        # down the page, then wrap once at the end.
+        seen = []
+        word = self.page.words[0]
+        for _ in range(3):
+            self.page.edit_word(word, word.content.upper())
+            word = self.page.step_from(word, self._flagged(), +1)
+            seen.append(word.content)
+        self.assertEqual(seen, ["cf", "1927", "Lone"])
+
+    def test_wrap_at_the_page_ends(self) -> None:
+        flagged = self._flagged()
+        self.assertEqual(
+            self.page.step_from(self.page.words[-1], flagged, +1).content, "Board")
+        self.assertEqual(
+            self.page.step_from(self.page.words[0], flagged, -1).content, "Lone")
+
+    def test_sole_remaining_word_has_nowhere_to_go(self) -> None:
+        word = self.page.words[1]
+        self.assertIsNone(self.page.step_from(word, [word], +1))
+        self.assertIsNone(self.page.step_from(word, [], +1))
+
+    def test_candidate_order_does_not_matter(self) -> None:
+        # The GUI filters the flagged list; stepping must rely on document
+        # order, not on the order it happens to be handed.
+        shuffled = list(reversed(self._flagged()))
+        nxt = self.page.step_from(self.page.words[1], shuffled, +1)
+        self.assertEqual(nxt.content, "1927")
+
+    def test_deleted_word_anchors_at_the_page_start(self) -> None:
+        word = self.page.words[1]
+        self.page.delete_word(word)
+        self.assertIsNone(self.page.doc_index(word))
+        self.assertEqual(self.page.step_from(word, self._flagged(), +1).content,
+                         "Board")
+
+    def test_doc_index_follows_reading_order(self) -> None:
+        self.assertEqual([self.page.doc_index(w) for w in self.page.words],
+                         [0, 1, 2, 3])
 
 
 class ClearPageTests(_PageFixture):

@@ -10,7 +10,14 @@ the editor bar with a magnified snippet of the actual scan region.
 
 Keyboard flow for correctors: **Enter** commits the edit and jumps to the
 next flagged word, **Escape** deselects, **n/p** step through flagged words
-(canvas focus), **Ctrl+Z** undoes the last edit. Deletions (hallucinated
+(canvas focus), **Ctrl+Z** undoes the last edit. Enter on a word left
+*unchanged* confirms it — the OCR was right and only the confidence was low
+— stamping ``WC="1.00"`` so it leaves the queue for good
+(``remediate.ReviewPage.verify_word``, counted apart from corrections in the
+page's provenance). Stepping is *positional* —
+the next flagged word below the one in hand, wrapping (with a status note)
+at the page end — so a correction never costs the corrector their place on
+the page (``remediate.ReviewPage.step_from``). Deletions (hallucinated
 words) confirm first and are undone only by reloading the page. On the
 canvas, plain scroll pans vertically, **Shift+scroll** horizontally, and
 **Ctrl+scroll** zooms about the mouse cursor.
@@ -113,6 +120,12 @@ class _EditEntry:
 
 
 @dataclass
+class _VerifyEntry:
+    word: Word
+    old_wc: float | None
+
+
+@dataclass
 class _AddEntry:
     word: Word
 
@@ -156,7 +169,7 @@ class ReviewFrame(ttk.Frame):
         self._scale = 1.0
         self._rect_by_word: dict[int, int] = {}   # id(Word) -> canvas item
         self._selected: Optional[Word] = None
-        self._undo: list[_EditEntry | _AddEntry | _MoveEntry] = []
+        self._undo: list[_EditEntry | _VerifyEntry | _AddEntry | _MoveEntry] = []
         # Reading-order mode state: the selected block plus parallel
         # listbox-row -> element lists (the _sorted_stems idiom).
         self._order_block: Optional[object] = None
@@ -340,7 +353,7 @@ class ReviewFrame(ttk.Frame):
         self.ent_edit.bind("<Control-z>", lambda _e: self._undo_edit())
         btns = ttk.Frame(editor)
         btns.grid(row=1, column=3, sticky="e")
-        ttk.Button(btns, text="Apply (Enter)",
+        ttk.Button(btns, text="Apply / Confirm (Enter)",
                    command=lambda: self._apply_edit(advance=True)).pack(side="left")
         ttk.Button(btns, text="Delete word", command=self._delete_word).pack(
             side="left", padx=(6, 0))
@@ -531,8 +544,7 @@ class ReviewFrame(ttk.Frame):
             self._drag_item = None
             return
         threshold = self._threshold()
-        edited = {id(e.word) for e in self._undo
-                  if isinstance(e, (_EditEntry, _AddEntry))}
+        edited = self._touched_ids()
         for word in self._page.words:
             flagged = word.needs_review(threshold)
             if not (flagged or self.var_show_all.get() or id(word) in edited):
@@ -930,13 +942,27 @@ class ReviewFrame(ttk.Frame):
         if " ".join(new_text.split()) != word.content:
             self._undo.append(_EditEntry(word, word.content, word.wc))
             self._page.edit_word(word, new_text)
-            item = self._rect_by_word.get(id(word))
-            if item is not None:
-                self.canvas.itemconfigure(item, outline=_COLOR_EDITED)
-            self.btn_save.configure(state="normal")
+            self._mark_touched(word)
+        elif word.needs_review(self._threshold()):
+            # Enter on a word left as-is: the OCR got this one right, the
+            # confidence was just low. Confirm it (WC=1.00) so it leaves the
+            # queue instead of being re-served on the next pass — but count
+            # it apart from real corrections in the provenance.
+            old_wc = word.wc
+            if self._page.verify_word(word):
+                self._undo.append(_VerifyEntry(word, old_wc))
+                self._mark_touched(word)
         self._update_status()
         if advance:
             self._goto_flagged(+1)
+
+    def _mark_touched(self, word: Word) -> None:
+        """Recolor a word the corrector just settled (edited or confirmed)
+        and enable the save button."""
+        item = self._rect_by_word.get(id(word))
+        if item is not None:
+            self.canvas.itemconfigure(item, outline=_COLOR_EDITED)
+        self.btn_save.configure(state="normal")
 
     def _delete_word(self) -> None:
         word = self._selected
@@ -1017,7 +1043,10 @@ class ReviewFrame(ttk.Frame):
             self._update_editor()
             self._update_status()
             return
-        self._page.revert_word(entry.word, entry.old_content, entry.old_wc)
+        if isinstance(entry, _VerifyEntry):  # un-confirm: engine WC back
+            self._page.unverify_word(entry.word, entry.old_wc)
+        else:
+            self._page.revert_word(entry.word, entry.old_content, entry.old_wc)
         item = self._rect_by_word.get(id(entry.word))
         if item is not None:
             self.canvas.itemconfigure(item, outline=_wc_color(entry.word.wc))
@@ -1027,41 +1056,64 @@ class ReviewFrame(ttk.Frame):
 
     def _maybe_disable_save(self) -> None:
         if (self._page.session_edits == 0 and self._page.session_moves == 0
-                and not self._page.dirty):
+                and self._page.session_verifies == 0 and not self._page.dirty):
             self.btn_save.configure(state="disabled")
+
+    def _touched_ids(self) -> set[int]:
+        """Words this session has edited, confirmed, or added — drawn in the
+        edited color and kept out of the flagged queue."""
+        return {id(e.word) for e in self._undo
+                if isinstance(e, (_EditEntry, _VerifyEntry, _AddEntry))}
 
     def _flagged_now(self) -> list[Word]:
         if self._page is None:
             return []
-        edited = {id(e.word) for e in self._undo
-                  if isinstance(e, (_EditEntry, _AddEntry))}
-        return [w for w in self._page.flagged(self._threshold()) if id(w) not in edited]
+        touched = self._touched_ids()
+        return [w for w in self._page.flagged(self._threshold()) if id(w) not in touched]
 
     def _next_after(self, word: Word) -> Optional[Word]:
-        flagged = self._flagged_now()
-        after = [w for w in flagged if w is not word]
-        if not after or self._page is None:
+        if self._page is None:
             return None
-        try:
-            idx = self._page.words.index(word)
-        except ValueError:
-            return after[0]
-        for w in after:
-            if self._page.words.index(w) > idx:
-                return w
-        return after[0]
+        return self._page.step_from(word, self._flagged_now(), +1)
 
     def _goto_flagged(self, delta: int) -> None:
+        """Step to the next/previous flagged word *from where the corrector
+        is on the page*. Position, not membership in the flagged list: a word
+        just corrected is no longer flagged (``WC="1.00"``), and looking it up
+        in that list is what used to bounce the corrector back to the page's
+        first flagged word after every edit."""
         flagged = self._flagged_now()
-        if not flagged:
+        if not flagged or self._page is None:
             self._select_word(None)
             self.var_status.set("No flagged words left on this page. Save and pick the next page.")
             return
-        if self._selected is None or self._selected not in flagged:
+        current = self._selected
+        if current is None:
             self._select_word(flagged[0] if delta > 0 else flagged[-1])
             return
-        idx = (flagged.index(self._selected) + delta) % len(flagged)
-        self._select_word(flagged[idx])
+        nxt = self._page.step_from(current, flagged, delta)
+        if nxt is None:  # the selected word is the only one still flagged
+            self.var_status.set(
+                "This is the only flagged word left on this page — correct it, "
+                "then save and pick the next page.")
+            return
+        wrapped = self._wrapped(current, nxt, delta)
+        self._select_word(nxt)
+        if wrapped:
+            edge = "top" if delta > 0 else "bottom"
+            self.var_status.set(
+                f"Wrapped to the {edge} of the page — {len(flagged)} flagged "
+                f"word(s) still unreviewed.")
+
+    def _wrapped(self, current: Word, nxt: Word, delta: int) -> bool:
+        """True when stepping ran off the end of the page and came back
+        around — worth saying out loud, so a corrector who lands back near
+        the top knows they finished the page rather than lost their place."""
+        here = self._page.doc_index(current)
+        there = self._page.doc_index(nxt)
+        if here is None or there is None:
+            return False
+        return there < here if delta > 0 else there > here
 
     # ---------- save / status --------------------------------------------
 
