@@ -151,7 +151,66 @@ Not documented anywhere obvious, and each one presents as a dead end:
   closes nor errors the step on those — but nothing re-fires it either, so
   they complement the import step rather than replace it.)
 
-## 5. OCR settings that matter more than they look
+## 5. Target workflow: digitization stages as Goobi tasks
+
+Goobi is meant to be the only place progress is tracked — the spreadsheet's
+per-stage *date* and *by* columns are what Goobi records automatically on
+every step close (editor + timestamp), so the sheet becomes redundant rather
+than something to keep in parallel.
+
+| stage | Goobi mechanism | state |
+|---|---|---|
+| 0. Create processes from Ref-IDs | `plugin-import-excel` — mass-creates processes from spreadsheet rows | not installed |
+| 1. Capture | manual task; images arrive by upload or direct export (below) | ready |
+| 2. QC1 (+ image count) | manual task; Goobi counts images itself (`sortHelperImages`) — do not re-enter counts by hand | ready |
+| 3. Post-Process | manual task; Capture One re-exports over the same path | ready |
+| 4. QC2 (view images in Goobi) | `plugin-step-imageqa` — browser image inspection inside the task | **installed + configured** |
+| 5. OCR + transcript correction | automatic script step (this bridge) + correction in either GUI | ready |
+| 6. Review to Upload | manual task + script/export step copying `alto_ocr/<RefID>/` to the LibNova ingest point | small variant of this bridge |
+| 7. ReviewToRemove (~1 month) | `plugin-step-delay` — holds a step N days, then auto-closes into a cleanup step | not installed |
+
+**Automation is only sound from order 2 onward** — see the create-time race
+above. Stage 1 must be a manual task precisely so that closing it is what
+releases OCR.
+
+### Image import without a terminal
+
+Two production paths; copying files by hand is neither.
+
+**Browser upload.** `plugin-step-file-upload` is installed and its shipped
+config already has a catch-all block (any project, any step, TIFF/JP2/PDF
+accepted, target folder `master`). Set **Step plugin** = `intranda_step_fileUpload`
+on the Capture task and its detail view gains an upload box writing straight
+into `_master`. Works today; clunky for multi-GB objects.
+
+**Direct export from the capture station — the pattern the LDAP/Samba stack
+exists for.** Give the Capture task **Write images** (not merely Read images:
+the flag is inverted into `nurLesen`, and read-only mode passes
+`UserForImageReading`, default `root`). Accepting the task then symlinks the
+process folder into the digitizer's home; export those homes over Samba, and
+Capture One's output recipe writes directly into `_master` through the share.
+The export *is* the import — no copy step exists to forget. Requires NSS
+working and homes owned `<user>:tomcat` (§3), and the imaging stations
+needing SMB access to the Goobi server belongs in the VM request.
+
+### Where correction happens
+
+Both editors write the same `_alto` files, and both are legitimate:
+
+- **Goobi's built-in ALTO editor** (metadata editor, `showOcrButton` /
+  `loadJsonAlto`) — no extra software, correctors never leave Goobi.
+- **This tool's review GUI** — confidence ranking, worst-first queue, add/
+  delete word, reading-order mode. Needs `python3-tk` (§7).
+
+Goobi's editor writes `CONTENT` and nothing else: no provenance element, and
+`WC` left at its original value. The re-OCR guard therefore relies on METS
+checksum drift to notice those edits, and `repackage` converts drift into a
+durable stamp (alto_ocr ≥ v0.8.17). Two consequences worth knowing: an object
+OCR'd with `--no-mets` or `--no-checksums` has no fingerprint and so no
+protection for Goobi-side edits, and a page corrected in Goobi keeps its
+original confidence, so it still surfaces in the worst-first triage queue.
+
+## 6. OCR settings that matter more than they look
 
 **`--psm 1`, not Tesseract's `psm 3` default.** Both do fully automatic page
 segmentation; only `psm 1` runs orientation and script detection. A master TIFF
@@ -189,7 +248,7 @@ hint, where the correct action was to not OCR it at all. Check words-per-page
 before acting on a low score — 36 words on a full page is a photograph, not a
 handwriting problem.
 
-## 6. Host suitability
+## 7. Host suitability
 
 WSL2 is fine for building and evaluating, and unfit for shared use:
 
@@ -204,7 +263,7 @@ The moment a second person needs a browser on the instance, it needs a real
 VM. Nothing else in this document changes when it moves — the fixes above
 apply unaltered.
 
-## 7. The OCR bridge
+## 8. The OCR bridge
 
 See `README.md` in this directory. Host requirements it adds:
 
