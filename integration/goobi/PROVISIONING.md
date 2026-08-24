@@ -155,11 +155,16 @@ Every page gained, not only the rotated one, and the word count barely moved
 (12095 → 11987) — it is reading the same text, correctly. The wrapper defaults
 to `psm 1`; `ALTO_OCR_PSM` overrides it.
 
-Note OSD fixes the *text* but not the ALTO *geometry*: a rotated page's word
-boxes stay taller-than-wide, so the review GUI draws vertical boxes over
-horizontal text. The transcript is right and clicking is awkward. The real fix
-is upstream — a preservation master should not be sideways, and every
-downstream consumer pays for it, not just OCR.
+Note OSD corrects the *text* while leaving the ALTO *geometry* in the
+master's frame: a rotated page's word boxes stay taller-than-wide because the
+words genuinely are sideways in the master image. That is the correct
+behavior, by policy and by design — preservation masters are never modified,
+rotation exists only for transcription accuracy, and ALTO coordinates must
+map onto the master as captured (the same coordinate-frame contract that
+keeps deskew and border-crop disabled). Do not "fix" this by rotating pixels
+in preprocessing: that shifts every box off its word for all downstream
+consumers. Expect vertical boxes over sideways pages in the review GUI; the
+boxes are on the words.
 
 **Low mean WC does not mean "hard text".** It can equally mean *no* text:
 photographic material scores badly because the engine finds noise. One object
