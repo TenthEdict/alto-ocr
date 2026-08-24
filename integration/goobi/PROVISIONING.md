@@ -159,4 +159,25 @@ See `README.md` in this directory. Host requirements it adds:
   usual trip hazard when the app lives under `/home`. Verify with
   `sudo -u tomcat <app>/venv/bin/python -c "import alto_ocr"`, not by running
   it as yourself.
+- `python3-tk` from apt if correctors will run the review GUI on this host.
+  tkinter is not a pip package and is absent from a stock venv; without it the
+  GUI cannot start at all. Under WSL, WSLg supplies the display (`DISPLAY=:0`).
 - `install.sh` in this directory places the wrapper and its registration.
+
+**Deploy a pinned checkout, never a development working tree.** The wrapper
+executes `<app-dir>/src` directly, so whatever the working tree currently
+holds *is* what Goobi runs — a `git checkout` on that directory changes
+production instantly and silently, with no restart and no log entry. This bit
+during testing: switching branches to commit a doc reverted a bug fix
+underneath a running Goobi, and the resulting behaviour looked convincingly
+like a second bug. Deploy at a tag or merge commit and update it deliberately.
+
+**Correctors need group membership, not permission changes.** Saving a
+correction replaces the ALTO through the symlink view, which needs write on
+the *directory* (owned by `tomcat`, mode 775) rather than on the file — so
+adding the corrector to the `tomcat` group is sufficient, and no chmod of the
+output is required. Modes take care of themselves: the pipeline preserves an
+existing file's mode across writes and OCR always creates the file first as
+`tomcat`, so a corrector with even a `0077` umask cannot produce output Goobi
+is unable to read (verified). Setgid on the OCR directories is optional
+tidiness for consistent group ownership, not a requirement.
