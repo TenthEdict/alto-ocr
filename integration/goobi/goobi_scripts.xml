@@ -2,7 +2,7 @@
 <scripts>
     <script>
         <name>ALTO-OCR Processing</name>
-        <command>/opt/digiverso/goobi/scripts/run_alto_ocr.sh {processid} "{processtitle}" {tifpath} {ocrbasispath}</command>
+        <command>/opt/digiverso/goobi/scripts/run_alto_ocr.sh {processid} "{processtitle}" {origpath} {ocrbasispath}</command>
         <suppressLogging>false</suppressLogging>
     </script>
 </scripts>
