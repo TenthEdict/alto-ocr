@@ -148,6 +148,31 @@ def _wc_color(wc: float | None) -> str:
     return "#2da44e"
 
 
+def repackage_summary(results: list[RepackageResult]) -> str:
+    """One-line status for a finished Repackage.
+
+    Deliberately does not report a bare "N transcript(s) updated" count.
+    ``Save page`` writes the edited page's transcript itself, and the
+    Repackage button offers to save a dirty page before running — so from
+    this tab the count is essentially always zero, and phrasing zero as an
+    un-met outcome reads as a failure when it is the healthy case. A non-zero
+    count means ALTO and text had genuinely drifted (a CLI OCR run, or an
+    external XML editor), which is worth naming as a re-sync.
+    """
+    n_obj = len(results)
+    pages = sum(r.pages for r in results)
+    mets = sum(1 for r in results if r.mets_written)
+    txt = sum(r.txt_written for r in results)
+
+    parts = [f"Repackaged {n_obj} object(s)"]
+    parts.append(f"{mets} METS refreshed" if mets else "no METS written")
+    if txt:
+        parts.append(f"{txt} of {pages} transcript(s) re-synced from ALTO")
+    else:
+        parts.append(f"all {pages} transcript(s) already current")
+    return ", ".join(parts) + "."
+
+
 class ReviewFrame(ttk.Frame):
     """The Review tab. ``settings`` is the app's persisted dict; ``persist``
     writes it to disk (called after path/threshold changes)."""
@@ -1220,10 +1245,7 @@ class ReviewFrame(ttk.Frame):
             self.after(150, self._poll_repackage)
             return
         self.btn_repackage.configure(state="normal")
-        mets = sum(1 for r in results if r.mets_written)
-        txt = sum(r.txt_written for r in results)
-        msg = (f"Repackaged {len(results)} object(s): {mets} METS refreshed, "
-               f"{txt} transcript(s) updated.")
+        msg = repackage_summary(results)
         problems = [f"{r.ref_id}: {p}" for r in results for p in r.problems]
         if problems:
             shown = "\n".join(problems[:12])
