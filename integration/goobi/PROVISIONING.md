@@ -277,7 +277,48 @@ hint, where the correct action was to not OCR it at all. Check words-per-page
 before acting on a low score — 36 words on a full page is a photograph, not a
 handwriting problem.
 
-## 7. Host suitability
+## 7. Carrying workflow config to another host
+
+**Goobi has no template export.** The template page offers only "new" and
+"edit"; the REST API creates processes *from* a template, never a template.
+Templates live in MariaDB, so SQL is the only way to move a workflow
+definition — or to keep one under version control.
+
+`export_template.sh` emits the minimal re-importable dump: the template row,
+its steps, and each step's user-group assignments. Nothing more is needed,
+because everything a template references — institution, project, ruleset,
+docket, the six default user groups — is stock seed data present with
+**identical IDs** on any fresh install. Verified against this schema: a fresh
+install seeds `prozesse` 1 and 4 and `schritte` up to 28, so a template built
+later (here: process 6, steps 36/38/45) cannot collide.
+
+```sh
+integration/goobi/export_template.sh OCR_Processing > OCR_Processing.sql
+# on the target, after running the pre-flight queries in the file's header:
+mysql goobi < OCR_Processing.sql && systemctl restart tomcat10
+```
+
+**The schema declares no foreign keys at all** (checked: zero `FOREIGN KEY`
+in `goobi_blank.sql`, everything InnoDB). So an import referencing a project
+or user group the target lacks succeeds silently and produces a template that
+looks correct and then fails at process creation with *"No user associated
+for task X"*. That is why the script emits per-dependency pre-flight queries
+into the dump's header rather than a generic warning — run them.
+
+Credentials come from Tomcat's context XML rather than the install's
+credentials file, which drifts the first time anyone rotates the password
+(observed: the file's `PW_SQL_GOOBI` no longer authenticates on this host).
+
+Not exported, deliberately: users, processes, history, process logs. User
+accounts especially should be created on the target from its own directory —
+see the AD decision in §3 — rather than migrated from a test host.
+
+For one template, rebuilding by hand in the UI is comparable effort and
+carries no ID risk at all. The dump's real value is as a versioned artifact:
+a workflow definition that can be reviewed in a diff and restored after a
+mistake.
+
+## 8. Host suitability
 
 WSL2 is fine for building and evaluating, and unfit for shared use:
 
@@ -292,7 +333,7 @@ The moment a second person needs a browser on the instance, it needs a real
 VM. Nothing else in this document changes when it moves — the fixes above
 apply unaltered.
 
-## 8. The OCR bridge
+## 9. The OCR bridge
 
 See `README.md` in this directory. Host requirements it adds:
 
