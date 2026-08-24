@@ -1,6 +1,7 @@
 #!/bin/sh
 # Pre-push hook — run the test suite before every push; block the push on
-# failure. Pure-stdlib unittest, so it's quick (no Tesseract/Ollama needed).
+# failure. Pure-stdlib unittest, so it's quick (~2s, no Tesseract/Ollama
+# needed) *provided the interpreter can import the project's dependencies*.
 #
 # ENABLE (once per clone):   git config core.hooksPath scripts/hooks
 # BYPASS (emergencies only):  git push --no-verify
@@ -8,22 +9,77 @@
 # Runs from the repo top-level (git invokes hooks there), so the relative
 # discover path resolves correctly. Cross-platform: git runs hooks via sh on
 # both Linux/WSL and Git-for-Windows.
+#
+# Interpreter choice is ordered, venv first, and that ordering is the point:
+# a bare `python`/`python3` off PATH is the wrong interpreter more often than
+# not. The venv is built with include-system-site-packages=false, so the
+# system python misses every dependency; and on Windows a bare `python` is
+# often the Microsoft Store stub, which blocks waiting on a GUI and *hangs*
+# the push rather than failing it.
 
-if command -v python >/dev/null 2>&1; then
-    PY=python
-elif command -v python3 >/dev/null 2>&1; then
-    PY=python3
-else
-    echo "pre-push: no python on PATH; skipping tests (push allowed)." >&2
+PY=""
+for candidate in \
+    "venv/bin/python" \
+    "venv/Scripts/python.exe" \
+    ".venv/bin/python" \
+    ".venv/Scripts/python.exe"
+do
+    if [ -x "$candidate" ]; then
+        PY="$candidate"
+        break
+    fi
+done
+
+if [ -z "$PY" ]; then
+    for candidate in python3 python; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            PY="$candidate"
+            break
+        fi
+    done
+fi
+
+if [ -z "$PY" ]; then
+    echo "pre-push: no python found; skipping tests (push allowed)." >&2
     exit 0
 fi
 
+# Nothing here may hold the push open indefinitely. RUN is deliberately
+# unquoted below so it splits into words; empty when timeout(1) is absent.
+RUN=""
+if command -v timeout >/dev/null 2>&1; then
+    RUN="timeout 300"
+fi
+
+# Separate "this environment isn't set up" from "the code is broken". Without
+# the runtime dependencies every test module errors at import, and that
+# verdict says nothing about what is being pushed — so warn and allow, the
+# same call this hook already made for a missing interpreter.
+if ! $RUN "$PY" -c "import cv2, lxml, numpy, PIL, pypdfium2" >/dev/null 2>&1; then
+    echo "pre-push: '$PY' cannot import the project's dependencies —" >&2
+    echo "          skipping tests (push allowed). To set the venv up:" >&2
+    echo "          python3 -m venv venv && venv/bin/pip install -r requirements.txt" >&2
+    exit 0
+fi
+
+# stdin is the ref list git hands a pre-push hook. Point the suite at
+# /dev/null so anything that reads stdin gets EOF instead of blocking.
 echo "pre-push: running test suite ($PY -m unittest discover -s tests)..."
-if "$PY" -m unittest discover -s tests; then
+$RUN "$PY" -m unittest discover -s tests < /dev/null
+STATUS=$?
+
+if [ "$STATUS" -eq 0 ]; then
     echo "pre-push: tests passed — pushing."
     exit 0
+fi
+
+if [ "$STATUS" -eq 124 ]; then
+    echo "pre-push: TESTS TIMED OUT after 300s — push aborted." >&2
+    echo "          A 2-second suite hanging means a test reached the network," >&2
+    echo "          a subprocess, or a GUI. Re-run it directly to see where:" >&2
+    echo "          $PY -m unittest discover -s tests -v" >&2
 else
     echo "pre-push: TESTS FAILED — push aborted." >&2
-    echo "          Fix the failures, or override once with: git push --no-verify" >&2
-    exit 1
 fi
+echo "          Override once with: git push --no-verify" >&2
+exit 1
