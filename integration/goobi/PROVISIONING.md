@@ -135,7 +135,40 @@ Not documented anywhere obvious, and each one presents as a dead end:
   `_master` appears and `_media`, which `{tifpath}` points at, does not.
   Either create it per process, or point the script at `{origpath}`.
 
-## 5. Host suitability
+## 5. OCR settings that matter more than they look
+
+**`--psm 1`, not Tesseract's `psm 3` default.** Both do fully automatic page
+segmentation; only `psm 1` runs orientation and script detection. A master TIFF
+scanned sideways, read under `psm 3`, yields vertically-stacked words at
+`WC 0.00` — and nothing in the output says "orientation": it reads as an image
+quality problem, and a corrector faces hundreds of flagged words on a page
+whose text was perfectly legible all along. Measured over one 54-page object of
+typed reports:
+
+| | psm 3 | psm 1 |
+|---|---|---|
+| mean WC | 0.869 | **0.922** |
+| low-confidence words | 1199 (9.9%) | **489 (4.1%)** |
+| worst page PC | 0.32 | 0.52 |
+
+Every page gained, not only the rotated one, and the word count barely moved
+(12095 → 11987) — it is reading the same text, correctly. The wrapper defaults
+to `psm 1`; `ALTO_OCR_PSM` overrides it.
+
+Note OSD fixes the *text* but not the ALTO *geometry*: a rotated page's word
+boxes stay taller-than-wide, so the review GUI draws vertical boxes over
+horizontal text. The transcript is right and clicking is awkward. The real fix
+is upstream — a preservation master should not be sideways, and every
+downstream consumer pays for it, not just OCR.
+
+**Low mean WC does not mean "hard text".** It can equally mean *no* text:
+photographic material scores badly because the engine finds noise. One object
+of postcards scored 0.587 and tripped the tool's "handwriting candidate"
+hint, where the correct action was to not OCR it at all. Check words-per-page
+before acting on a low score — 36 words on a full page is a photograph, not a
+handwriting problem.
+
+## 6. Host suitability
 
 WSL2 is fine for building and evaluating, and unfit for shared use:
 
@@ -150,7 +183,7 @@ The moment a second person needs a browser on the instance, it needs a real
 VM. Nothing else in this document changes when it moves — the fixes above
 apply unaltered.
 
-## 6. The OCR bridge
+## 7. The OCR bridge
 
 See `README.md` in this directory. Host requirements it adds:
 

@@ -44,6 +44,13 @@ APP_DIR="${ALTO_OCR_APP_DIR:-/home/schipp0/alto-ocr}"
 VENV_PYTHON="${APP_DIR}/venv/bin/python"
 ENGINE="${ALTO_OCR_ENGINE:-tesseract}"
 OCR_LANG="${ALTO_OCR_LANG:-eng}"
+# psm 1, not Tesseract's psm 3 default: both do fully automatic page
+# segmentation, but only psm 1 runs orientation and script detection. A
+# sideways master TIFF read under psm 3 produces vertically-stacked garbage at
+# WC 0.00 with no hint that orientation was the problem. Measured over one
+# 54-page object of typed reports: mean WC 0.869 -> 0.922 and low-confidence
+# words 1199 -> 489, i.e. every page gained, not just the rotated one.
+PSM="${ALTO_OCR_PSM:-1}"
 LOG_DIR="${ALTO_OCR_LOG_DIR:-/opt/digiverso/logs}"
 # Extra flags, e.g. ALTO_OCR_EXTRA_ARGS="--psm 4 --binarize"
 read -r -a EXTRA_ARGS <<< "${ALTO_OCR_EXTRA_ARGS:-}"
@@ -58,6 +65,14 @@ fi
 
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/alto_ocr_${PROCESS_ID}.log"
+# Goobi runs this as tomcat; operators re-run it by hand as themselves. The
+# per-process log is shared, so whoever creates it must not lock the other
+# out -- a 0644 tomcat-owned log makes every later manual run die on
+# "Permission denied" before it can report anything.
+if [[ ! -e "${LOG_FILE}" ]]; then
+    : > "${LOG_FILE}" 2>/dev/null || true
+fi
+chmod g+w "${LOG_FILE}" 2>/dev/null || true
 
 # fd 3 = the real stdout, which Goobi captures into the process journal.
 # Everything else -- including stderr -- goes to the log file only.
@@ -76,7 +91,7 @@ echo "[$(log_ts)] process id    : ${PROCESS_ID}"
 echo "[$(log_ts)] process title : ${PROCESS_TITLE}"
 echo "[$(log_ts)] input images  : ${TIFF_DIR}"
 echo "[$(log_ts)] ocr base      : ${OCR_BASE}"
-echo "[$(log_ts)] engine        : ${ENGINE} (lang ${OCR_LANG})"
+echo "[$(log_ts)] engine        : ${ENGINE} (lang ${OCR_LANG}, psm ${PSM})"
 
 # Unreplaced Goobi variables are the classic misconfiguration: a token that
 # still looks like {tifffolder} means the name is not one Goobi knows.
@@ -112,6 +127,7 @@ set +e
     --ref-id "${PROCESS_TITLE}" \
     --engine "${ENGINE}" \
     --ocr-lang "${OCR_LANG}" \
+    --psm "${PSM}" \
     --summary-json "${SUMMARY_JSON}" \
     ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
 EXIT_CODE=$?
