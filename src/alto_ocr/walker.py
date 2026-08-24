@@ -243,7 +243,29 @@ def _check_stem_collisions(
     return collisions
 
 
-def discover_ref_id(ref_id_dir: Path) -> RefIdInputs | SkippedRefId | None:
+def validate_ref_id(value: str) -> str:
+    """Return an explicit Ref ID unchanged, or raise ``ValueError``.
+
+    A Ref ID becomes an output directory name and the METS filename, so it
+    has to be one usable path component. Surrounding whitespace is rejected
+    rather than trimmed: an object silently filed under a name the caller
+    didn't type is worse than a hard error.
+    """
+    if not value or value.strip() != value:
+        raise ValueError(
+            f"{value!r} must be non-empty and carry no leading/trailing whitespace")
+    if value in (".", ".."):
+        raise ValueError(f"{value!r} is not a usable directory name")
+    for char in ("/", "\\", "\0"):
+        if char in value:
+            raise ValueError(
+                f"{value!r} must be a single path component (contains {char!r})")
+    return value
+
+
+def discover_ref_id(
+    ref_id_dir: Path, *, ref_id: str | None = None,
+) -> RefIdInputs | SkippedRefId | None:
     """Build a RefIdInputs for a single Ref ID directory.
 
     Returns ``None`` when the directory holds no images/PDFs at all (not an
@@ -251,24 +273,33 @@ def discover_ref_id(ref_id_dir: Path) -> RefIdInputs | SkippedRefId | None:
     pages but output-stem collisions would corrupt its ALTO/Text outputs.
     Callers must surface a ``SkippedRefId`` in their summary and exit code —
     an object with real pages must never silently vanish from a run.
+
+    ``ref_id`` overrides the identifier otherwise taken from ``ref_id_dir``'s
+    *resolved* basename — for callers whose input folder is named for its
+    role rather than the object, e.g. Goobi workflow hands us
+    ``images/<title>_media`` when the Ref ID is ``<title>``. The override
+    steers the output directory name, the METS OBJID/LABEL and the log
+    labels; it never changes which files are discovered. Raises
+    ``ValueError`` when it isn't a usable path component.
     """
     ref_id_dir = ref_id_dir.resolve()
+    name = ref_id_dir.name if ref_id is None else validate_ref_id(ref_id)
     sources = _find_sources_in(ref_id_dir)
     if not sources:
         return None
-    collisions = _check_stem_collisions(ref_id_dir.name, sources)
+    collisions = _check_stem_collisions(name, sources)
     if collisions:
         stems = sorted({stem for stem, _prior, _this in collisions})
         preview = ", ".join(repr(s) for s in stems[:3]) + (", …" if len(stems) > 3 else "")
         return SkippedRefId(
-            ref_id=ref_id_dir.name,
+            ref_id=name,
             page_count=sum(s.page_count for s in sources),
             reason=(f"output-stem collision on {len(stems)} stem(s) ({preview}) — "
                     "two sources would overwrite each other's ALTO/TXT outputs; "
                     "rename at the source and re-run. Object NOT processed."),
         )
     return RefIdInputs(
-        ref_id=ref_id_dir.name,
+        ref_id=name,
         source_dir=ref_id_dir,
         sources=tuple(sources),
     )

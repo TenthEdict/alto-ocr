@@ -102,6 +102,8 @@ The reference spec is in `instructions.txt`. Layouts observed in practice:
 - **Nested several levels**: TIFs split across sub-folders, possibly grouped by year/document (e.g., `UA00058_17072/1927/UA58i19270613SM/*.tif`).
 - **Mixed PDF + TIF**: PDFs and TIFs intermingled at any depth. The walker treats them as a single Ref ID; each PDF expands to N pages via rasterization.
 
+The Ref ID is the input folder's **resolved** basename (symlinks don't carry identity), which assumes the folder is named for the object. `process --ref-id <id>` overrides it for callers where that doesn't hold — Goobi workflow hands us `images/<processtitle>_media`, so without the override every output folder and METS OBJID would carry a `_media` suffix. The override steers identity only (output folder name, METS OBJID/LABEL, log labels), never discovery, and is rejected up front unless it's one usable path component — it becomes a directory name and the METS filename, so `..` or a separator would plant output outside the root. `batch` has no equivalent: there, one Ref ID per subdirectory is the whole point. Locked by `tests/test_ref_id_override.py` (2026-08-24).
+
 The walker does a recursive scan with `os.walk` (one `scandir` per directory, no per-file stat — important on SMB-mounted network drives where per-file stats can turn a 30-second scan into 30 minutes). It accepts `.tif`/`.tiff`/`.pdf` case-insensitively, filters Windows junk (`Thumbs.db` and variants), and **sorts pages deterministically** by relative-path components. Natural sort on each component so `Page 2` comes before `Page 10` and meeting `19270104` sorts before `19270613`. If a source has no clear page-number signal, the natural-sort fallback is lexicographic on the full name; spot-check the order in the log. An object dropped at discovery for **output-stem collisions** comes back as a `SkippedRefId` and surfaces in `process`/`batch`/GUI summaries as a failed red row with a nonzero exit code (2026-07-30; previously a warning-only silent skip) — "no images at all" stays a plain non-object skip, since collections legitimately contain non-object folders.
 
 ## OCR engine
@@ -164,6 +166,9 @@ Required runtime deps for the new module: `typer`, `rich`, `tqdm`, `lxml` (METS 
 ```
 # Single object (Tesseract is the default engine; ALTO gains WC/PC confidences)
 python -m src.alto_ocr.main process <object_dir> <output_root>
+
+# Single object whose folder isn't named for the object (Goobi's "<title>_media")
+python -m src.alto_ocr.main process <object_dir> <output_root> --ref-id MSP00074_14698
 
 # All objects in a collection directory
 python -m src.alto_ocr.main batch <collection_dir> <output_root> --workers 4

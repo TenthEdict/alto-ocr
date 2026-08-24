@@ -301,6 +301,13 @@ SummaryOpt = typer.Option(None, "--summary-json",
                           help="Write a machine-readable summary to this path.")
 
 
+# `process` only: `batch` takes one Ref ID per subdirectory, so a single
+# override would be meaningless there.
+RefIdOpt = typer.Option(None, "--ref-id",
+                        help="Ref ID for this object, overriding the input folder's name. "
+                             "Steers the output folder, the METS OBJID/LABEL and log labels.")
+
+
 # ---------- Commands ------------------------------------------------------------
 
 @app.command()
@@ -308,6 +315,7 @@ def process(
     object_dir: Path = typer.Argument(..., exists=True, file_okay=False, dir_okay=True,
                                       help="One Ref ID directory containing TIFs (at any nesting depth)."),
     output_root: Path = typer.Argument(..., help="Output root; <output_root>/<RefID>/ will be created."),
+    ref_id: Optional[str] = RefIdOpt,
     engine: str = EngineOpt,
     tesseract_path: Optional[Path] = TesseractOpt,
     glmocr_endpoint: Optional[str] = GLMOCREndpointOpt,
@@ -334,7 +342,11 @@ def process(
     """Process one Ref ID."""
     _setup_logging(verbose)
 
-    found = discover_ref_id(object_dir)
+    try:
+        found = discover_ref_id(object_dir, ref_id=ref_id)
+    except ValueError as e:
+        console.print(f"[red]--ref-id[/red] {e}")
+        raise typer.Exit(code=2) from e
     if found is None:
         console.print(f"[red]No TIFs or PDFs found in {object_dir}[/red]")
         raise typer.Exit(code=1)
