@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import stat
 import sys
 import tempfile
 import time
@@ -88,6 +89,34 @@ def force_utf8_output() -> None:
             pass
 
 
+# Probed once, at import, while the process is still single-threaded: reading
+# the umask means temporarily setting it, which would be a race if two threads
+# (or a forked pool worker mid-run) did it concurrently. On Windows umask is
+# effectively 0 and chmod only toggles the read-only bit, so this is a no-op
+# there.
+_UMASK = os.umask(0o022)
+os.umask(_UMASK)
+
+
+def _target_mode(path: Path) -> int:
+    """The mode an atomic write should leave on ``path``.
+
+    ``tempfile.mkstemp`` hard-codes 0600 and ``os.replace`` preserves the temp
+    file's mode, so without this every atomically-written file comes out
+    private to the writing user. That breaks any workflow where one account
+    produces output and another consumes it — Goobi workflow runs the pipeline
+    as ``tomcat`` while correctors open the same ALTO as themselves.
+
+    An existing destination keeps its own mode, so a deliberate ``chmod`` on
+    output survives a re-run. Otherwise fall back to what an ordinary
+    ``open(path, "w")`` would have produced under this process's umask.
+    """
+    try:
+        return stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        return 0o666 & ~_UMASK
+
+
 def atomic_write_bytes(path: Path | str, data: bytes) -> None:
     """Write ``data`` to ``path`` atomically (temp file + ``os.replace``).
 
@@ -102,6 +131,7 @@ def atomic_write_bytes(path: Path | str, data: bytes) -> None:
     SMB shares it intermittently fails with a transient access-denied.
     """
     path = Path(path)
+    mode = _target_mode(path)
     fd, tmp_name = tempfile.mkstemp(
         dir=path.parent, prefix=f".{path.name}.", suffix=".tmp",
     )
@@ -113,6 +143,14 @@ def atomic_write_bytes(path: Path | str, data: bytes) -> None:
                 os.fsync(f.fileno())
             except OSError:
                 pass  # best effort — some network filesystems refuse fsync
+        # Before the rename, so the file is never briefly visible at the
+        # destination with the wrong mode. Best effort: a filesystem that
+        # refuses chmod (some SMB/NFS mounts) must not fail the write.
+        try:
+            os.chmod(tmp_name, mode)
+        except OSError:
+            logger.debug("chmod %o failed on %s; leaving mkstemp's mode",
+                         mode, tmp_name)
         _replace_with_retry(tmp_name, path)
     except BaseException:
         try:
