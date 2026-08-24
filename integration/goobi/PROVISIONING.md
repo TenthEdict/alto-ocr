@@ -134,6 +134,22 @@ Not documented anywhere obvious, and each one presents as a dead end:
   only creates it when `useOrigFolder` is false, and it defaults true — so
   `_master` appears and `_media`, which `{tifpath}` points at, does not.
   Either create it per process, or point the script at `{origpath}`.
+- **An automatic order-1 step always fires before images can exist.**
+  Process creation queues every task that is Open *and* automatic
+  immediately (`ProzesskopieForm` starts a `ScriptThreadWithoutHibernate`
+  per such step), and `_master` is created empty in that same instant —
+  images copied in afterward can never win the race. Observed: the OCR step
+  fired at creation, failed with *"No TIFs or PDFs found"*, landed in ERROR
+  (which also sends an error mail where mail is configured), and needed a
+  manual retry — strictly worse than not being automatic. Automation is
+  only sound from order 2 onward: make image delivery a real manual order-1
+  task ("Image import" — whoever copies the scans closes it), with OCR
+  automatic at order 2. Closing step N is what opens and queues step N+1,
+  so OCR then fires exactly when images are guaranteed present, and the
+  workflow gains an audit trail of who delivered images and when. (Exit
+  codes 98/99 from a step script are the softer tool here: Goobi neither
+  closes nor errors the step on those — but nothing re-fires it either, so
+  they complement the import step rather than replace it.)
 
 ## 5. OCR settings that matter more than they look
 
