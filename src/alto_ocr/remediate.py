@@ -78,8 +78,8 @@ from .alto_format import (
     reorder_attrs,
     serialize_with_tabs,
 )
-from .mets import METS_NS, PageEntry, build_mets, write_mets
-from .walker import IMAGE_SUFFIXES, natural_key
+from .mets import METS_NS, XLINK_NS, PageEntry, _checksum_md5, build_mets, write_mets
+from .walker import IMAGE_SUFFIXES, natural_chunks, natural_key
 
 logger = logging.getLogger(__name__)
 
@@ -850,6 +850,9 @@ class RepackageResult:
     txt_written: int          # transcripts created or updated (identical files untouched)
     mets_written: bool
     problems: list[str] = field(default_factory=list)
+    # Stems found changed outside this tool and stamped as reviewed, so the
+    # re-OCR guard keeps protecting them after the METS is refreshed.
+    externally_edited: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -863,6 +866,94 @@ def iter_object_dirs(output_root: Path) -> list[Path]:
         return [output_root]
     return [d for d in sorted(output_root.iterdir())
             if d.is_dir() and (d / "ALTO").is_dir()]
+
+
+def mets_alto_checksums(mets_path: Path) -> dict[str, str]:
+    """``{stem: MD5}`` for the ALTO files an existing METS records.
+
+    The METS is the pipeline's own record of the bytes it last packaged, so
+    it doubles as a fingerprint store — no extra state to keep in sync.
+    Empty when the METS is unreadable, absent, or was written with
+    ``--no-checksums`` (nothing to compare against).
+    """
+    try:
+        root = etree.parse(str(mets_path), hardened_parser()).getroot()
+    except (OSError, etree.XMLSyntaxError) as e:
+        logger.debug("Could not read METS %s for checksums (%s)", mets_path, e)
+        return {}
+    out: dict[str, str] = {}
+    for file_el in root.iter(f"{{{METS_NS}}}file"):
+        cksum = file_el.get("CHECKSUM")
+        if not cksum:
+            continue
+        for flocat in file_el.iter(f"{{{METS_NS}}}FLocat"):
+            href = flocat.get(f"{{{XLINK_NS}}}href", "")
+            if href.startswith("ALTO/") and href.endswith(".xml"):
+                out[Path(href).stem] = cksum.lower()
+    return out
+
+
+def pages_edited_since_mets(object_dir: Path) -> list[str]:
+    """Stems whose ALTO on disk no longer matches the METS's recorded MD5.
+
+    These are pages some *other* tool corrected — Goobi workflow's built-in
+    ALTO editor, eScriptorium, a hand-edit. Such edits carry no
+    ``<Processing ID="review">`` (Goobi's ``AltoSaver`` writes ``CONTENT``
+    and nothing else), so provenance alone cannot see them and a re-run
+    would destroy human work silently.
+
+    Returns ``[]`` when there is no METS or it carries no checksums — the
+    detection is only as good as the fingerprint, and a run that opted out
+    of METS or checksums has none. Provenance remains the primary signal;
+    this is the safety net under it.
+    """
+    object_dir = Path(object_dir)
+    recorded = mets_alto_checksums(object_dir / f"{object_dir.name}.mets.xml")
+    if not recorded:
+        return []
+    alto_dir = object_dir / "ALTO"
+    edited = []
+    for stem, want in recorded.items():
+        current = _checksum_md5(alto_dir / f"{stem}.xml")
+        if current is not None and current.lower() != want:
+            edited.append(stem)
+    return sorted(edited, key=natural_chunks)
+
+
+def stamp_external_review(alto_path: Path) -> bool:
+    """Record that *something outside this tool* corrected ``alto_path``.
+
+    Called by ``repackage_object`` for pages whose bytes drifted from the
+    METS. Without this the protection would be temporary: repackage
+    refreshes the METS checksums, the drift disappears, and the next
+    re-run overwrites the edit. Stamping converts a transient
+    byte-difference into the durable signal the guard already understands.
+
+    Returns True when a stamp was written. Pages that already carry review
+    provenance are left alone — our own GUI's record is more specific than
+    anything inferrable here.
+    """
+    try:
+        tree = etree.parse(str(alto_path), hardened_parser(remove_blank_text=True))
+    except (OSError, etree.XMLSyntaxError):
+        return False
+    root = tree.getroot()
+    ns = alto_namespace(root)
+    desc = root.find(f"./{qname(ns, 'Description')}")
+    if desc is None:
+        return False  # non-institution ALTO; don't invent structure
+    for el in desc.findall(qname(ns, "Processing")):
+        if el.get("ID") == "review":
+            return False
+    proc = etree.SubElement(desc, qname(ns, "Processing"), {"ID": "review"})
+    etree.SubElement(proc, qname(ns, "processingDateTime")).text = (
+        datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    etree.SubElement(proc, qname(ns, "processingAgency")).text = "alto_ocr"
+    etree.SubElement(proc, qname(ns, "processingStepDescription")).text = (
+        "external edit: ALTO changed outside this tool (detected by METS "
+        "checksum drift); word count unknown")
+    serialize_with_tabs(tree, alto_path)
+    return True
 
 
 def _mets_page_order(mets_path: Path) -> list[str] | None:
@@ -931,6 +1022,16 @@ def repackage_object(
     if not stems:
         result.problems.append("no ALTO pages found")
         return result
+
+    # Detect drift BEFORE the METS is rebuilt: refreshing its checksums
+    # erases the only evidence an external editor leaves, so the transient
+    # byte-difference has to become a durable stamp here or protection is
+    # lost the moment this function finishes.
+    for stem in pages_edited_since_mets(object_dir):
+        if stamp_external_review(alto_dir / f"{stem}.xml"):
+            result.externally_edited.append(stem)
+            logger.info("[%s] %s changed outside this tool — stamped as reviewed",
+                        result.ref_id, stem)
 
     text_dir = object_dir / "Text"
     has_text = text_dir.is_dir()

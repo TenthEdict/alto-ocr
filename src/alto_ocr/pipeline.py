@@ -33,7 +33,7 @@ from xml.sax.saxutils import escape as xml_escape
 from ._util import atomic_write_text
 from .mets import PageEntry, build_mets, write_mets
 from .ocr import OCREngine
-from .remediate import has_review_provenance
+from .remediate import has_review_provenance, pages_edited_since_mets
 from .pdf import rasterize_pdf
 from .preprocess import PreprocessConfig, preprocess
 from .walker import RefIdInputs, SkippedRefId, rel_natural_key
@@ -306,17 +306,28 @@ def process_ref_id(
     alto_dir = out_dir / "ALTO"
     text_dir = out_dir / "Text"
 
-    # Review-provenance guard: never silently overwrite pages a human has
-    # corrected. Cost on a fresh run is zero (no existing ALTO dir).
+    # Correction guard: never silently overwrite pages a human has worked on.
+    # Two signals, because not every editor leaves provenance — Goobi
+    # workflow's built-in ALTO editor writes CONTENT and nothing else, so
+    # METS checksum drift is the only trace such an edit leaves. Cost on a
+    # fresh run is zero (no existing ALTO dir).
     if not force_reocr and alto_dir.is_dir():
-        reviewed = [p.stem for p in sorted(alto_dir.glob("*.xml"))
-                    if has_review_provenance(p)]
+        stamped = [p.stem for p in sorted(alto_dir.glob("*.xml"))
+                   if has_review_provenance(p)]
+        drifted = [s for s in pages_edited_since_mets(out_dir) if s not in stamped]
+        reviewed = stamped + drifted
         if reviewed:
             preview = ", ".join(reviewed[:3]) + (", …" if len(reviewed) > 3 else "")
-            msg = (f"{len(reviewed)} already-reviewed page(s) in the existing "
-                   f"output ({preview}) — refusing to overwrite human "
-                   f"corrections. Re-run with --force-reocr to discard them, "
-                   f"or move {out_dir} aside first.")
+            how = []
+            if stamped:
+                how.append(f"{len(stamped)} with review provenance")
+            if drifted:
+                how.append(f"{len(drifted)} changed outside this tool "
+                           "(METS checksum drift)")
+            msg = (f"{len(reviewed)} corrected page(s) in the existing output "
+                   f"({preview}; {', '.join(how)}) — refusing to overwrite "
+                   f"human corrections. Re-run with --force-reocr to discard "
+                   f"them, or move {out_dir} aside first.")
             logger.error("[%s] %s", inputs.ref_id, msg)
             guarded = RefIdResult(
                 ref_id=inputs.ref_id, output_dir=out_dir,
