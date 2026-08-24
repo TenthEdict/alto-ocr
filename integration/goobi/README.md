@@ -10,6 +10,13 @@ workflow 26.06.1** on Ubuntu 24.04 / Tomcat 10 / OpenJDK 17.
 | `goobi_scripts.xml` | `/opt/digiverso/goobi/config/goobi_scripts.xml` |
 | `install.sh` | — (puts the other two in place) |
 | `PROVISIONING.md` | — (host build notes: what Goobi's own installer gets wrong) |
+| `import_images.sh` | `/opt/digiverso/goobi/scripts/import_images.sh` |
+| `export_template.sh` | — (dumps a process template as re-importable SQL) |
+
+> Adding a script here: this repo has `core.fileMode false`, so `chmod +x`
+> is invisible to git. Set the bit in the index explicitly, or the committed
+> copy cannot be executed:
+> `git update-index --chmod=+x integration/goobi/your_script.sh`
 
 These live here because they are the only artifacts that encode how the two
 systems join. Reconstructing them from memory on a new host means
