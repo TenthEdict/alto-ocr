@@ -9,6 +9,7 @@ workflow 26.06.1** on Ubuntu 24.04 / Tomcat 10 / OpenJDK 17.
 | `run_alto_ocr.sh` | `/opt/digiverso/goobi/scripts/run_alto_ocr.sh` |
 | `goobi_scripts.xml` | `/opt/digiverso/goobi/config/goobi_scripts.xml` |
 | `install.sh` | — (puts the other two in place) |
+| `PROVISIONING.md` | — (host build notes: what Goobi's own installer gets wrong) |
 
 These live here because they are the only artifacts that encode how the two
 systems join. Reconstructing them from memory on a new host means
@@ -28,7 +29,12 @@ Goobi's sample entries (Tiff-Header, Copy images, Compression) are dropped on
 purpose. Merge by hand on a host that has its own entries.
 
 Requires the pipeline's venv at `<app-dir>/venv`, Tesseract on `PATH`, and
-`--ref-id` support in the CLI (v0.8.15+).
+`--ref-id` support in the CLI (v0.8.15+). The venv must be readable *and
+executable by the `tomcat` user* — verify with `sudo -u tomcat`, not as
+yourself.
+
+Building the Goobi host itself is a separate problem with its own set of
+undocumented traps: see [PROVISIONING.md](PROVISIONING.md).
 
 ## Task configuration in Goobi
 
