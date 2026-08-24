@@ -50,6 +50,8 @@ fi
 
 install -o "$GOOBI_USER" -g "$GOOBI_USER" -m 755 \
     "$SRC_DIR/run_alto_ocr.sh" "$GOOBI_ROOT/scripts/run_alto_ocr.sh"
+install -o "$GOOBI_USER" -g "$GOOBI_USER" -m 755 \
+    "$SRC_DIR/import_images.sh" "$GOOBI_ROOT/scripts/import_images.sh"
 install -o "$GOOBI_USER" -g "$GOOBI_USER" -m 644 \
     "$SRC_DIR/goobi_scripts.xml" "$GOOBI_ROOT/config/goobi_scripts.xml"
 
@@ -60,6 +62,7 @@ LOG_DIR="$(dirname -- "$GOOBI_ROOT")/logs"
 
 echo "installed:"
 echo "  $GOOBI_ROOT/scripts/run_alto_ocr.sh"
+echo "  $GOOBI_ROOT/scripts/import_images.sh"
 echo "  $GOOBI_ROOT/config/goobi_scripts.xml"
 if [ "$APP_DIR" != "/home/schipp0/alto-ocr" ]; then
     echo

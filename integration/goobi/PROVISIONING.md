@@ -163,11 +163,17 @@ than something to keep in parallel.
 | 0. Create processes from Ref-IDs | `plugin-import-excel` — mass-creates processes from spreadsheet rows | not installed |
 | 1. Capture | manual task; images arrive by upload or direct export (below) | ready |
 | 2. QC1 (+ image count) | manual task; Goobi counts images itself (`sortHelperImages`) — do not re-enter counts by hand | ready |
-| 3. Post-Process | manual task; Capture One re-exports over the same path | ready |
-| 4. QC2 (view images in Goobi) | `plugin-step-imageqa` — browser image inspection inside the task | **installed + configured** |
-| 5. OCR + transcript correction | automatic script step (this bridge) + correction in either GUI | ready |
-| 6. Review to Upload | manual task + script/export step copying `alto_ocr/<RefID>/` to the LibNova ingest point | small variant of this bridge |
-| 7. ReviewToRemove (~1 month) | `plugin-step-delay` — holds a step N days, then auto-closes into a cleanup step | not installed |
+| 3. Post-Process | manual check-off; the work itself happens in Capture One | ready |
+| 4. Import images | **automatic** script step — `import_images.sh`, share → `_master` | ready |
+| 5. QC2 (view images in Goobi) | `plugin-step-imageqa` — browser image inspection inside the task | **installed + configured** |
+| 6. OCR | automatic script step (this bridge) | ready |
+| 7. Transcript correction | Goobi's ALTO editor and/or this tool's review GUI | ready |
+| 8. Review to Upload | manual task + script/export step copying `alto_ocr/<RefID>/` to the LibNova ingest point | small variant of this bridge |
+| 9. ReviewToRemove (~1 month) | `plugin-step-delay` — holds a step N days, then auto-closes into a cleanup step | not installed |
+
+OCR is split from correction because an automatic step needs a clean close
+boundary — one task cannot both run unattended and be a human review.
+
 
 **Automation is only sound from order 2 onward** — see the create-time race
 above. Stage 1 must be a manual task precisely so that closing it is what
@@ -175,7 +181,30 @@ releases OCR.
 
 ### Image import without a terminal
 
-Two production paths; copying files by hand is neither.
+Three paths; copying files by hand is none of them.
+
+**Automatic script step (`import_images.sh`) — the primary path.** The share
+stages post-processed objects one folder per Ref ID under
+`04_ImportImages/<RefID>/`, and the process title *is* the Ref ID, so the
+step needs no arguments beyond what Goobi already substitutes. Registered as
+*Import Images* in `goobi_scripts.xml`; `GOOBI_IMPORT_ROOT` overrides the
+share path. Measured: 30 pages / 1.4 GB in 1m39s over SMB.
+
+Design points worth keeping if it is ever rewritten:
+
+- **rsync `--checksum`, not size-and-time.** SMB timestamps are unreliable
+  enough that a truncated earlier transfer can look complete by size and
+  mtime alone. These are preservation copies; pay the read.
+- **Copies, never moves.** The share's own `09_ReviewToRemove` stage is where
+  deletion belongs. Moving here would destroy the only copy before anyone
+  has reviewed the results.
+- **An empty import root is treated as "share not mounted", not "no images".**
+  The two are indistinguishable to `ls`, and importing zero files
+  "successfully" would send an empty object on to QC2 and OCR.
+- **Nested page files are refused, not flattened.** Goobi lists the master
+  folder flat, so a page in a subfolder is invisible to QC2 and the metadata
+  editor — but flattening could silently collide two pages sharing a filename
+  in different subfolders. Fail and let a human decide.
 
 **Browser upload.** `plugin-step-file-upload` is installed and its shipped
 config already has a catch-all block (any project, any step, TIFF/JP2/PDF

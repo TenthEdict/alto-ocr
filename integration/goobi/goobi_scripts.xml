@@ -1,6 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <scripts>
     <script>
+        <name>Import Images</name>
+        <command>/opt/digiverso/goobi/scripts/import_images.sh {processid} "{processtitle}" {origpath}</command>
+        <suppressLogging>false</suppressLogging>
+    </script>
+    <script>
         <name>ALTO-OCR Processing</name>
         <command>/opt/digiverso/goobi/scripts/run_alto_ocr.sh {processid} "{processtitle}" {origpath} {ocrbasispath}</command>
         <suppressLogging>false</suppressLogging>
