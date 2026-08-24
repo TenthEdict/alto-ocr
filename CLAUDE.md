@@ -161,6 +161,12 @@ Generating the files works; correcting the transcripts is the bottleneck. The fi
 
 Required runtime deps for the new module: `typer`, `rich`, `tqdm`, `lxml` (METS XML), `Pillow` (TIF I/O + DPI metadata), `opencv-python-headless` (preprocessing), `numpy` (transitive via OpenCV but pin explicitly), `pypdfium2` (PDF rasterization). Tesseract is a system dep, not a Python one.
 
+## Goobi workflow integration
+
+`integration/goobi/` holds the bridge that runs this pipeline as an automatic script step in [Goobi workflow](https://docs.goobi.io/en/home) — the wrapper script, the `goobi_scripts.xml` registration, an idempotent installer, and a README recording the four Goobi constraints that shape the wrapper (unknown `{variables}` pass through verbatim; *any* stderr output marks the step failed even on exit 0; quoted args are safe because there's no shell; OCR output must land in `{processtitle}_alto` / `_txt`). Read that README before touching the wrapper — every constraint was found in the Goobi source, not its docs. Verified against Goobi workflow 26.06.1.
+
+Goobi's folders hold the real ALTO/Text; `ocr/alto_ocr/<RefID>/` is a symlink view onto them so `triage`, `repackage` and the review GUI work unchanged on the same bytes. The wrapper passes `--ref-id {processtitle}` because Goobi's image folder is `<title>_media` (see *Input layout*).
+
 ## Running
 
 ```
