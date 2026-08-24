@@ -16,6 +16,8 @@ Run from the repo root (so ``src.alto_ocr`` resolves):
 
 from __future__ import annotations
 
+import os
+import stat
 import sys
 import tempfile
 import unittest
@@ -87,3 +89,61 @@ class AtomicWriteTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AtomicWriteModeTests(unittest.TestCase):
+    """Atomic writes must not leave files private to the writing user.
+
+    ``tempfile.mkstemp`` hard-codes 0600 and ``os.replace`` preserves the temp
+    file's mode, so every atomically-written file used to come out 0600. That
+    is invisible in a single-user workflow and fatal in a hand-off one: Goobi
+    workflow runs the pipeline as ``tomcat``, and a corrector opening the same
+    ALTO as their own account got EACCES on every page.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+
+    @staticmethod
+    def _mode(path: Path) -> int:
+        return stat.S_IMODE(path.stat().st_mode)
+
+    def _expected_default(self) -> int:
+        umask = os.umask(0o022)
+        os.umask(umask)
+        return 0o666 & ~umask
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX permission semantics")
+    def test_new_file_follows_umask_not_mkstemp(self) -> None:
+        p = self.dir / "new.xml"
+        atomic_write_bytes(p, b"<alto/>")
+        self.assertEqual(self._mode(p), self._expected_default())
+        self.assertNotEqual(self._mode(p), 0o600,
+                            "mkstemp's private mode must not survive the rename")
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX permission semantics")
+    def test_text_writes_too(self) -> None:
+        p = self.dir / "new.txt"
+        atomic_write_text(p, "transcript\n")
+        self.assertEqual(self._mode(p), self._expected_default())
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX permission semantics")
+    def test_existing_mode_is_preserved(self) -> None:
+        # A deliberate chmod on output must survive a re-run, in either
+        # direction — group-writable for a shared review folder, or tightened.
+        for mode in (0o664, 0o600, 0o640):
+            with self.subTest(mode=oct(mode)):
+                p = self.dir / f"existing_{mode:o}.xml"
+                p.write_bytes(b"old")
+                os.chmod(p, mode)
+                atomic_write_bytes(p, b"new")
+                self.assertEqual(self._mode(p), mode)
+                self.assertEqual(p.read_bytes(), b"new")
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX permission semantics")
+    def test_no_temp_files_left_behind(self) -> None:
+        p = self.dir / "page.xml"
+        atomic_write_bytes(p, b"<alto/>")
+        self.assertEqual([q.name for q in self.dir.iterdir()], ["page.xml"])
