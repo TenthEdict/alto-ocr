@@ -77,14 +77,47 @@ for arg in "${DEST_DIR}"; do
     esac
 done
 
-# An unmounted share looks exactly like an empty one to `ls`, and importing
-# zero images "successfully" would send an empty object on to QC2 and OCR.
-# Check the mount point itself before blaming the object.
-[[ -d "${IMPORT_ROOT}" ]] || die "import root does not exist: ${IMPORT_ROOT} (is the share mounted?)"
+# "Not visible from here" has three quite different causes and one symptom, so
+# say which rather than making the reader guess:
+#
+#   1. nothing is mounted there at all;
+#   2. it is mounted, but not in THIS process's mount namespace. Goobi runs
+#      under a systemd unit with PrivateTmp=yes, which gives the service its
+#      own namespace -- a share mounted after Tomcat started is invisible to
+#      it while remaining perfectly visible in a login shell. Mount first,
+#      then (re)start Tomcat;
+#   3. it is mounted and visible, but this user cannot traverse it.
+#
+# Importing zero images "successfully" would send an empty object on to QC2
+# and OCR, so all three are hard failures.
+if [[ ! -d "${IMPORT_ROOT}" ]]; then
+    # Walk up to the deepest ancestor that does exist and describe it. An
+    # EMPTY directory where a share should be is the signature of both cases
+    # worth distinguishing: the share is not mounted, or it is mounted
+    # somewhere this process cannot see. Goobi's systemd unit sets
+    # PrivateTmp=yes, which gives the service its own mount namespace, so a
+    # share mounted after Tomcat started stays invisible to Goobi while a
+    # login shell sees it perfectly. Deliberately probed by walking the path
+    # rather than reading /proc/1/mountinfo, which an unprivileged service
+    # cannot do.
+    probe="${IMPORT_ROOT}"
+    while [[ "${probe}" != "/" && ! -d "${probe}" ]]; do
+        probe="${probe%/*}"
+        [[ -n "${probe}" ]] || probe="/"
+    done
+    if [[ -z "$(ls -A "${probe}" 2>/dev/null)" ]]; then
+        die "import root ${IMPORT_ROOT} not found, and ${probe} exists but is EMPTY -- the share is not mounted as far as this process can see. If it IS mounted in your shell, this process is in a different mount namespace (Goobi's unit sets PrivateTmp=yes): mount the share first, then restart Tomcat."
+    fi
+    die "import root ${IMPORT_ROOT} not found -- deepest existing ancestor is ${probe}. Check the path, or set GOOBI_IMPORT_ROOT."
+fi
+if ! ls -A "${IMPORT_ROOT}" >/dev/null 2>&1; then
+    die "import root ${IMPORT_ROOT} exists but $(id -un) cannot read it -- check mount options (a uid=/gid= mount can exclude the tomcat user) and directory permissions"
+fi
 if [[ -z "$(ls -A "${IMPORT_ROOT}" 2>/dev/null)" ]]; then
-    die "import root ${IMPORT_ROOT} is empty -- the share is probably not mounted"
+    die "import root ${IMPORT_ROOT} is mounted and readable but empty -- nothing staged, or a stub directory is shadowing the share"
 fi
 [[ -d "${SRC_DIR}" ]] || die "no staged folder for this object: ${SRC_DIR}"
+[[ -r "${SRC_DIR}" ]] || die "staged folder exists but is not readable by $(id -un): ${SRC_DIR}"
 
 N_SRC=$(find "${SRC_DIR}" -maxdepth 1 -type f \( -iname '*.tif' -o -iname '*.tiff' -o -iname '*.pdf' \) | wc -l)
 N_NESTED=$(find "${SRC_DIR}" -mindepth 2 -type f \( -iname '*.tif' -o -iname '*.tiff' -o -iname '*.pdf' \) | wc -l)

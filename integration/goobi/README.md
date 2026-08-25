@@ -16,7 +16,12 @@ workflow 26.06.1** on Ubuntu 24.04 / Tomcat 10 / OpenJDK 17.
 > Adding a script here: this repo has `core.fileMode false`, so `chmod +x`
 > is invisible to git. Set the bit in the index explicitly, or the committed
 > copy cannot be executed:
+> `chmod +x integration/goobi/your_script.sh && \`
 > `git update-index --chmod=+x integration/goobi/your_script.sh`
+>
+> Both halves are needed: `update-index` sets the mode git records, and
+> `chmod` sets the mode on disk. With `core.fileMode false` neither implies
+> the other, and a checkout will not restore the bit either.
 
 These live here because they are the only artifacts that encode how the two
 systems join. Reconstructing them from memory on a new host means
