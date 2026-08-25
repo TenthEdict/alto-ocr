@@ -59,17 +59,32 @@ stays as it is -- it is this tool's own fixity record, and the re-OCR guard
 uses its checksums to notice corrections made by editors that leave no
 provenance of their own.
 
-Sub-collections: open issue
----------------------------
+Sub-collections: not nesting (settled 2026-08-24)
+-------------------------------------------------
 
-A Ref ID on the share sometimes carries sub-collection folders
-(`<RefID>/1927/...`). They are uncommon -- a handful over a year -- but real.
+"Sub-collections" are SIBLING Ref IDs, not folders inside a Ref ID. A
+collection subdivides by suffixing the Ref ID, and each subdivision is a
+complete object with its pages flat inside it:
 
-Goobi's image folder must be flat, so the import step REFUSES nested input
-rather than flattening it: flattening could silently collide two pages that
-share a filename in different subfolders, and the preservation copies' names
-must not be rewritten. Those objects therefore cannot pass through the
-pipeline yet and need handling by hand.
+    MSS00021 Gaddis, Bertha Kate diaries/preservation-files/preservation/
+        MSS00021_001/MSS00021_001_00001.tif ... (208 pages, flat)
+        MSS00021_002/ ... (216 pages, flat)
+        ... through MSS00021_018
 
-Whether the delivered folder should reconstruct sub-collection paths, or
-whether flattening them is acceptable for delivery, is not yet decided.
+Checked across all 18 Ref IDs of that collection: zero subdirectories, zero
+nested TIFFs, 5,030 pages total. So each sub-collection is simply its own
+Goobi process with its own Ref ID, which is already how the pipeline works --
+no flattening, no subpath map, no reconstruction at delivery.
+
+The import step's refusal of nested input therefore never fires on real data.
+Keep it anyway: it is cheap, and it fails loudly rather than silently
+mangling preservation copies if the convention ever changes.
+
+Page size varies enormously by material and no single figure represents it:
+
+    diaries (MSS00021)           1397x2106   2.9 MP    ~7 MB/page
+    letter-size reports          4698x3798  17.8 MP   ~50 MB/page
+    oversize sheet               12409x4773 59.2 MP  ~177 MB/page
+
+All at 400-500 dpi. Storage and OCR-time estimates must state which material
+they assume.
