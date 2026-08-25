@@ -1,0 +1,8 @@
+# Browser review server (src/alto_ocr/webreview) -- NOT needed for the CLI,
+# the Tk GUI, or the PyInstaller bundle. Kept out of requirements.txt on
+# purpose: the distributed desktop build must not grow a web stack.
+#
+#   pip install -r requirements-web.txt
+#
+fastapi>=0.110.0,<1.0.0
+uvicorn>=0.27.0,<1.0.0

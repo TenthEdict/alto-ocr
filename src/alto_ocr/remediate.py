@@ -178,6 +178,11 @@ class ReviewPage:
             raise StubPageError(f"{self.alto_path.name}: <Page> has no usable dimensions.")
 
         img_w, img_h = image_size
+        # Kept, not just consumed: every box this class hands out is in
+        # image-pixel space, so a consumer that renders them needs the frame
+        # those boxes belong to. The Tk GUI has the PIL image at hand; the
+        # web review server serves geometry as JSON and has nothing to ask.
+        self.image_size = (img_w, img_h)
         self.sx = img_w / page_w
         self.sy = img_h / page_h
 

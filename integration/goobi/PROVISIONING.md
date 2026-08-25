@@ -239,6 +239,66 @@ OCR'd with `--no-mets` or `--no-checksums` has no fingerprint and so no
 protection for Goobi-side edits, and a page corrected in Goobi keeps its
 original confidence, so it still surfaces in the worst-first triage queue.
 
+There is a third problem with Goobi's editor, and it is the disqualifying
+one: **it draws its highlight boxes in the wrong place on this institution's
+ALTO.** `SimpleAlto.java:127-150` reads `HPOS`/`WIDTH` as pixels and never
+looks at `<MeasurementUnit>`. The institution format is `mm10`, so on a
+300 DPI letter scan every box lands 1.968× small toward the top-left — the
+corrector is shown a highlight that is not over the word they are editing.
+Nothing in Goobi's configuration changes this.
+
+### The third editor: a review server beside Goobi (alto_ocr ≥ v0.9.0)
+
+`serve-review` serves the same review workflow as the Tk GUI in a browser,
+reached from a link on the **Transcript Correction** task. It exists because
+the two options above each fail in a different way: Goobi's editor misplaces
+boxes and drops `WC`, and the Tk GUI needs Python, Tk and a display on every
+corrector's workstation.
+
+It is a presentation layer only — every edit goes through the same
+`remediate.py` the Tk GUI and the `repackage` command use — so provenance,
+`WC="1.00"` stamping, `PC` recomputation and transcript regeneration are
+identical whichever UI a page was corrected in. Word geometry is scaled by
+image-size / Page-dimensions the way `alto_parse` does it, which is exactly
+the step Goobi's editor omits, so `mm10` boxes land correctly.
+
+Three files set it up, all in `integration/goobi/`:
+
+| file | what it does |
+| --- | --- |
+| `alto-ocr-review.service` | runs it as `tomcat` (it edits Goobi's own folders), bound to `127.0.0.1:8081` |
+| `apache-ocr-review.conf` | proxies it at `/ocr-review/` under Goobi's own access control |
+| `goobi_processProperties.xml` | puts the clickable link on the correction task |
+
+```
+sudo install -m 644 alto-ocr-review.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now alto-ocr-review
+sudo install -m 644 apache-ocr-review.conf /etc/apache2/conf-available/
+sudo a2enmod proxy proxy_http headers && sudo a2enconf apache-ocr-review
+sudo systemctl reload apache2
+```
+
+**The security note is load-bearing, not boilerplate.** The server can
+rewrite any transcript it can see and authenticates nobody; it binds to
+localhost so that Apache is the only way in. Whatever protects `/goobi` has
+to protect `/ocr-review` — fill in the commented `Auth*` lines in
+`apache-ocr-review.conf` to match Goobi's own vhost before announcing the
+URL to anyone. `--read-only` serves the reviewing UI with saving disabled,
+for a deployment where that is the intent.
+
+**Why the link carries no Ref ID.** Goobi does not variable-replace property
+values (no `VariableReplacer` on the `PropertyParser` or
+`GoobiScriptPropertySet` path), so `{processtitle}` in a property would reach
+the browser verbatim. The link therefore points at the app's own worklist,
+which discovers objects by walking `metadata/<processid>/ocr/alto_ocr/<RefID>/`
+itself. A corrector opens one tab and works a queue sorted worst-first rather
+than returning to Goobi between objects.
+
+**Processes created before the config landed** have no property row and would
+show an empty link. Select them in the process list and run GoobiScript
+`propertySet` once with `name: OCR Transcript Review` and the URL as `value`;
+the header of `goobi_processProperties.xml` has the exact call.
+
 ## 6. OCR settings that matter more than they look
 
 **`--psm 1`, not Tesseract's `psm 3` default.** Both do fully automatic page
