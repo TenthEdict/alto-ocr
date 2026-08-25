@@ -318,7 +318,35 @@ carries no ID risk at all. The dump's real value is as a versioned artifact:
 a workflow definition that can be reviewed in a diff and restored after a
 mistake.
 
-## 8. Host suitability
+## 8. Mounts must exist before Tomcat starts
+
+`tomcat10.service` ships with `PrivateTmp=yes`, which gives the service its own
+mount namespace. A share mounted *after* Tomcat started is therefore invisible
+to Goobi while a login shell sees it perfectly:
+
+```
+tomcat's namespace:   /mnt/wsl  /mnt/wslg  /mnt/c
+a login shell:        /mnt/wsl  /mnt/wslg  /mnt/c  /mnt/l  /mnt/y
+```
+
+Observed live: the image-import step failed with "import root does not exist"
+twice while `ls` on the same path succeeded interactively. `systemctl restart
+tomcat10` after mounting fixes it, and the import step now distinguishes this
+case explicitly instead of blaming the path — it walks up to the deepest
+existing ancestor and reports an *empty* directory where a share should be,
+which is the shared signature of "not mounted" and "mounted in another
+namespace". (It probes by walking the path rather than reading
+`/proc/1/mountinfo`, which an unprivileged service cannot do.)
+
+**On the VM this is a design constraint, not a WSL quirk.** Mount the
+digitization share via `/etc/fstab` with `_netdev`, and add
+`RequiresMountsFor=/path/to/share` to the Tomcat unit as a drop-in under
+`/etc/systemd/system/tomcat10.service.d/`, so systemd orders the two and
+re-establishes them together. Otherwise a network blip that remounts the share
+leaves Goobi unable to see it until someone restarts Tomcat, with no error that
+points at the cause.
+
+## 9. Host suitability
 
 WSL2 is fine for building and evaluating, and unfit for shared use:
 
@@ -333,7 +361,7 @@ The moment a second person needs a browser on the instance, it needs a real
 VM. Nothing else in this document changes when it moves — the fixes above
 apply unaltered.
 
-## 9. The OCR bridge
+## 10. The OCR bridge
 
 See `README.md` in this directory. Host requirements it adds:
 
