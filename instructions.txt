@@ -80,6 +80,69 @@ The import step's refusal of nested input therefore never fires on real data.
 Keep it anyway: it is cheap, and it fails loudly rather than silently
 mangling preservation copies if the convention ever changes.
 
+What a Ref ID is (settled 2026-08-24)
+------------------------------------
+
+    MSP00064_9528
+    ^^^^^^^^ ^^^^
+    |        ArchivesSpace ref_id of the archival object
+    zero-padded collection code
+
+The suffix is NOT a hash or a local serial: it is the `ref_id` of an
+ArchivesSpace archival object, so a Ref ID names exactly "this file or item,
+in this collection". Both forms seen in the wild are ArchivesSpace ref_ids --
+that system changed how it mints them, so records created around 2017 carry
+short numeric ids and ones created from ~2026 carry 32 hex characters:
+
+    MSP00064_9528                                created 2017
+    MSP00064_80f000a0e81be57c49b9daf247a641a8    created 2026
+
+Both are children of the same collection. There is ONE convention, not two.
+
+The prefix maps to the collection code by stripping the zero padding and
+inserting a space -- an exact join, verified against two collections:
+
+    MSP00064  <->  "MSP 64"  Darrell Lemaire papers   LibSafe container 117
+    MSP00084  <->  "MSP 84"  Gary Fisher papers       LibSafe container 116
+
+LibSafe holds one collection per container, and each collection root carries a
+`collection_organization_tree.json` exported from ArchivesSpace:
+
+    title                        the collection folder name in LibSafe
+    key / ead_id / id_0          the collection code, e.g. "MSP 64"
+    children[].metadata.ref_id   every object in the collection
+    children[].metadata.title    the object's archival title
+    children[].metadata.dates    its dates
+
+So the upload destination is DISCOVERED, never constructed:
+
+  1. split the Ref ID on the first underscore
+  2. normalize the prefix to a collection code
+  3. find the tree whose key matches -> container from its path, folder from
+     its `title`
+  4. confirm the ref_id appears among that tree's children
+
+Step 4 is the point. It proves the object belongs to the collection it is
+about to be written into, rather than merely that the prefix parsed. S3 has no
+directories, so a path wrong by one character silently creates a parallel
+collection folder instead of failing -- discovery plus this check is what makes
+that unreachable.
+
+Do NOT derive the destination from folder names. The same collection is titled
+three different ways across systems:
+
+    share folder   MSA00163 Anne M Lutz papers      (no period)
+    LibSafe item   MSA00163 Anne M. Lutz papers     (period, lowercase p)
+    LibSafe path   Anne M. Lutz Papers              (no code, capital P)
+
+Also note `preservation-files/` is present under `digitize-scans/` for some
+collections and absent for others. Discovery reads the shape that collection
+actually uses; there is nothing to standardize first.
+
+The trees also carry per-object titles and dates, which is the natural source
+if the delivered METS should ever carry archival description in a `dmdSec`
+rather than structure alone.
+
 Page size varies enormously by material and no single figure represents it:
 
     diaries (MSS00021)           1397x2106   2.9 MP    ~7 MB/page
