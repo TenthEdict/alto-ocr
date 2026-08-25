@@ -918,5 +918,94 @@ def doctor(
     raise typer.Exit(code=1 if (dep_failed or not (glmocr_ok or tesseract_ok)) else 0)
 
 
+@app.command()
+def serve_review(
+    goobi_metadata_root: Optional[Path] = typer.Option(
+        None, "--goobi-metadata-root",
+        help="Goobi's metadata root (default /opt/digiverso/goobi/metadata when "
+             "no --output-root is given). Objects are found at "
+             "<root>/<processid>/ocr/alto_ocr/<RefID>/."),
+    output_root: Optional[Path] = typer.Option(
+        None, "--output-root", help="A standalone pipeline output root to review."),
+    source_root: Optional[Path] = typer.Option(
+        None, "--source-root",
+        help="Preservation scans for --output-root. Required with it: the scans "
+             "are not in the output tree."),
+    host: str = typer.Option(
+        "127.0.0.1", "--host",
+        help="Bind address. Left at localhost on purpose -- this server writes "
+             "to the archive's ALTO and has no authentication of its own; put "
+             "Apache in front of it."),
+    port: int = typer.Option(8081, "--port"),
+    cache_dir: Optional[Path] = typer.Option(
+        None, "--cache-dir", help="Where rendered page JPEGs are cached."),
+    low_wc: float = typer.Option(
+        DEFAULT_LOW_WC, "--low-wc", help="Words below this WC are flagged for review."),
+    read_only: bool = typer.Option(
+        False, "--read-only", help="Serve the reviewing UI with saving disabled."),
+    verbose: bool = VerboseOpt,
+) -> None:
+    """Serve the browser transcript-review UI (multi-user, no install).
+
+    The same edit semantics as the Tk Review tab -- both are thin layers over
+    ``remediate.py`` -- reachable from a link on the Goobi task instead of
+    needing Python and a display on the corrector's workstation.
+
+    Deploy it behind the same Apache that serves Goobi, under the same access
+    control: it can rewrite any transcript it can see and authenticates
+    nobody, which is why it binds to localhost unless told otherwise.
+    """
+    _setup_logging(verbose)
+    try:
+        from .webreview.app import create_app
+        from .webreview.config import ReviewServerConfig
+    except ImportError as e:
+        console.print(
+            f"[red]FAIL[/red] the review server needs its own dependencies: {e}\n"
+            "       pip install -r requirements-web.txt")
+        raise typer.Exit(code=1) from e
+    try:
+        import uvicorn
+    except ImportError as e:
+        console.print("[red]FAIL[/red] uvicorn is not installed.\n"
+                      "       pip install -r requirements-web.txt")
+        raise typer.Exit(code=1) from e
+
+    kwargs: dict = {
+        "goobi_metadata_root": goobi_metadata_root,
+        "output_root": output_root,
+        "source_root": source_root,
+        "low_wc": low_wc,
+        "read_only": read_only,
+    }
+    if cache_dir is not None:
+        kwargs["cache_dir"] = cache_dir
+    if goobi_metadata_root is None and output_root is None:
+        from .webreview.config import DEFAULT_GOOBI_METADATA_ROOT
+        kwargs["goobi_metadata_root"] = DEFAULT_GOOBI_METADATA_ROOT
+
+    try:
+        config = ReviewServerConfig(**kwargs)
+    except ValueError as e:
+        console.print(f"[red]FAIL[/red] {e}")
+        raise typer.Exit(code=1) from e
+
+    console.print(f"[bold]alto_ocr review server[/bold] → http://{host}:{port}/")
+    if config.goobi_metadata_root:
+        console.print(f"  Goobi metadata root : {config.goobi_metadata_root}")
+    if config.output_root:
+        console.print(f"  output root         : {config.output_root}")
+        console.print(f"  preservation scans  : {config.source_root}")
+    console.print(f"  render cache        : {config.cache_dir}")
+    if read_only:
+        console.print("  [yellow]read-only: corrections cannot be saved[/yellow]")
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        console.print("  [yellow]WARNING[/yellow] bound to a routable address with no "
+                      "authentication — anyone who can reach this port can rewrite "
+                      "transcripts. Proxy it behind Apache instead.")
+
+    uvicorn.run(create_app(config), host=host, port=port, log_level="info")
+
+
 if __name__ == "__main__":
     app()

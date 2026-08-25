@@ -1,0 +1,67 @@
+# Browser transcript-review server, beside Goobi.
+#
+#   sudo install -m 644 alto-ocr-review.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now alto-ocr-review
+#
+# It edits Goobi's own ALTO in place (through the ocr/alto_ocr/<RefID>/
+# symlink view), so it must run as a user that can write those folders --
+# tomcat owns them, hence User=tomcat. Corrections then land on exactly the
+# bytes Goobi serves, with no second copy to reconcile.
+#
+# It authenticates nobody and binds to localhost only. Apache in front of it
+# supplies the access control (see apache-ocr-review.conf); do NOT change
+# --host without putting authentication somewhere.
+
+[Unit]
+Description=ALTO-OCR browser transcript review
+Documentation=file:///home/schipp0/alto-ocr/integration/goobi/README.md
+After=network-online.target
+Wants=network-online.target
+# Goobi's metadata tree may live on a mount. Without this the unit can start
+# before the mount lands and see an empty root -- the same private-mount
+# trap documented in PROVISIONING.md section 8. Add the mount unit name here
+# if /opt/digiverso is not on the root filesystem.
+RequiresMountsFor=/opt/digiverso/goobi/metadata
+
+[Service]
+Type=simple
+User=tomcat
+Group=tomcat
+WorkingDirectory=/home/schipp0/alto-ocr
+Environment=PYTHONPATH=/home/schipp0/alto-ocr/src
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/schipp0/alto-ocr/venv/bin/python -m alto_ocr.main serve-review \
+    --goobi-metadata-root /opt/digiverso/goobi/metadata \
+    --cache-dir /var/cache/alto-ocr-review \
+    --host 127.0.0.1 \
+    --port 8081
+Restart=on-failure
+RestartSec=5
+
+# The render cache is the only thing it writes outside the metadata tree.
+CacheDirectory=alto-ocr-review
+CacheDirectoryMode=0750
+
+# PrivateTmp is deliberately OFF. Goobi's own unit sets it, which is exactly
+# what put Tomcat in a different mount namespace from the operator's shell
+# and made a mounted share invisible to the import script (PROVISIONING.md
+# section 8). Nothing here needs a private /tmp; a private mount namespace
+# would only recreate that trap.
+PrivateTmp=no
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+# ProtectHome=read-only would block writing under /home, but the app only
+# ever writes into the Goobi metadata tree and its cache directory.
+ReadWritePaths=/opt/digiverso/goobi/metadata /var/cache/alto-ocr-review
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=alto-ocr-review
+
+[Install]
+WantedBy=multi-user.target

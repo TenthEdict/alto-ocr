@@ -164,3 +164,83 @@ Both must be zero: a non-empty stderr passes here but fails inside Goobi
 (constraint 2). Run as `tomcat`, not as yourself — the app directory and venv
 have to be readable by the Tomcat user, which is the usual first-install trip
 hazard when the app lives under `/home`.
+
+## The review server (`serve-review`)
+
+A browser front end for transcript correction, linked from the **Transcript
+Correction** task. Same edit semantics as the Tk review GUI — both are thin
+layers over `remediate.py` — so provenance stamping, `WC="1.00"`, `PC`
+recomputation and transcript regeneration are identical whichever UI a page
+was corrected in.
+
+It edits Goobi's own `_alto` / `_txt` folders through the
+`ocr/alto_ocr/<RefID>/` symlink view, so there is no second copy to
+reconcile, and a page corrected here is immediately what Goobi serves.
+
+```sh
+pip install -r requirements-web.txt          # fastapi + uvicorn, web only
+python -m alto_ocr.main serve-review         # → http://127.0.0.1:8081/
+```
+
+Deploy with the three files beside this README:
+
+| file | install to |
+|---|---|
+| `alto-ocr-review.service` | `/etc/systemd/system/` — runs as `tomcat`, binds localhost |
+| `apache-ocr-review.conf` | `/etc/apache2/conf-available/` — proxies `/ocr-review/` |
+| `goobi_processProperties.xml` | merge into `/opt/digiverso/goobi/config/` — the task link |
+
+**Read this before exposing it.** The server rewrites ALTO and authenticates
+nobody. It binds to `127.0.0.1` so Apache is the only route in; fill in the
+commented `Auth*` lines in `apache-ocr-review.conf` to match Goobi's own vhost
+before giving anyone the URL. `--read-only` disables saving entirely.
+
+### Two Goobi facts that shaped it
+
+1. **Goobi renders a process property of type `link` as an anchor** on the
+   task screen (`uii/template/includes/task/box_properties.xhtml`), so the
+   link needs no plugin and no patch. A property with type `html` is rendered
+   with `escape="false"` if a styled button is ever wanted instead.
+2. **Property values are not variable-replaced.** Neither `PropertyParser`
+   nor `GoobiScriptPropertySet` runs a `VariableReplacer`, so `{processtitle}`
+   in a property value reaches the browser verbatim. Hence one constant URL to
+   the app's own worklist, which finds objects by walking
+   `metadata/<processid>/ocr/alto_ocr/<RefID>/` for itself.
+
+### Why not use Goobi's own ALTO editor
+
+It writes `CONTENT` only (`AltoSaver.java:91-94`) — `WC` keeps its engine
+value, so a corrected word never leaves the low-confidence queue — and it
+reads `HPOS`/`WIDTH` as pixels with no `<MeasurementUnit>` handling
+(`SimpleAlto.java:127-150`), so on this institution's `mm10` ALTO every
+highlight box lands 1.968× small toward the top-left of the word it is
+supposed to mark.
+
+### Environment overrides
+
+The systemd unit passes CLI flags, but every knob also reads from the
+environment, so a unit drop-in can change one without rewriting `ExecStart`:
+
+| variable | default | |
+|---|---|---|
+| `ALTO_OCR_REVIEW_GOOBI_ROOT` | `/opt/digiverso/goobi/metadata` | Goobi-managed objects |
+| `ALTO_OCR_REVIEW_OUTPUT_ROOT` | — | standalone output root instead |
+| `ALTO_OCR_REVIEW_SOURCE_ROOT` | — | preservation scans for the above |
+| `ALTO_OCR_REVIEW_CACHE_DIR` | system temp | rendered page JPEGs |
+| `ALTO_OCR_REVIEW_LOW_WC` | `0.50` | flag words below this confidence |
+| `ALTO_OCR_REVIEW_PAGE_PX` | `2400` | full-page render cap (long edge) |
+| `ALTO_OCR_REVIEW_WORKING_PX` | `4000` | cached working-copy cap |
+| `ALTO_OCR_REVIEW_READ_ONLY` | `false` | serve without the save path |
+
+### Keyboard
+
+`n` / `p` next/previous flagged word · `Enter` correct (or confirm, if the
+text is unchanged) and advance · `a` add-word mode · `Esc` close the editor ·
+`Ctrl+S` save.
+
+Corrections accumulate in the browser and post as **one batch per save**: one
+file write, one provenance update, and nothing held server-side, so a closed
+laptop or a restarted service loses only what was not yet saved. The save
+carries a digest of the ALTO it was made against; if another session (or the
+Tk GUI, or an external editor) saved in the meantime, the server answers 409
+and offers to reload or overwrite.

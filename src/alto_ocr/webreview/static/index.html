@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Transcript review — ALTO-OCR</title>
+<link rel="stylesheet" href="static/review.css">
+</head>
+<body>
+
+<header class="bar">
+  <a class="brand" href="#/">Transcript review</a>
+  <nav id="crumbs" class="crumbs"></nav>
+  <span class="spacer"></span>
+  <span id="banner" class="banner" hidden></span>
+  <span id="version" class="muted"></span>
+</header>
+
+<main id="view"></main>
+
+<!-- ============ worklist ============ -->
+<template id="tpl-worklist">
+  <section class="pad">
+    <div class="row">
+      <h1>Objects</h1>
+      <span class="spacer"></span>
+      <input id="filter" type="search" placeholder="Filter by Ref ID…" autocomplete="off">
+      <button id="reload" class="btn">Rescan</button>
+    </div>
+    <p class="muted" id="worklist-note">Loading…</p>
+    <table class="grid" id="worklist" hidden>
+      <thead>
+        <tr>
+          <th>Ref ID</th><th class="num">Pages</th><th class="num">To review</th>
+          <th class="num">Mean PC</th><th class="num">Low-conf words</th>
+          <th>State</th><th></th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</template>
+
+<!-- ============ object: page list ============ -->
+<template id="tpl-object">
+  <section class="pad">
+    <div class="row">
+      <h1 id="obj-title"></h1>
+      <span class="spacer"></span>
+      <label class="check"><input type="checkbox" id="worst-first" checked> Worst first</label>
+      <button id="repackage" class="btn">Repackage</button>
+      <a id="goobi-link" class="btn ghost" hidden target="_blank" rel="noopener">Open in Goobi</a>
+    </div>
+    <p class="muted" id="obj-stats"></p>
+    <table class="grid" id="pages">
+      <thead>
+        <tr><th>Page</th><th>Status</th><th class="num">PC</th>
+            <th class="num">Words</th><th class="num">Low-conf</th><th>Reviewed</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</template>
+
+<!-- ============ page review ============ -->
+<template id="tpl-page">
+  <section class="review">
+    <aside class="sidebar">
+      <div class="side-head">
+        <strong id="side-ref"></strong>
+        <label class="check"><input type="checkbox" id="side-worst" checked> Worst first</label>
+      </div>
+      <ol id="side-pages" class="pagelist"></ol>
+    </aside>
+
+    <div class="canvas-wrap">
+      <div class="toolbar">
+        <button id="prev-flag" class="btn" title="Previous flagged word (p)">‹ Prev</button>
+        <button id="next-flag" class="btn" title="Next flagged word (n)">Next ›</button>
+        <span class="sep"></span>
+        <button id="zoom-out" class="btn" title="Zoom out">−</button>
+        <span id="zoom-label" class="muted mono">fit</span>
+        <button id="zoom-in" class="btn" title="Zoom in">+</button>
+        <button id="zoom-fit" class="btn">Fit</button>
+        <span class="sep"></span>
+        <button id="add-mode" class="btn toggle" title="Add a missed word (a)">+ Add word</button>
+        <button id="clear-page" class="btn danger">Clear page</button>
+        <span class="spacer"></span>
+        <span id="pending" class="pending"></span>
+        <button id="save" class="btn primary" disabled title="Save (Ctrl+S)">Save</button>
+      </div>
+
+      <div id="scroller" class="scroller">
+        <div id="stage" class="stage">
+          <img id="scan" alt="" draggable="false">
+          <svg id="overlay" xmlns="http://www.w3.org/2000/svg"></svg>
+        </div>
+      </div>
+
+      <div id="editor" class="editor" hidden>
+        <img id="snippet" class="snippet" alt="">
+        <div class="editor-fields">
+          <div class="editor-meta">
+            <span id="ed-wc" class="badge"></span>
+            <span id="ed-pos" class="muted mono"></span>
+          </div>
+          <input id="ed-text" type="text" autocomplete="off" spellcheck="false">
+          <div class="glyphs" id="glyphs"></div>
+        </div>
+        <div class="editor-actions">
+          <button id="ed-commit" class="btn primary" title="Enter">Correct &amp; next</button>
+          <button id="ed-confirm" class="btn" title="The OCR is right">Confirm</button>
+          <button id="ed-delete" class="btn danger" title="Hallucinated word">Delete</button>
+          <button id="ed-cancel" class="btn ghost" title="Esc">Close</button>
+        </div>
+      </div>
+
+      <div id="addbar" class="editor" hidden>
+        <div class="editor-fields">
+          <div class="editor-meta"><span class="badge new">New word</span>
+            <span class="muted">Drag a box on the scan, then type the word.</span></div>
+          <input id="add-text" type="text" autocomplete="off" spellcheck="false"
+                 placeholder="Word the OCR missed…">
+        </div>
+        <div class="editor-actions">
+          <button id="add-commit" class="btn primary">Add &amp; keep going</button>
+          <button id="add-cancel" class="btn ghost">Cancel</button>
+        </div>
+      </div>
+
+      <p id="page-status" class="status"></p>
+    </div>
+  </section>
+</template>
+
+<script src="static/review.js"></script>
+</body>
+</html>

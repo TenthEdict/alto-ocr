@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Puts a clickable link to the browser transcript-review UI on the Goobi
+  task screen. Merge the <property> block below into
+  /opt/digiverso/goobi/config/goobi_processProperties.xml (the install ships
+  an empty <config_processProperties/> stub).
+
+  WHY A PROCESS PROPERTY, and why the URL carries no Ref ID
+  =========================================================
+  Goobi renders a process property of type "link" as an <h:outputLink
+  target="_blank"> on the task screen (verified in
+  uii/template/includes/task/box_properties.xhtml, Goobi 26.06.1), so this
+  needs no Java, no plugin, and no patch to Goobi.
+
+  Property values are NOT variable-replaced — PropertyParser and
+  GoobiScriptPropertySet both store the string literally, and there is no
+  VariableReplacer anywhere on that path — so "{processtitle}" would appear
+  in the URL verbatim. The link therefore points at the review app's own
+  worklist, which finds every reviewable object by walking
+  metadata/<processid>/ocr/alto_ocr/<RefID>/ for itself. That is the better
+  shape anyway: a corrector opens one tab and works down a queue sorted
+  worst-first, instead of returning to Goobi between objects.
+
+  HOW THE VALUE GETS STORED
+  =========================
+  <showProcessGroup> makes this a process-creation property, and
+  ProzesskopieForm persists it with its <defaultvalue> when a process is
+  created (DisplayProperty.transfer writes `value`). Existing processes have
+  no such row yet — backfill them with one GoobiScript run (see below).
+
+  A property with no stored row renders as an empty link, because
+  PropertyParser blanks readValue for unstored properties. That is why the
+  backfill matters rather than being optional tidying.
+-->
+<config_processProperties>
+
+    <property>
+        <name>OCR Transcript Review</name>
+        <!-- "link" is what makes Goobi render this as an anchor rather than
+             as text the corrector would have to copy and paste. -->
+        <type>link</type>
+
+        <!-- CHANGE THIS to the URL Apache serves the review app on, i.e. the
+             ProxyPass prefix from apache-ocr-review.conf. Must be reachable
+             from the CORRECTOR's browser, not from the server. -->
+        <defaultvalue>https://goobi.example.purdue.edu/ocr-review/</defaultvalue>
+
+        <project>*</project>
+
+        <!-- Shown on the correction task only. Naming the task explicitly
+             (rather than "*") keeps the link off the eight other tasks in
+             the workflow, where it would just be noise. Add another
+             <showStep> line to surface it elsewhere — QC2 is a reasonable
+             second home, since that is where a page's OCR is first judged. -->
+        <showStep name="Transcript Correction" access="read"
+                  template="Capture_To_Ingest_v1" />
+
+        <!-- Required for the value to be stored at process creation.
+             access="read" so nobody can edit the URL per process by hand:
+             it is deployment configuration, not per-object data. -->
+        <showProcessGroup access="read" template="Capture_To_Ingest_v1" />
+    </property>
+
+</config_processProperties>
+
+<!--
+  BACKFILL FOR PROCESSES THAT ALREADY EXIST
+  =========================================
+  Creation properties are written at creation time, so processes made before
+  this config landed have no row and would show an empty link. Select them in
+  Goobi's process list and run this GoobiScript once (Administration ->
+  GoobiScript, or the process list's script box):
+
+      action: propertySet
+      name: OCR Transcript Review
+      value: https://goobi.example.purdue.edu/ocr-review/
+
+  propertySet creates the property if it does not exist, so the same call is
+  safe to re-run and safe to use for changing the URL later across every
+  process at once.
+-->
