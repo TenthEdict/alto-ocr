@@ -41,14 +41,26 @@ NSMAP = {None: METS_NS, "xlink": XLINK_NS}
 MIME_BY_GROUP = {
     "ALTO": "application/xml",
     "Text": "text/plain",
+    "Image": "image/tiff",
 }
 USE_BY_GROUP = {
     "ALTO": "ocr",
     "Text": "transcript",
+    "Image": "preservation",
 }
 EXT_BY_GROUP = {
     "ALTO": ".xml",
     "Text": ".txt",
+    "Image": ".tif",
+}
+# Subdirectory each group occupies in the pipeline's working layout. Images
+# live outside the object directory entirely (Goobi keeps them under
+# images/<RefID>_master), so they have no working subdirectory and are only
+# ever described by a delivery METS, which is flat.
+SUBDIR_BY_GROUP = {
+    "ALTO": "ALTO",
+    "Text": "Text",
+    "Image": None,
 }
 
 
@@ -117,10 +129,25 @@ def _file_element(
     *,
     with_checksums: bool,
     file_id: str,
+    flat_hrefs: bool = False,
+    source_dir: Path | None = None,
 ) -> etree._Element:
+    """One ``<mets:file>``.
+
+    Two paths are involved and they are deliberately separate. The *href* is
+    what a consumer of the package will resolve, and depends on the layout the
+    METS describes: nested (``ALTO/x.xml``) for the pipeline's working tree,
+    bare (``x.xml``) for the flat delivered folder. The *source* is where this
+    machine reads the bytes to size and checksum them, which for images is
+    outside the object directory altogether.
+    """
     ext = EXT_BY_GROUP[group]
-    rel = f"{group}/{stem}{ext}"
-    abs_path = ref_id_dir / rel
+    subdir = SUBDIR_BY_GROUP[group]
+    rel = f"{stem}{ext}" if (flat_hrefs or subdir is None) else f"{subdir}/{stem}{ext}"
+    if source_dir is not None:
+        abs_path = source_dir / f"{stem}{ext}"
+    else:
+        abs_path = ref_id_dir / (f"{subdir}/{stem}{ext}" if subdir else f"{stem}{ext}")
 
     attrs = {
         "ID": file_id,
@@ -156,8 +183,22 @@ def build_mets(
     agent_version: str = __version__,
     with_checksums: bool = True,
     with_plaintext: bool = True,
+    image_dir: Path | None = None,
+    flat_hrefs: bool = False,
 ) -> etree._ElementTree:
     """Build the METS document for one Ref ID.
+
+    Two kinds of METS come out of this, and they describe different layouts:
+
+    * the **working** METS (defaults) describes the pipeline's own tree, with
+      nested ``ALTO/`` and ``Text/`` hrefs and no images. It doubles as this
+      tool's fixity record — the re-OCR guard compares its checksums to spot
+      corrections made by editors that leave no provenance — so its hrefs must
+      resolve against ``ref_id_dir``.
+    * the **delivery** METS (``image_dir`` set, ``flat_hrefs=True``) describes
+      the flat folder handed to the repository, where images, ALTO and text sit
+      side by side. A manifest that listed only the OCR outputs while sitting
+      beside the images would be worse than none, because it looks complete.
 
     Args:
         ref_id: object identifier (used as METS OBJID).
@@ -169,8 +210,19 @@ def build_mets(
         with_plaintext: include the ``Text`` fileGrp and structMap fptrs.
             Set False when the pipeline ran with plaintext suppressed so
             the METS doesn't reference files that aren't on disk.
+        image_dir: directory holding the source TIFFs. When given, an
+            ``Image`` fileGrp is added and each page's div points at its image
+            as well. The images are read from here for size and checksum but
+            described by filename only, since they are not inside
+            ``ref_id_dir``.
+        flat_hrefs: write bare filenames instead of ``ALTO/…`` / ``Text/…``,
+            for a delivered folder that is flat.
     """
-    groups: tuple[str, ...] = ("ALTO", "Text") if with_plaintext else ("ALTO",)
+    groups: list[str] = ["ALTO"]
+    if with_plaintext:
+        groups.append("Text")
+    if image_dir is not None:
+        groups.insert(0, "Image")  # preservation copy leads the fileSec
     now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
     root = etree.Element(
@@ -220,6 +272,8 @@ def build_mets(
                     group, page.stem, ref_id_dir,
                     with_checksums=with_checksums,
                     file_id=file_ids[(group, page.order)],
+                    flat_hrefs=flat_hrefs,
+                    source_dir=image_dir if group == "Image" else None,
                 )
             )
 

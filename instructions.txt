@@ -1,27 +1,75 @@
-For every set of images (Ref ID) that require OCR, three associated folders exist together:
+Delivery structure for a digitized, transcribed object
+=====================================================
 
-[TIFF Images folder]              -- preservation copy; canonical, NOT produced by the OCR tool
-[METS/ALTO folder]                -- produced by the OCR tool
-[Plain text transcript folder]    -- produced by the OCR tool
+One Ref ID delivers as ONE FLAT FOLDER. Every file for the object sits
+directly in that folder -- no subfolders -- so that LibSafe holds the images,
+the OCR outputs and the manifest as a single item:
 
-Each folder contains the exact same number of files, and each set of files is named identically except for the file extension. Like this:
+    <container>/<Collection Name>/digitize-scans/preservation-files/<RefID>/
+        page001.tif          preservation copy; canonical, NOT produced by the OCR tool
+        page001.xml          ALTO -- produced by the OCR tool
+        page001.txt          plain-text transcript -- produced by the OCR tool
+        page002.tif
+        page002.xml
+        page002.txt
+        ...
+        <RefID>.mets.xml     manifest describing all of the above
 
-[TIFF Images folder]
-image001.tif
-image002.tif
-image003.tif
-...etc.
-[METS/ALTO folder]
-image001.xml
-image002.xml
-image003.xml
-...etc.
-[Plain text transcript folder]
-image001.txt
-image002.txt
-image003.txt
-...etc.
+Every page contributes the same set of files, named identically except for the
+extension. The METS references all three file types with bare filenames as
+hrefs, because the delivered folder is flat.
 
-The TIFF folder lives in the preservation tree at preservation-files/preservation/<RefID>/. The OCR tool reads these TIFs but does not copy them anywhere; duplicating them onto the documentation tree would waste storage on the network drive.
+  <container>       LibSafe container number, e.g. 50
+  <Collection Name> e.g. "Anne M. Lutz Papers"
+  <RefID>           e.g. MSA00163_df5ebf121773e0f868004a83d0673134
 
-The METS/ALTO and Plain text folders are produced by the OCR tool at documentation/ALTOS-Plain Text/<RefID>/ALTO/ and .../Text/. The OCR tool also writes one <RefID>.mets.xml file alongside those two folders, describing the ALTO + Text outputs. The METS does not reference the preservation TIFs -- LibNova pairs the two trees by Ref ID externally.
+Neither the container number nor the collection name is derivable from the Ref
+ID; both come from the workflow (a Goobi project per collection, or a process
+property).
+
+Superseded design (do not reintroduce)
+-------------------------------------
+
+Until 2026-08-24 this file described two sibling trees --
+`preservation-files/preservation/<RefID>/` for TIFFs and
+`documentation/ALTOS-Plain Text/<RefID>/` for ALTO and text -- paired by Ref ID
+externally by LibNova, with a METS that deliberately did NOT reference the
+TIFFs so as not to duplicate them onto the documentation tree.
+
+That model is retired: everything is co-located, and the METS therefore
+describes the images too. A manifest that listed only two thirds of the files
+beside it would be worse than no manifest, because it looks authoritative.
+
+Working layout inside the pipeline
+----------------------------------
+
+The delivered layout is NOT the pipeline's working layout. While an object is
+in the workflow, Goobi's own conventions apply:
+
+    <process>/images/<RefID>_master/     TIFFs (flat -- Goobi requires it)
+    <process>/ocr/<RefID>_alto/          ALTO
+    <process>/ocr/<RefID>_txt/           plain text
+    <process>/ocr/alto_ocr/<RefID>/      view onto the two above, plus the
+                                         working METS (nested ALTO/ + Text/
+                                         hrefs, describing THIS layout)
+
+The delivery package is assembled at upload time: files are flattened into one
+folder and a delivery METS with flat hrefs is written for it. The working METS
+stays as it is -- it is this tool's own fixity record, and the re-OCR guard
+uses its checksums to notice corrections made by editors that leave no
+provenance of their own.
+
+Sub-collections: open issue
+---------------------------
+
+A Ref ID on the share sometimes carries sub-collection folders
+(`<RefID>/1927/...`). They are uncommon -- a handful over a year -- but real.
+
+Goobi's image folder must be flat, so the import step REFUSES nested input
+rather than flattening it: flattening could silently collide two pages that
+share a filename in different subfolders, and the preservation copies' names
+must not be rewritten. Those objects therefore cannot pass through the
+pipeline yet and need handling by hand.
+
+Whether the delivered folder should reconstruct sub-collection paths, or
+whether flattening them is acceptable for delivery, is not yet decided.
