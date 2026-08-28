@@ -31,6 +31,7 @@ import base64
 import json
 import logging
 import os
+import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -248,6 +249,50 @@ _LOOP_TANDEM_MIN_REPS = 4     # a block must repeat back-to-back >= this many ti
 _LOOP_TANDEM_EXTREME_REPS = 30  # ...or this many, if its lines are all short tokens
 _LOOP_TANDEM_LINE_CHARS = 20  # a "substantial" line: a unit with one this long is real text (caption/title), not a tally token
 
+# Intra-line loop collapse. The two passes above are LINE-based; a loop confined
+# to ONE line is invisible to them. That is the shape dense tabular pages and
+# run-on table headers produce, because the model never emits a newline while
+# looping: MSF00327 page 00022 is a *single* 450-word line of "1.67 67" x216,
+# page 00012 one line of "0" x553, page 00019 a 1,475-word line whose column
+# header repeats x43. (Page 00022 did not even reach the passes above — a text
+# with no newline returned early.) Same discipline as _collapse_tandem, applied
+# to whitespace tokens within a line: EXACT match, back-to-back, smallest period.
+#
+# Thresholds are measured, not guessed. Over the 4,844-page MSA00005 + MSF00327
+# corpus, every intra-line tandem run of a SUBSTANTIAL unit (some token >=
+# _LOOP_INLINE_TOKEN_CHARS) is either a real loop at 108x or legitimate content
+# at exactly 3x ("Met or in process:", "Friendship Seven," — the same
+# radio-comms page the module note above cites); short-token runs top out at 19x
+# legitimately ("T" x19, "x" x9, "40.7" x7) against loops at 216x/549x/553x.
+# Both floors sit at ~2x the observed legitimate maximum, far below any loop.
+_LOOP_INLINE_MAX_PERIOD = 30   # longest repeating token-block to look for
+_LOOP_INLINE_MIN_REPS = 6      # substantial unit: collapse at this many back-to-back repeats
+_LOOP_INLINE_EXTREME_REPS = 40 # ...or this many, if the unit is all short tokens
+_LOOP_INLINE_TOKEN_CHARS = 8   # a token this long makes a unit "substantial" (real words, not tally cells)
+
+# Enumerated loop collapse. A loop the model NUMBERS as it goes ("1. X", "2. X",
+# "3. X", ...) defeats every exact-match pass above, since no two lines are
+# byte-identical: MSF00327 page 00079 emitted one invented sentence 71x this way
+# (2,877 words on a page holding ~460). We compare lines by their body with the
+# leading list marker removed. Guarded on body SIZE and ALPHABETIC content so a
+# genuine numbered form or index — "1. .....", "2. ....." — is never touched.
+# Corpus-wide (4,844 pages) there is no legitimate enumerated run at all: the
+# only two hits are this loop and a 3x verbatim repeat that is also a loop.
+#
+# The 4x floor is deliberate PARITY with _LOOP_TANDEM_MIN_REPS, not a fresh
+# judgement: the same four identical bodies WITHOUT markers already collapse via
+# _collapse_tandem today. Stripping a marker before comparing changes what we can
+# see, not how much repetition we treat as degenerate — so the residual risk here
+# (a rating form whose numbered rows carry identical option text) is one the
+# shipped code has always accepted for the unnumbered form of the same page.
+_LOOP_ENUM_MIN_REPS = 4          # identical bodies back-to-back before it counts as a loop
+_LOOP_ENUM_MIN_BODY_CHARS = 40   # a shorter body is a form field / index entry, not looped prose
+_LOOP_ENUM_MIN_BODY_ALPHA = 12   # ...and it must be mostly text, not dot leaders or rules
+
+# A leading list marker: "1.", "12)", "(3)", "iv.", "a]" — or a bullet.
+_ENUMERATOR_RE = re.compile(r"^[(\[]?(?:\d{1,3}|[ivxlIVXL]{1,5}|[A-Za-z])[.):\]]\s+")
+_BULLET_RE = re.compile(r"^[-*•·]\s+")
+
 
 def _find_periodic_cut(nonblank: list[str]) -> int | None:
     """If the non-blank lines are a unit repeated >= 3×, return the unit length
@@ -337,20 +382,137 @@ def _collapse_tandem(lines: list[str]) -> list[str]:
     return out
 
 
+def _collapse_inline_run(words: list[str]) -> list[str]:
+    """Collapse CONSECUTIVE tandem repeats of a token block within one line.
+
+    The token-level twin of :func:`_collapse_tandem`, with the same shape and the
+    same discipline: scan left-to-right, take the SMALLEST period whose block
+    repeats back-to-back, and keep exactly one copy. EXACT match,
+    order-preserving. A run qualifies iff it repeats >= _LOOP_INLINE_MIN_REPS
+    times AND (its unit holds a token >= _LOOP_INLINE_TOKEN_CHARS — real words,
+    so a loop — OR it repeats an extreme >= _LOOP_INLINE_EXTREME_REPS times).
+
+    Those two guards are what keep it off legitimate tabular data, where a row of
+    identical short cells ("6 6 6 6 6", "0 0 0") is ordinary content, not a loop.
+    """
+    out: list[str] = []
+    i, n = 0, len(words)
+    while i < n:
+        chosen_p = chosen_reps = 0
+        for p in range(1, min(_LOOP_INLINE_MAX_PERIOD, (n - i) // 2) + 1):
+            unit = words[i:i + p]
+            reps, j = 1, i + p
+            while j + p <= n and words[j:j + p] == unit:
+                reps += 1
+                j += p
+            if reps < _LOOP_INLINE_MIN_REPS:
+                continue
+            substantial = max(len(t) for t in unit) >= _LOOP_INLINE_TOKEN_CHARS
+            if substantial or reps >= _LOOP_INLINE_EXTREME_REPS:
+                chosen_p, chosen_reps = p, reps
+                break
+        if chosen_p:
+            out.extend(words[i:i + chosen_p])  # keep exactly one copy
+            logger.debug("glm-ocr: collapsed intra-line loop (period=%d, reps=%d)",
+                         chosen_p, chosen_reps)
+            i += chosen_p * chosen_reps
+        else:
+            out.append(words[i])
+            i += 1
+    return out
+
+
+def _collapse_inline(text: str) -> str:
+    """Apply :func:`_collapse_inline_run` to each line, per the module note above.
+
+    A line that collapses to the same token count is emitted BYTE-IDENTICAL (the
+    original string, not a re-join), so healthy pages keep their exact original
+    spacing and this pass is a provable no-op on them.
+    """
+    out: list[str] = []
+    for line in text.split("\n"):
+        words = line.split()
+        if len(words) < _LOOP_INLINE_MIN_REPS:
+            out.append(line)  # too short to hold a qualifying run
+            continue
+        collapsed = _collapse_inline_run(words)
+        out.append(line if len(collapsed) == len(words) else " ".join(collapsed))
+    return "\n".join(out)
+
+
+def _enum_body(line: str) -> str | None:
+    """Return ``line`` stripped of a leading list marker, or None if it has none."""
+    s = line.strip()
+    body = _ENUMERATOR_RE.sub("", s, count=1)
+    if body == s:
+        body = _BULLET_RE.sub("", s, count=1)
+    return None if body == s else body.strip()
+
+
+def _collapse_enumerated(lines: list[str]) -> list[str]:
+    """Collapse a run of list items whose bodies are identical to the first item.
+
+    Catches the loop the model numbers as it goes ("1. X", "2. X", "3. X", ...),
+    which every exact-match pass misses because the marker makes each line
+    unique. Compares only the body; keeps the first item verbatim (marker and
+    all) and drops the rest, including any blank lines between them — so items
+    separated by blank lines, as glm-ocr emits them, are still seen as a run.
+
+    Guarded on body length and alphabetic content (see the module note above), so
+    a real numbered form or index whose items are short or mostly dot leaders is
+    never collapsed. Order-preserving; returns ``lines`` unchanged if nothing
+    qualifies.
+    """
+    nb_idx = [i for i, ln in enumerate(lines) if ln.strip()]
+    bodies = [_enum_body(lines[i]) for i in nb_idx]
+    drop: set[int] = set()
+    k, m = 0, len(nb_idx)
+    while k < m:
+        body = bodies[k]
+        if (body is None
+                or len(body) < _LOOP_ENUM_MIN_BODY_CHARS
+                or sum(c.isalpha() for c in body) < _LOOP_ENUM_MIN_BODY_ALPHA):
+            k += 1
+            continue
+        j = k
+        while j + 1 < m and bodies[j + 1] == body:
+            j += 1
+        if j - k + 1 >= _LOOP_ENUM_MIN_REPS:
+            logger.debug("glm-ocr: collapsed enumerated loop (reps=%d, body=%.40s)",
+                         j - k + 1, body)
+            # The token cap usually cuts the last item mid-way, leaving a body
+            # that is a proper prefix of the looped one ("71. **Skyline"). That
+            # is the same truncated final copy _find_periodic_cut allows for, so
+            # take it with the run rather than leave a dangling fragment.
+            if (j + 1 < m and bodies[j + 1]
+                    and body.startswith(bodies[j + 1])
+                    and len(bodies[j + 1]) < len(body)):
+                j += 1
+            drop.update(range(nb_idx[k] + 1, nb_idx[j] + 1))
+        k = j + 1
+    return lines if not drop else [ln for i, ln in enumerate(lines) if i not in drop]
+
+
 def _collapse_repetition_loops(text: str) -> str:
     """Collapse degenerate glm-ocr repetition loops to their real content.
 
-    Two EXACT, order-preserving passes — both leave healthy pages byte-identical
+    Four EXACT, order-preserving passes — all leave healthy pages byte-identical
     and never touch legit repetitive content (roll-calls, tallies, ledgers,
     short-token table columns):
 
     1. **Consecutive tandem runs** (``_collapse_tandem``): a block repeated
        back-to-back many times (a caption ×42, "Transfer Van" ×608) → one copy,
        guarded so short-token periodic data is spared.
-    2. **Whole-page exact period** (``_find_periodic_cut``): the page is one unit
+    2. **Enumerated runs** (``_collapse_enumerated``): the same body repeated
+       under an incrementing list marker ("1. X", "2. X", … ×71) → first item.
+       The marker is what makes 1. and 2. above blind to this shape.
+    3. **Whole-page exact period** (``_find_periodic_cut``): the page is one unit
        repeated k× (k >= 3) with the final copy possibly truncated by the token
        cap (a caption ×160, a table ×3) → first copy. A block that appears only
        ~2× is treated as legitimately doubled content and left intact.
+    4. **Intra-line runs** (``_collapse_inline``): a loop inside a SINGLE line
+       ("1.67 67" ×216, "0" ×553), which 1.–3. cannot see because they compare
+       whole lines. Runs last, on the output of the others.
 
     We deliberately do NOT do fuzzy / unique-ratio de-duplication (it cannot tell
     a generation loop from a genuinely repetitive document and would gut real
@@ -358,19 +520,23 @@ def _collapse_repetition_loops(text: str) -> str:
     see module note). Non-exact "messy" loops are left duplicated rather than
     risk destroying content.
     """
-    if "\n" not in text:
-        return text
-    lines = _collapse_tandem(text.split("\n"))
-    nb_idx = [i for i, ln in enumerate(lines) if ln.strip()]
-    nonblank = [lines[i].strip() for i in nb_idx]
-    period = _find_periodic_cut(nonblank)
-    if period is not None:
-        cut = nb_idx[period - 1] + 1  # keep through the period-th non-blank line
-        if cut < len(lines):
-            logger.debug("glm-ocr: collapsed periodic loop (period=%d non-blank lines, "
-                         "%d -> %d lines)", period, len(lines), cut)
-            lines = lines[:cut]
-    return "\n".join(lines)
+    if "\n" in text:
+        lines = _collapse_tandem(text.split("\n"))
+        lines = _collapse_enumerated(lines)
+        nb_idx = [i for i, ln in enumerate(lines) if ln.strip()]
+        nonblank = [lines[i].strip() for i in nb_idx]
+        period = _find_periodic_cut(nonblank)
+        if period is not None:
+            cut = nb_idx[period - 1] + 1  # keep through the period-th non-blank line
+            if cut < len(lines):
+                logger.debug("glm-ocr: collapsed periodic loop (period=%d non-blank lines, "
+                             "%d -> %d lines)", period, len(lines), cut)
+                lines = lines[:cut]
+        text = "\n".join(lines)
+    # Intra-line runs LAST: the line-based passes above see exactly the input
+    # they always did (so their behavior is unchanged), and a collapse here can
+    # never make two distinct lines identical and feed them a false match.
+    return _collapse_inline(text)
 
 
 def transcribe(image: np.ndarray, config: GLMOCRConfig) -> str:
