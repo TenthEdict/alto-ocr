@@ -15,6 +15,7 @@ Run from the repo root:
 
 from __future__ import annotations
 
+import functools
 import os
 import sys
 import tempfile
@@ -73,6 +74,38 @@ def _write_image(path: Path) -> None:
     Image.new("RGB", (8, 10), "white").save(path, format="TIFF")
 
 
+@functools.lru_cache(maxsize=1)
+def _symlinks_available() -> bool:
+    """Whether this process may create symlinks.
+
+    Windows grants that privilege only under Developer Mode or elevation;
+    without either, symlink creation raises ``OSError`` (WinError 1314). That
+    is a limit of the environment, not a failure of the code under test, so
+    the symlink-layout tests below SKIP rather than error -- otherwise every
+    run on an ordinary Windows workstation reports failures that say nothing
+    about the change being made, and the pre-push hook blocks every push.
+    CI still exercises them (Linux, and Windows runners hold the privilege).
+
+    Probed by actually creating one, not by checking the platform: the
+    privilege is per-process and per-configuration, not per-OS.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp) / "target"
+        target.mkdir()
+        try:
+            os.symlink(target, Path(tmp) / "link", target_is_directory=True)
+        except (OSError, NotImplementedError, AttributeError):
+            return False
+        return True
+
+
+_NEEDS_SYMLINKS = unittest.skipUnless(
+    _symlinks_available(),
+    "symlink creation not permitted here (Windows needs Developer Mode or elevation)",
+)
+
+
+@_NEEDS_SYMLINKS
 class GoobiLayoutTests(unittest.TestCase):
     """The layout the bridge builds: real ALTO folders, a symlink view."""
 

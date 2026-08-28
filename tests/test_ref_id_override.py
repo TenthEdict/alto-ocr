@@ -19,6 +19,8 @@ Run from the repo root (so ``src.alto_ocr`` resolves):
 
 from __future__ import annotations
 
+import functools
+import os
 import sys
 import tempfile
 import unittest
@@ -38,6 +40,38 @@ from src.alto_ocr.walker import (  # noqa: E402
 )
 
 ALTO_NS = "http://www.loc.gov/standards/alto/ns-v2#"
+
+
+
+@functools.lru_cache(maxsize=1)
+def _symlinks_available() -> bool:
+    """Whether this process may create symlinks.
+
+    Windows grants that privilege only under Developer Mode or elevation;
+    without either, symlink creation raises ``OSError`` (WinError 1314). That
+    is a limit of the environment, not a failure of the code under test, so
+    the symlink-layout tests below SKIP rather than error -- otherwise every
+    run on an ordinary Windows workstation reports failures that say nothing
+    about the change being made, and the pre-push hook blocks every push.
+    CI still exercises them (Linux, and Windows runners hold the privilege).
+
+    Probed by actually creating one, not by checking the platform: the
+    privilege is per-process and per-configuration, not per-OS.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp) / "target"
+        target.mkdir()
+        try:
+            os.symlink(target, Path(tmp) / "link", target_is_directory=True)
+        except (OSError, NotImplementedError, AttributeError):
+            return False
+        return True
+
+
+_NEEDS_SYMLINKS = unittest.skipUnless(
+    _symlinks_available(),
+    "symlink creation not permitted here (Windows needs Developer Mode or elevation)",
+)
 
 
 class FakeEngine:
@@ -116,6 +150,7 @@ class DiscoverRefIdOverrideTests(unittest.TestCase):
         self.assertEqual([s.path for s in overridden.sources],
                          [s.path for s in plain.sources])
 
+    @_NEEDS_SYMLINKS
     def test_override_survives_a_symlinked_input(self) -> None:
         # The resolved basename is what the default uses, so a symlink named
         # for the object can't carry identity on its own — the override must.
