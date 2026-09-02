@@ -23,10 +23,17 @@
 
   HOW THE VALUE GETS STORED
   =========================
-  <showProcessGroup> makes this a process-creation property, and
-  ProzesskopieForm persists it with its <defaultvalue> when a process is
-  created (DisplayProperty.transfer writes `value`). Existing processes have
-  no such row yet — backfill them with one GoobiScript run (see below).
+  <showProcessCreation> is what makes this a process-creation property.
+  ProzesskopieForm:319 builds its property list from
+  PropertyParser.getProcessCreationProperties, which matches ONLY on
+  <showProcessCreation> (PropertyParser:507-517) — with just
+  <showProcessGroup> the property is skipped there entirely and no row is
+  ever written. access="read" still stores the value: getConfiguredProperties
+  filters on display conditions, not access, so ProzesskopieForm:1054-1059
+  runs transfer() and persists <defaultvalue> regardless. <showProcessGroup>
+  is still needed, but for a different job — it governs display in the
+  property group on the process detail page. Existing processes have no row
+  yet — backfill them with one GoobiScript run (see below).
 
   A property with no stored row renders as an empty link, because
   PropertyParser blanks readValue for unstored properties. That is why the
@@ -34,8 +41,13 @@
 -->
 <config_processProperties>
 
-    <property>
-        <name>OCR Transcript Review</name>
+    <!-- The property NAME is an attribute, not a <name> child element.
+         PropertyParser reads it as prop.getString("@name") on both the
+         creation path (getProcessCreationProperties) and the task-screen path
+         (getPropertiesForStep); a <name> child leaves it null, so the row is
+         written with a NULL property_name and never binds to the definition.
+         Goobi's own sample config uses the attribute form. -->
+    <property name="OCR Transcript Review">
         <!-- "link" is what makes Goobi render this as an anchor rather than
              as text the corrector would have to copy and paste. -->
         <type>link</type>
@@ -55,9 +67,15 @@
         <showStep name="Transcript Correction" access="read"
                   template="Capture_To_Ingest_v1" />
 
-        <!-- Required for the value to be stored at process creation.
-             access="read" so nobody can edit the URL per process by hand:
-             it is deployment configuration, not per-object data. -->
+        <!-- Writes the row at process creation. Without this element the
+             property is never stored and the task screen renders an empty
+             link, because PropertyParser blanks readValue for unstored
+             properties. -->
+        <showProcessCreation access="read" template="Capture_To_Ingest_v1" />
+
+        <!-- Shows the property in the process detail page's property group.
+             access="read" on both so nobody can edit the URL per process by
+             hand: it is deployment configuration, not per-object data. -->
         <showProcessGroup access="read" template="Capture_To_Ingest_v1" />
     </property>
 
