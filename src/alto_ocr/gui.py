@@ -1,7 +1,11 @@
 """Tkinter desktop GUI for alto_ocr.
 
-A thin wrapper over the existing pipeline. Folder picker, four toggles
-(METS, plaintext, recurse-subfolders, engine type), live log + progress.
+A thin wrapper over the existing pipeline. Two tabs — **Run** (folder
+pickers, output formats, engine choice, Run/Cancel, progress and the live
+log) and **Review** (transcript correction, ``review.py``) — under a menu
+bar whose **Tools ▸ Advanced settings…** opens the engine and
+preprocessing options, including the Tesseract location, in a window of
+their own.
 
 Run with::
 
@@ -24,8 +28,9 @@ import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import Optional
+from typing import Mapping, Optional
 
+from . import __version__
 from .glmocr import (
     DEFAULT_MODEL,
     DEFAULT_TIMEOUT_S,
@@ -77,6 +82,99 @@ class JobConfig:
     glmocr_endpoint: Optional[str] = None
     glmocr_model: str = DEFAULT_MODEL
     glmocr_timeout: int = DEFAULT_TIMEOUT_S
+
+
+class SettingsError(ValueError):
+    """An Advanced setting the user has to fix; the message says what."""
+
+
+def parse_advanced(raw: Mapping[str, object]) -> dict:
+    """Validate the Advanced settings fields into ``JobConfig`` keyword
+    arguments. ``raw`` holds the fields as the widgets return them (text
+    for the number boxes, so "abc" arrives as "abc" rather than as a Tk
+    error). Raises ``SettingsError`` naming what to fix. Pure — no Tk — so
+    the rules are testable headless.
+    """
+    def whole_number(key: str, label: str) -> int:
+        try:
+            return int(str(raw.get(key, "")).strip())
+        except ValueError:
+            raise SettingsError(f"{label} must be a whole number.") from None
+
+    min_dpi = whole_number("min_dpi", "Min DPI")
+    psm = whole_number("psm", "PSM")
+    oem = whole_number("oem", "OEM")
+    glmocr_timeout = whole_number("glmocr_timeout", "GLMOCR timeout")
+    if min_dpi <= 0:
+        raise SettingsError("Min DPI must be positive.")
+    if not 0 <= psm <= 13:
+        raise SettingsError("PSM must be between 0 and 13.")
+    if not 0 <= oem <= 3:
+        raise SettingsError("OEM must be between 0 and 3.")
+    if glmocr_timeout <= 0:
+        raise SettingsError("GLMOCR timeout must be positive.")
+
+    tess_str = str(raw.get("tesseract_path", "") or "").strip()
+    tess_path = Path(tess_str).expanduser() if tess_str else None
+    if tess_path is not None and not tess_path.is_file():
+        raise SettingsError(
+            f"The Tesseract program path does not point at a file:\n{tess_path}\n\n"
+            "Leave the field empty to find Tesseract automatically, or pick "
+            "the program with Browse…")
+
+    debug_str = str(raw.get("debug_preprocessed", "") or "").strip()
+    return dict(
+        tesseract_path=tess_path,
+        preprocess_config=PreprocessConfig(
+            min_dpi=min_dpi,
+            # The frame-changing stages: both engines force them off so
+            # word boxes stay on the original scan (ocr.adjust_preprocess),
+            # so the GUI offers no switch that would only pretend to.
+            do_deskew=False,
+            do_border_crop=False,
+            do_denoise=bool(raw.get("do_denoise")),
+            do_clahe=bool(raw.get("do_clahe")),
+            do_binarize=bool(raw.get("do_binarize")),
+        ),
+        debug_preprocessed_dir=Path(debug_str).expanduser() if debug_str else None,
+        ocr_options=OCROptions(
+            language=str(raw.get("ocr_lang", "") or "").strip() or "eng",
+            psm=psm, oem=oem),
+        glmocr_endpoint=str(raw.get("glmocr_endpoint", "") or "").strip() or None,
+        glmocr_model=(str(raw.get("glmocr_model", "") or "").strip()
+                      or GLMOCRConfig().model),
+        glmocr_timeout=glmocr_timeout,
+        with_checksums=bool(raw.get("with_checksums", True)),
+    )
+
+
+def advanced_settings(adv: Mapping[str, object]) -> dict:
+    """The settings-file entries for validated Advanced options (the output
+    of ``parse_advanced``). A ``None`` value means "remove the key": the
+    Tesseract path is saved only when the user chose one — an auto-detected
+    path is re-derived each launch, so a reinstall can't strand the app on
+    a stale location."""
+    pc = adv["preprocess_config"]
+    oo = adv["ocr_options"]
+    debug_dir = adv["debug_preprocessed_dir"]
+    return {
+        "tesseract_path": str(adv["tesseract_path"]) if adv["tesseract_path"] else None,
+        "min_dpi": pc.min_dpi,
+        "do_denoise": pc.do_denoise,
+        "do_clahe": pc.do_clahe,
+        "do_binarize": pc.do_binarize,
+        "debug_preprocessed": str(debug_dir) if debug_dir else "",
+        "ocr_lang": oo.language,
+        "psm": oo.psm,
+        "oem": oo.oem,
+        "glmocr_endpoint": adv["glmocr_endpoint"] or "",
+        "glmocr_model": adv["glmocr_model"],
+        "glmocr_timeout": adv["glmocr_timeout"],
+        "with_checksums": adv["with_checksums"],
+        # Retired with their checkboxes (engines force both stages off).
+        "do_deskew": None,
+        "do_border_crop": None,
+    }
 
 
 # Bumped when a saved preference has to be retired rather than merely
@@ -153,8 +251,11 @@ class AltoOcrApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("820x720")
-        self.root.minsize(720, 720)
+        # Room for the Review tab's two toolbars, clamped for small screens.
+        width = min(1000, int(root.winfo_screenwidth() * 0.95))
+        height = min(780, int(root.winfo_screenheight() * 0.88))
+        self.root.geometry(f"{width}x{height}")
+        self.root.minsize(720, 560)
 
         # All settings — basic and advanced — restore from the persisted
         # JSON on launch so users keep their preferred recipe across runs.
@@ -168,37 +269,30 @@ class AltoOcrApp:
         # Run-tab basics
         self.var_input = tk.StringVar()
         self.var_output = tk.StringVar()
-        # Once the user manually overrides the output, stop auto-updating from input.
+        # Once the user manually picks the output, stop auto-updating from input.
         self._output_overridden = False
         self.var_recurse = tk.BooleanVar(value=bool(s.get("recurse", False)))
         self.var_mets = tk.BooleanVar(value=bool(s.get("write_mets", True)))
         self.var_plaintext = tk.BooleanVar(value=bool(s.get("write_plaintext", True)))
         self.var_engine = tk.StringVar(value=str(s.get("engine", "tesseract")))
-        self.var_tesseract = tk.StringVar(value=str(s.get("tesseract_path", "")))
         self.var_status = tk.StringVar(value="Ready.")
 
-        # Advanced — Preprocessing
-        self.var_min_dpi = tk.IntVar(value=int(s.get("min_dpi", pp.min_dpi)))
-        self.var_do_deskew = tk.BooleanVar(value=bool(s.get("do_deskew", pp.do_deskew)))
+        # Advanced settings window. Number fields are StringVars so a
+        # mistyped value reaches parse_advanced as text, not as a TclError.
+        self.var_tesseract = tk.StringVar(value=str(s.get("tesseract_path", "")))
+        self.var_min_dpi = tk.StringVar(value=str(s.get("min_dpi", pp.min_dpi)))
         self.var_do_denoise = tk.BooleanVar(value=bool(s.get("do_denoise", pp.do_denoise)))
         self.var_do_clahe = tk.BooleanVar(value=bool(s.get("do_clahe", pp.do_clahe)))
         self.var_do_binarize = tk.BooleanVar(value=bool(s.get("do_binarize", pp.do_binarize)))
-        self.var_do_border_crop = tk.BooleanVar(
-            value=bool(s.get("do_border_crop", pp.do_border_crop)))
         self.var_debug_preproc = tk.StringVar(value=str(s.get("debug_preprocessed", "")))
-
-        # Advanced — Tesseract OCR options
         self.var_ocr_lang = tk.StringVar(value=str(s.get("ocr_lang", oo.language)))
-        self.var_psm = tk.IntVar(value=int(s.get("psm", oo.psm)))
-        self.var_oem = tk.IntVar(value=int(s.get("oem", oo.oem)))
-
-        # Advanced — GLMOCR
+        self.var_psm = tk.StringVar(value=str(s.get("psm", oo.psm)))
+        self.var_oem = tk.StringVar(value=str(s.get("oem", oo.oem)))
         self.var_glmocr_endpoint = tk.StringVar(value=str(s.get("glmocr_endpoint", "")))
         self.var_glmocr_model = tk.StringVar(value=str(s.get("glmocr_model", gc.model)))
-        self.var_glmocr_timeout = tk.IntVar(value=int(s.get("glmocr_timeout", gc.timeout_s)))
-
-        # Advanced — METS
+        self.var_glmocr_timeout = tk.StringVar(value=str(s.get("glmocr_timeout", gc.timeout_s)))
         self.var_with_checksums = tk.BooleanVar(value=bool(s.get("with_checksums", True)))
+        self._adv_win: Optional[tk.Toplevel] = None
 
         # Worker bookkeeping.
         self._worker: Optional[threading.Thread] = None
@@ -209,93 +303,49 @@ class AltoOcrApp:
         # Auto-fill output folder when the input changes (until overridden).
         self.var_input.trace_add("write", self._on_input_changed)
 
+        self._build_menu()
         self._build_ui()
         self._install_logging()
-        self.root.after(self.POLL_MS, self._drain_queues)
+        self._poll_after = self.root.after(self.POLL_MS, self._drain_queues)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ---------- UI construction ------------------------------------------------
 
+    def _build_menu(self) -> None:
+        menubar = tk.Menu(self.root)
+        file_menu = tk.Menu(menubar, tearoff=False)
+        file_menu.add_command(label="Exit", command=self._on_close)
+        menubar.add_cascade(label="File", menu=file_menu)
+        tools = tk.Menu(menubar, tearoff=False)
+        tools.add_command(label="Advanced settings…", accelerator="Ctrl+,",
+                          command=self._open_advanced)
+        menubar.add_cascade(label="Tools", menu=tools)
+        help_menu = tk.Menu(menubar, tearoff=False)
+        help_menu.add_command(label="About Alto OCR", command=self._show_about)
+        menubar.add_cascade(label="Help", menu=help_menu)
+        self.root.configure(menu=menubar)
+        self.root.bind("<Control-comma>", lambda _e: self._open_advanced())
+        self.menubar = menubar
+        self.tools_menu = tools
+
     def _build_ui(self) -> None:
-        outer = ttk.Frame(self.root, padding=12)
-        outer.pack(fill="both", expand=True)
-        # Grid layout: PanedWindow (Notebook + Log, draggable sash between)
-        # gets all extra space; actions and progress are persistent chrome
-        # at the bottom and are NEVER inside the paned region — so the
-        # Run/Cancel buttons can't get clipped no matter how the user
-        # resizes the sash or the window.
-        outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(0, weight=1)  # paned (resizable area)
-        outer.rowconfigure(1, weight=0)  # actions
-        outer.rowconfigure(2, weight=0)  # progress
-
-        # Vertical PanedWindow: Notebook on top, Log on bottom. Using
-        # tk.PanedWindow (not ttk) because only the legacy widget exposes
-        # per-pane minsize, which keeps the log from collapsing to zero.
-        paned = tk.PanedWindow(
-            outer, orient="vertical",
-            sashwidth=6, sashrelief="raised", borderwidth=0,
-        )
-        # Match the sash background to the ttk theme so it blends in;
-        # ttk widgets don't expose `background` via cget, so query the
-        # style instead. Skip silently if the theme doesn't define one.
-        theme_bg = ttk.Style().lookup("TFrame", "background")
-        if theme_bg:
-            paned.configure(background=theme_bg)
-        paned.grid(row=0, column=0, sticky="nsew")
-
-        nb = ttk.Notebook(paned)
+        # Only the notebook: everything about a run — Run/Cancel, progress,
+        # the log — lives on the Run tab, so the Review tab gets the whole
+        # window for the page it is correcting.
+        nb = ttk.Notebook(self.root)
+        nb.pack(fill="both", expand=True, padx=8, pady=8)
         tab_run = ttk.Frame(nb, padding=8)
-        tab_advanced = ttk.Frame(nb, padding=8)
         nb.add(tab_run, text="Run")
-        nb.add(tab_advanced, text="Advanced settings")
         self._build_run_tab(tab_run)
-        self._build_advanced_tab(tab_advanced)
         self.review = ReviewFrame(nb, self._settings,
                                   lambda: _save_settings(self._settings))
         nb.add(self.review, text="Review")
-        paned.add(nb, minsize=240, stretch="never")
-        self._paned = paned
         self._nb = nb
-        nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
-
-        log_frame = ttk.LabelFrame(paned, text="Log", padding=4)
-        log_frame.columnconfigure(0, weight=1)
-        log_frame.rowconfigure(0, weight=1)
-        self.log_text = tk.Text(
-            log_frame, wrap="none", height=10,
-            background="#101418", foreground="#d8d8d8",
-            insertbackground="#d8d8d8", font=("Consolas", 9),
-        )
-        self.log_text.grid(row=0, column=0, sticky="nsew")
-        scroll_y = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
-        scroll_y.grid(row=0, column=1, sticky="ns")
-        self.log_text.configure(yscrollcommand=scroll_y.set, state="disabled")
-        self.log_text.tag_configure("ERROR", foreground="#ff6e6e")
-        self.log_text.tag_configure("WARNING", foreground="#ffd166")
-        self.log_text.tag_configure("INFO", foreground="#d8d8d8")
-        self.log_text.tag_configure("DEBUG", foreground="#7d8896")
-        paned.add(log_frame, minsize=160, stretch="always")
-
-        # Persistent chrome below the paned area.
-        actions = ttk.Frame(outer)
-        actions.grid(row=1, column=0, sticky="ew", pady=(10, 6))
-        self.btn_run = ttk.Button(actions, text="Run OCR", command=self._on_run)
-        self.btn_run.pack(side="left")
-        self.btn_cancel = ttk.Button(actions, text="Cancel",
-                                     command=self._on_cancel, state="disabled")
-        self.btn_cancel.pack(side="left", padx=(8, 0))
-        self.btn_clear = ttk.Button(actions, text="Clear log",
-                                    command=self._clear_log)
-        self.btn_clear.pack(side="left", padx=(8, 0))
-        ttk.Label(actions, textvariable=self.var_status, foreground="#666").pack(
-            side="right")
-
-        self.progress = ttk.Progressbar(outer, mode="determinate")
-        self.progress.grid(row=2, column=0, sticky="ew", pady=(0, 6))
+        self.tab_run = tab_run
 
     def _build_run_tab(self, tab: ttk.Frame) -> None:
         tab.columnconfigure(1, weight=1)
+        tab.rowconfigure(7, weight=1)  # the log takes the leftover height
 
         ttk.Label(tab, text="Folder to OCR:").grid(
             row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 6))
@@ -308,8 +358,8 @@ class AltoOcrApp:
             row=1, column=0, sticky="w", padx=(0, 8), pady=(0, 6))
         ttk.Entry(tab, textvariable=self.var_output).grid(
             row=1, column=1, sticky="ew", pady=(0, 6))
-        ttk.Button(tab, text="Override…", command=self._browse_output).grid(
-            row=1, column=2, padx=(8, 0), pady=(0, 6))
+        self.btn_browse_output = ttk.Button(tab, text="Browse…", command=self._browse_output)
+        self.btn_browse_output.grid(row=1, column=2, padx=(8, 0), pady=(0, 6))
 
         ttk.Checkbutton(
             tab,
@@ -326,37 +376,161 @@ class AltoOcrApp:
 
         engine_frame = ttk.LabelFrame(tab, text="OCR engine", padding=8)
         engine_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(8, 4))
-        engine_frame.columnconfigure(1, weight=1)
         radio_row = ttk.Frame(engine_frame)
-        radio_row.grid(row=0, column=0, columnspan=3, sticky="w")
+        radio_row.pack(fill="x")
         ttk.Radiobutton(radio_row, text="Tesseract (default — word confidences)",
                         variable=self.var_engine, value="tesseract").pack(
             side="left", padx=(0, 16))
         ttk.Radiobutton(radio_row, text="GLMOCR (handwriting)",
                         variable=self.var_engine, value="glmocr").pack(side="left")
-        # Optional Tesseract binary override — leave blank to auto-detect.
-        ttk.Label(engine_frame, text="Tesseract path:").grid(
-            row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
-        ttk.Entry(engine_frame, textvariable=self.var_tesseract).grid(
-            row=1, column=1, sticky="ew", pady=(8, 0))
-        ttk.Button(engine_frame, text="Browse…",
-                   command=self._browse_tesseract).grid(
-            row=1, column=2, padx=(8, 0), pady=(8, 0))
-        ttk.Label(
-            engine_frame,
-            text="Only used when Tesseract is selected. Leave empty to "
-                 "auto-detect (PATH, TESSERACT_PATH, or standard install).",
-            foreground="#888",
-        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        hint = ttk.Label(
+            engine_frame, cursor="hand2", foreground="#1f6feb",
+            text="Tesseract location and other engine options: Tools ▸ Advanced settings…")
+        hint.pack(anchor="w", pady=(6, 0))
+        hint.bind("<Button-1>", lambda _e: self._open_advanced())
 
-    def _build_advanced_tab(self, tab: ttk.Frame) -> None:
-        tab.columnconfigure(0, weight=1)
+        actions = ttk.Frame(tab)
+        actions.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(10, 6))
+        self.btn_run = ttk.Button(actions, text="Run OCR", command=self._on_run)
+        self.btn_run.pack(side="left")
+        self.btn_cancel = ttk.Button(actions, text="Cancel",
+                                     command=self._on_cancel, state="disabled")
+        self.btn_cancel.pack(side="left", padx=(8, 0))
+        self.btn_clear = ttk.Button(actions, text="Clear log",
+                                    command=self._clear_log)
+        self.btn_clear.pack(side="left", padx=(8, 0))
+        ttk.Label(actions, textvariable=self.var_status, foreground="#666").pack(
+            side="right")
+
+        self.progress = ttk.Progressbar(tab, mode="determinate")
+        self.progress.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+
+        log_frame = ttk.LabelFrame(tab, text="Log", padding=4)
+        log_frame.grid(row=7, column=0, columnspan=3, sticky="nsew")
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+        self.log_text = tk.Text(
+            log_frame, wrap="none", height=8,
+            background="#101418", foreground="#d8d8d8",
+            insertbackground="#d8d8d8", font=("Consolas", 9),
+        )
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        scroll_y = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
+        scroll_y.grid(row=0, column=1, sticky="ns")
+        self.log_text.configure(yscrollcommand=scroll_y.set, state="disabled")
+        self.log_text.tag_configure("ERROR", foreground="#ff6e6e")
+        self.log_text.tag_configure("WARNING", foreground="#ffd166")
+        self.log_text.tag_configure("INFO", foreground="#d8d8d8")
+        self.log_text.tag_configure("DEBUG", foreground="#7d8896")
+
+    # ---------- Advanced settings window ---------------------------------------
+
+    def _open_advanced(self) -> None:
+        """Tools ▸ Advanced settings…: one window, raised if already open.
+        Edits apply to the next run and are saved when the window closes."""
+        if self._adv_win is not None and self._adv_win.winfo_exists():
+            self._adv_win.deiconify()
+            self._adv_win.lift()
+            self._adv_win.focus_set()
+            return
+        win = tk.Toplevel(self.root)
+        win.title(f"Advanced settings — {APP_TITLE}")
+        win.transient(self.root)
+        body = ttk.Frame(win, padding=12)
+        body.pack(fill="both", expand=True)
+        self._build_advanced_panel(body)
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=10, column=0, sticky="ew", pady=(4, 0))
+        ttk.Button(buttons, text="Reset to defaults",
+                   command=self._on_reset_advanced).pack(side="left")
+        ttk.Button(buttons, text="Close", command=self._close_advanced).pack(side="right")
+        ttk.Label(buttons, text="Changes apply to the next OCR run.",
+                  foreground="#888").pack(side="right", padx=(0, 12))
+
+        win.protocol("WM_DELETE_WINDOW", self._close_advanced)
+        win.bind("<Escape>", lambda _e: self._close_advanced())
+        win.geometry(f"+{self.root.winfo_rootx() + 60}+{self.root.winfo_rooty() + 40}")
+        self._adv_win = win
+
+    def _close_advanced(self) -> None:
+        """Validate and save; an invalid field keeps the window open."""
+        win = self._adv_win
+        if win is None:
+            return
+        try:
+            adv = parse_advanced(self._advanced_raw())
+        except SettingsError as e:
+            messagebox.showerror("Advanced settings", str(e), parent=win)
+            return
+        self._update_settings(advanced_settings(adv))
+        win.destroy()
+        self._adv_win = None
+
+    def _build_advanced_panel(self, panel: ttk.Frame) -> None:
+        panel.columnconfigure(0, weight=1)
+
+        # ----- Tesseract OCR (its program location moved here from Run) -----
+        tess = ttk.LabelFrame(panel, text="Tesseract OCR", padding=8)
+        tess.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        tess.columnconfigure(2, weight=1)
+        ttk.Label(tess, text="Tesseract program:").grid(
+            row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(tess, textvariable=self.var_tesseract, width=48).grid(
+            row=0, column=1, columnspan=2, sticky="ew")
+        ttk.Button(tess, text="Browse…", command=self._browse_tesseract).grid(
+            row=0, column=3, padx=(8, 0))
+        ttk.Label(
+            tess, foreground="#888",
+            text="Leave empty to find it automatically (PATH, TESSERACT_PATH, "
+                 "or the standard install folder).",
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(2, 6))
+        for row, (label, widget, hint) in enumerate((
+            ("Language:", ttk.Entry(tess, textvariable=self.var_ocr_lang, width=14),
+             "e.g. 'eng', 'fra', 'eng+lat'."),
+            ("PSM (page segmentation):",
+             ttk.Spinbox(tess, from_=0, to=13, increment=1,
+                         textvariable=self.var_psm, width=6),
+             "3=auto (default), 1=auto + rotated pages, 4=single column, 6=uniform block."),
+            ("OEM (engine mode):",
+             ttk.Spinbox(tess, from_=0, to=3, increment=1,
+                         textvariable=self.var_oem, width=6),
+             "3=default LSTM (recommended)."),
+        ), start=2):
+            ttk.Label(tess, text=label).grid(row=row, column=0, sticky="w",
+                                             padx=(0, 8), pady=(4, 0))
+            widget.grid(row=row, column=1, sticky="w", pady=(4, 0))
+            ttk.Label(tess, text=hint, foreground="#888").grid(
+                row=row, column=2, columnspan=2, sticky="w", padx=(8, 0), pady=(4, 0))
+
+        # ----- GLMOCR (handwriting) -----
+        gl = ttk.LabelFrame(panel, text="GLMOCR (handwriting)", padding=8)
+        gl.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        gl.columnconfigure(2, weight=1)
+        ttk.Label(gl, text="Endpoint:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(gl, textvariable=self.var_glmocr_endpoint).grid(
+            row=0, column=1, columnspan=2, sticky="ew")
+        ttk.Label(
+            gl, text="Leave empty to use OLLAMA_HOST or the built-in default.",
+            foreground="#888",
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        ttk.Label(gl, text="Model:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        ttk.Entry(gl, textvariable=self.var_glmocr_model, width=24).grid(
+            row=2, column=1, sticky="w", pady=(6, 0))
+        ttk.Label(
+            gl, text="Ollama model tag, e.g. 'glm-ocr:q8_0'.", foreground="#888",
+        ).grid(row=2, column=2, sticky="w", padx=(8, 0), pady=(6, 0))
+        ttk.Label(gl, text="Timeout (sec):").grid(
+            row=3, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        ttk.Spinbox(
+            gl, from_=10, to=900, increment=10,
+            textvariable=self.var_glmocr_timeout, width=8,
+        ).grid(row=3, column=1, sticky="w", pady=(6, 0))
 
         # ----- Preprocessing -----
-        pp = ttk.LabelFrame(tab, text="Preprocessing", padding=8)
-        pp.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        pp = ttk.LabelFrame(panel, text="Preprocessing", padding=8)
+        pp.grid(row=2, column=0, sticky="ew", pady=(0, 8))
         pp.columnconfigure(1, weight=1)
-
         ttk.Label(pp, text="Min DPI:").grid(row=0, column=0, sticky="w", padx=(0, 8))
         ttk.Spinbox(
             pp, from_=72, to=2400, increment=50,
@@ -366,107 +540,73 @@ class AltoOcrApp:
             pp, text="Upscale low-DPI scans to at least this DPI before OCR.",
             foreground="#888",
         ).grid(row=0, column=2, sticky="w", padx=(8, 0))
-
         stages = ttk.Frame(pp)
-        stages.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
-        ttk.Checkbutton(stages, text="Deskew",
-                        variable=self.var_do_deskew).pack(side="left", padx=(0, 12))
+        stages.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(8, 0))
         ttk.Checkbutton(stages, text="Denoise",
                         variable=self.var_do_denoise).pack(side="left", padx=(0, 12))
         ttk.Checkbutton(stages, text="CLAHE contrast",
                         variable=self.var_do_clahe).pack(side="left", padx=(0, 12))
         ttk.Checkbutton(stages, text="Binarize",
                         variable=self.var_do_binarize).pack(side="left", padx=(0, 12))
-        ttk.Checkbutton(stages, text="Border crop",
-                        variable=self.var_do_border_crop).pack(side="left")
-
+        ttk.Label(
+            pp, foreground="#888",
+            text="Deskew and border crop always stay off: they would move the "
+                 "text away from where the word boxes place it on the original scan.",
+        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(2, 0))
         ttk.Label(pp, text="Save preprocessed images to:").grid(
-            row=2, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+            row=3, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
         ttk.Entry(pp, textvariable=self.var_debug_preproc).grid(
-            row=2, column=1, sticky="ew", pady=(8, 0))
+            row=3, column=1, columnspan=2, sticky="ew", pady=(8, 0))
         ttk.Button(pp, text="Browse…", command=self._browse_debug_preproc).grid(
-            row=2, column=2, padx=(8, 0), pady=(8, 0))
+            row=3, column=3, padx=(8, 0), pady=(8, 0))
         ttk.Label(
             pp, text="Leave empty to skip; useful for debugging OCR accuracy.",
             foreground="#888",
-        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(2, 0))
-
-        # ----- Tesseract OCR options -----
-        tess = ttk.LabelFrame(tab, text="Tesseract OCR", padding=8)
-        tess.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        tess.columnconfigure(1, weight=0)
-
-        ttk.Label(tess, text="Language:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Entry(tess, textvariable=self.var_ocr_lang, width=14).grid(
-            row=0, column=1, sticky="w")
-        ttk.Label(
-            tess, text="e.g. 'eng', 'fra', 'eng+lat'.",
-            foreground="#888",
-        ).grid(row=0, column=2, sticky="w", padx=(8, 0))
-
-        ttk.Label(tess, text="PSM (page segmentation):").grid(
-            row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
-        ttk.Spinbox(
-            tess, from_=0, to=13, increment=1,
-            textvariable=self.var_psm, width=6,
-        ).grid(row=1, column=1, sticky="w", pady=(6, 0))
-        ttk.Label(
-            tess, text="3=auto (default), 4=single column, 6=uniform block.",
-            foreground="#888",
-        ).grid(row=1, column=2, sticky="w", padx=(8, 0), pady=(6, 0))
-
-        ttk.Label(tess, text="OEM (engine mode):").grid(
-            row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
-        ttk.Spinbox(
-            tess, from_=0, to=3, increment=1,
-            textvariable=self.var_oem, width=6,
-        ).grid(row=2, column=1, sticky="w", pady=(6, 0))
-        ttk.Label(
-            tess, text="3=default LSTM (recommended).",
-            foreground="#888",
-        ).grid(row=2, column=2, sticky="w", padx=(8, 0), pady=(6, 0))
-
-        # ----- GLMOCR (handwritten) -----
-        gl = ttk.LabelFrame(tab, text="GLMOCR (handwritten)", padding=8)
-        gl.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-        gl.columnconfigure(1, weight=1)
-
-        ttk.Label(gl, text="Endpoint:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Entry(gl, textvariable=self.var_glmocr_endpoint).grid(
-            row=0, column=1, columnspan=2, sticky="ew")
-        ttk.Label(
-            gl, text="Leave empty to use OLLAMA_HOST or the built-in default.",
-            foreground="#888",
-        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 0))
-
-        ttk.Label(gl, text="Model:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
-        ttk.Entry(gl, textvariable=self.var_glmocr_model, width=24).grid(
-            row=2, column=1, sticky="w", pady=(6, 0))
-        ttk.Label(
-            gl, text="Ollama model tag, e.g. 'glm-ocr:q8_0'.",
-            foreground="#888",
-        ).grid(row=2, column=2, sticky="w", padx=(8, 0), pady=(6, 0))
-
-        ttk.Label(gl, text="Timeout (sec):").grid(
-            row=3, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
-        ttk.Spinbox(
-            gl, from_=10, to=900, increment=10,
-            textvariable=self.var_glmocr_timeout, width=8,
-        ).grid(row=3, column=1, sticky="w", pady=(6, 0))
+        ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(2, 0))
 
         # ----- METS -----
-        mets = ttk.LabelFrame(tab, text="METS", padding=8)
+        mets = ttk.LabelFrame(panel, text="METS", padding=8)
         mets.grid(row=3, column=0, sticky="ew", pady=(0, 8))
         ttk.Checkbutton(
             mets, text="Compute MD5 checksums (slower on large objects)",
             variable=self.var_with_checksums,
         ).pack(side="left")
 
-        # Reset button
-        reset_row = ttk.Frame(tab)
-        reset_row.grid(row=4, column=0, sticky="ew")
-        ttk.Button(reset_row, text="Reset advanced settings to defaults",
-                   command=self._on_reset_advanced).pack(side="right")
+    def _advanced_raw(self) -> dict:
+        return {
+            "tesseract_path": self.var_tesseract.get(),
+            "min_dpi": self.var_min_dpi.get(),
+            "do_denoise": self.var_do_denoise.get(),
+            "do_clahe": self.var_do_clahe.get(),
+            "do_binarize": self.var_do_binarize.get(),
+            "debug_preprocessed": self.var_debug_preproc.get(),
+            "ocr_lang": self.var_ocr_lang.get(),
+            "psm": self.var_psm.get(),
+            "oem": self.var_oem.get(),
+            "glmocr_endpoint": self.var_glmocr_endpoint.get(),
+            "glmocr_model": self.var_glmocr_model.get(),
+            "glmocr_timeout": self.var_glmocr_timeout.get(),
+            "with_checksums": self.var_with_checksums.get(),
+        }
+
+    def _on_reset_advanced(self) -> None:
+        """Restore every Advanced setting to its dataclass default."""
+        pp = PreprocessConfig()
+        oo = OCROptions()
+        gc = GLMOCRConfig()
+        self.var_tesseract.set("")
+        self.var_min_dpi.set(str(pp.min_dpi))
+        self.var_do_denoise.set(pp.do_denoise)
+        self.var_do_clahe.set(pp.do_clahe)
+        self.var_do_binarize.set(pp.do_binarize)
+        self.var_debug_preproc.set("")
+        self.var_ocr_lang.set(oo.language)
+        self.var_psm.set(str(oo.psm))
+        self.var_oem.set(str(oo.oem))
+        self.var_glmocr_endpoint.set("")
+        self.var_glmocr_model.set(gc.model)
+        self.var_glmocr_timeout.set(str(gc.timeout_s))
+        self.var_with_checksums.set(True)
 
     # ---------- Helpers --------------------------------------------------------
 
@@ -513,8 +653,9 @@ class AltoOcrApp:
 
     def _browse_tesseract(self) -> None:
         f = filedialog.askopenfilename(
-            title="Select tesseract binary",
+            title="Select the Tesseract program",
             filetypes=[("Executable", "*.exe"), ("All files", "*.*")],
+            parent=self._adv_win or self.root,
         )
         if f:
             self.var_tesseract.set(f)
@@ -522,34 +663,40 @@ class AltoOcrApp:
     def _browse_debug_preproc(self) -> None:
         d = filedialog.askdirectory(
             title="Select folder for preprocessed-image dumps", mustexist=False,
+            parent=self._adv_win or self.root,
         )
         if d:
             self.var_debug_preproc.set(d)
 
-    def _on_reset_advanced(self) -> None:
-        """Restore every Advanced-tab field to its dataclass default."""
-        pp = PreprocessConfig()
-        oo = OCROptions()
-        gc = GLMOCRConfig()
-        self.var_min_dpi.set(pp.min_dpi)
-        self.var_do_deskew.set(pp.do_deskew)
-        self.var_do_denoise.set(pp.do_denoise)
-        self.var_do_clahe.set(pp.do_clahe)
-        self.var_do_binarize.set(pp.do_binarize)
-        self.var_do_border_crop.set(pp.do_border_crop)
-        self.var_debug_preproc.set("")
-        self.var_ocr_lang.set(oo.language)
-        self.var_psm.set(oo.psm)
-        self.var_oem.set(oo.oem)
-        self.var_glmocr_endpoint.set("")
-        self.var_glmocr_model.set(gc.model)
-        self.var_glmocr_timeout.set(gc.timeout_s)
-        self.var_with_checksums.set(True)
+    def _show_about(self) -> None:
+        messagebox.showinfo(
+            f"About {APP_TITLE}",
+            f"{APP_TITLE} {__version__}\n\n"
+            "Archival page scans → METS/ALTO XML and plain-text transcripts, "
+            "with a review tab for correcting them.\n\n"
+            f"Settings are kept in:\n{SETTINGS_PATH}",
+            parent=self.root,
+        )
 
     def _clear_log(self) -> None:
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.configure(state="disabled")
+
+    def _update_settings(self, changes: Mapping[str, object]) -> None:
+        """Merge ``changes`` into the settings (``None`` removes a key) and
+        write the file only if anything actually changed."""
+        s = dict(self._settings)
+        for key, value in changes.items():
+            if value is None:
+                s.pop(key, None)
+            else:
+                s[key] = value
+        if s != self._settings:
+            # Update in place: the Review tab holds a reference to this dict.
+            self._settings.clear()
+            self._settings.update(s)
+            _save_settings(self._settings)
 
     # ---------- Run lifecycle --------------------------------------------------
 
@@ -565,16 +712,17 @@ class AltoOcrApp:
         self.btn_cancel.configure(state="normal")
         self.progress.configure(value=0, maximum=1)
         self.var_status.set("Running…")
+        self.root.title(f"{APP_TITLE} — OCR running…")
         pc = cfg.preprocess_config
         logger.info(
             "Starting: input=%s output=%s recurse=%s mets=%s plaintext=%s "
             "checksums=%s engine=%s lang=%s psm=%d oem=%d min_dpi=%d "
-            "stages=[deskew=%s denoise=%s clahe=%s binarize=%s border=%s]",
+            "stages=[denoise=%s clahe=%s binarize=%s]",
             cfg.input_dir, cfg.output_dir, cfg.recurse,
             cfg.write_mets, cfg.write_plaintext, cfg.with_checksums,
             cfg.engine, cfg.ocr_options.language, cfg.ocr_options.psm,
             cfg.ocr_options.oem, pc.min_dpi,
-            pc.do_deskew, pc.do_denoise, pc.do_clahe, pc.do_binarize, pc.do_border_crop,
+            pc.do_denoise, pc.do_clahe, pc.do_binarize,
         )
         self._worker = threading.Thread(
             target=self._worker_main, args=(cfg,), daemon=True,
@@ -588,18 +736,6 @@ class AltoOcrApp:
         self.var_status.set("Cancelling — finishing current Ref ID…")
         self.btn_cancel.configure(state="disabled")
 
-    def _on_tab_changed(self, _event: object) -> None:
-        # The Review tab needs canvas height, but the default layout gives
-        # extra space to the log pane. On switching to Review with a short
-        # notebook pane, drop the sash so the notebook gets ~72% of the
-        # paned area; the user can still drag it back.
-        try:
-            if (self._nb.select() == str(self.review)
-                    and self._nb.winfo_height() < 500):
-                self._paned.sash_place(0, 0, int(self._paned.winfo_height() * 0.72))
-        except tk.TclError:
-            pass
-
     def _on_close(self) -> None:
         if self._worker and self._worker.is_alive():
             if not messagebox.askyesno(
@@ -611,6 +747,14 @@ class AltoOcrApp:
             self._cancel_event.set()
         if not self.review.confirm_close():
             return
+        if self._adv_win is not None and self._adv_win.winfo_exists():
+            # Keep what was set in an open Advanced window, if it is valid;
+            # never block quitting over a half-typed field.
+            try:
+                self._update_settings(advanced_settings(parse_advanced(self._advanced_raw())))
+            except SettingsError:
+                pass
+        self.root.after_cancel(self._poll_after)
         self.root.destroy()
 
     def _collect_config(self) -> JobConfig | None:
@@ -658,57 +802,13 @@ class AltoOcrApp:
                 f"Pick an output folder that doesn't contain the input.",
             )
             return None
-        tess_str = self.var_tesseract.get().strip()
-        tess_path: Optional[Path] = Path(tess_str).expanduser() if tess_str else None
-        if tess_path is not None and not tess_path.is_file():
-            messagebox.showerror(
-                APP_TITLE,
-                f"Tesseract path does not point at a file:\n{tess_path}\n\n"
-                f"Leave the field empty to auto-detect, or pick the binary with Browse…",
-            )
-            return None
-
-        # ----- Advanced tab -----
         try:
-            min_dpi = int(self.var_min_dpi.get())
-            psm = int(self.var_psm.get())
-            oem = int(self.var_oem.get())
-            glmocr_timeout = int(self.var_glmocr_timeout.get())
-        except (tk.TclError, ValueError):
+            adv = parse_advanced(self._advanced_raw())
+        except SettingsError as e:
             messagebox.showerror(
-                APP_TITLE,
-                "Advanced settings: Min DPI / PSM / OEM / GLMOCR timeout must be integers.",
-            )
+                APP_TITLE, f"{e}\n\n(Tools ▸ Advanced settings…)",
+                parent=self._adv_win or self.root)
             return None
-        if min_dpi <= 0:
-            messagebox.showerror(APP_TITLE, "Min DPI must be positive.")
-            return None
-        if not (0 <= psm <= 13):
-            messagebox.showerror(APP_TITLE, "PSM must be between 0 and 13.")
-            return None
-        if not (0 <= oem <= 3):
-            messagebox.showerror(APP_TITLE, "OEM must be between 0 and 3.")
-            return None
-        if glmocr_timeout <= 0:
-            messagebox.showerror(APP_TITLE, "GLMOCR timeout must be positive.")
-            return None
-
-        ocr_lang = self.var_ocr_lang.get().strip() or "eng"
-        glmocr_model = self.var_glmocr_model.get().strip() or GLMOCRConfig().model
-        glmocr_endpoint_str = self.var_glmocr_endpoint.get().strip()
-
-        debug_str = self.var_debug_preproc.get().strip()
-        debug_dir = Path(debug_str).expanduser() if debug_str else None
-
-        preprocess_config = PreprocessConfig(
-            min_dpi=min_dpi,
-            do_deskew=self.var_do_deskew.get(),
-            do_denoise=self.var_do_denoise.get(),
-            do_clahe=self.var_do_clahe.get(),
-            do_binarize=self.var_do_binarize.get(),
-            do_border_crop=self.var_do_border_crop.get(),
-        )
-        ocr_options = OCROptions(language=ocr_lang, psm=psm, oem=oem)
 
         return JobConfig(
             input_dir=in_path,
@@ -716,65 +816,30 @@ class AltoOcrApp:
             recurse=self.var_recurse.get(),
             write_mets=self.var_mets.get(),
             write_plaintext=self.var_plaintext.get(),
-            with_checksums=self.var_with_checksums.get(),
             engine=self.var_engine.get(),
-            tesseract_path=tess_path,
-            preprocess_config=preprocess_config,
-            debug_preprocessed_dir=debug_dir,
-            ocr_options=ocr_options,
-            glmocr_endpoint=glmocr_endpoint_str or None,
-            glmocr_model=glmocr_model,
-            glmocr_timeout=glmocr_timeout,
+            **adv,
         )
 
     def _persist_settings(self, cfg: JobConfig) -> None:
         """Snapshot the job's basic + advanced configuration to disk so it
-        comes back on the next launch.
-
-        The Tesseract path keeps its existing semantics: only saved when the
-        user supplied an explicit path; auto-detected paths are re-derived
-        each launch so a Tesseract reinstall doesn't strand us on a stale
-        location.
-        """
-        s = dict(self._settings)
-        # Run-tab basics
-        s["recurse"] = cfg.recurse
-        s["engine"] = cfg.engine
-        s["write_mets"] = cfg.write_mets
-        s["write_plaintext"] = cfg.write_plaintext
-        # Advanced — Preprocessing
-        pc = cfg.preprocess_config
-        s["min_dpi"] = pc.min_dpi
-        s["do_deskew"] = pc.do_deskew
-        s["do_denoise"] = pc.do_denoise
-        s["do_clahe"] = pc.do_clahe
-        s["do_binarize"] = pc.do_binarize
-        s["do_border_crop"] = pc.do_border_crop
-        s["debug_preprocessed"] = (
-            str(cfg.debug_preprocessed_dir) if cfg.debug_preprocessed_dir else ""
-        )
-        # Advanced — Tesseract OCR
-        s["ocr_lang"] = cfg.ocr_options.language
-        s["psm"] = cfg.ocr_options.psm
-        s["oem"] = cfg.ocr_options.oem
-        # Advanced — GLMOCR
-        s["glmocr_endpoint"] = cfg.glmocr_endpoint or ""
-        s["glmocr_model"] = cfg.glmocr_model
-        s["glmocr_timeout"] = cfg.glmocr_timeout
-        # Advanced — METS
-        s["with_checksums"] = cfg.with_checksums
-        # Tesseract path — only if explicit.
-        if cfg.tesseract_path:
-            s["tesseract_path"] = str(cfg.tesseract_path)
-        else:
-            s.pop("tesseract_path", None)
-
-        if s != self._settings:
-            # Update in place: the Review tab holds a reference to this dict
-            # (its keys ride along in `s` via the dict(...) copy above).
-            self._settings.clear()
-            self._settings.update(s)
-            _save_settings(self._settings)
+        comes back on the next launch."""
+        changes: dict[str, object] = {
+            "recurse": cfg.recurse,
+            "engine": cfg.engine,
+            "write_mets": cfg.write_mets,
+            "write_plaintext": cfg.write_plaintext,
+        }
+        changes.update(advanced_settings({
+            "tesseract_path": cfg.tesseract_path,
+            "preprocess_config": cfg.preprocess_config,
+            "debug_preprocessed_dir": cfg.debug_preprocessed_dir,
+            "ocr_options": cfg.ocr_options,
+            "glmocr_endpoint": cfg.glmocr_endpoint,
+            "glmocr_model": cfg.glmocr_model,
+            "glmocr_timeout": cfg.glmocr_timeout,
+            "with_checksums": cfg.with_checksums,
+        }))
+        self._update_settings(changes)
 
     # ---------- Worker (off the main thread) -----------------------------------
 
@@ -918,14 +983,18 @@ class AltoOcrApp:
                     self.btn_run.configure(state="normal")
                     self.btn_cancel.configure(state="disabled")
                     self.var_status.set("Done." if success else "Finished with errors.")
+                    self.root.title(APP_TITLE)
                 else:
                     self.progress.configure(maximum=max(total, 1), value=current)
                     if total > 0:
                         self.var_status.set(f"Processed {current}/{total} Ref ID(s).")
+                        # The log lives on the Run tab; the title keeps a
+                        # corrector working on the Review tab informed.
+                        self.root.title(f"{APP_TITLE} — OCR {current}/{total} Ref ID(s)")
         except queue.Empty:
             pass
 
-        self.root.after(self.POLL_MS, self._drain_queues)
+        self._poll_after = self.root.after(self.POLL_MS, self._drain_queues)
 
     def _append_log(self, level: str, msg: str) -> None:
         self.log_text.configure(state="normal")
