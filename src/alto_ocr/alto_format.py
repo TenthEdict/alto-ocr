@@ -112,6 +112,29 @@ def qname(ns: str | None, tag: str) -> str:
     return f"{{{ns}}}{tag}" if ns else tag
 
 
+# Characters a String's CONTENT must never carry: everything XML 1.0 cannot
+# represent at all (C0 controls other than tab/LF/CR, lone surrogates,
+# U+FFFE/U+FFFF), plus DEL and the C1 controls, which XML tolerates but no
+# transcription legitimately contains — they are the signature of
+# mis-decoded text pasted in from somewhere else. Tab/LF/CR never reach a
+# CONTENT value: edits collapse whitespace before storing it.
+_NOT_CONTENT = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ud800-\udfff￾￿]")
+
+
+def content_problem(text: str) -> str | None:
+    """Why ``text`` cannot be stored as an ALTO ``CONTENT`` value, or None.
+
+    Checked before a human edit mutates the tree. lxml would refuse most of
+    these characters on its own, but with an exception raised half-way
+    through an edit and a message no corrector can act on.
+    """
+    m = _NOT_CONTENT.search(text)
+    if m is None:
+        return None
+    return (f"contains U+{ord(m.group()):04X}, a control character that ALTO "
+            "(XML) cannot store; retype that part of the word")
+
+
 def px_to_mm10(px: int, dpi: int) -> int:
     """Convert a pixel value to ALTO ``mm10`` units (1/10 mm).
 
