@@ -32,6 +32,7 @@ from ..remediate import (
     StubPageError,
     repackage_object,
 )
+from ..symbols import keyboard_payload
 from . import imaging, ops
 from .config import ReviewServerConfig
 from .discovery import ObjectIndex, ReviewObject, StatsCache
@@ -129,6 +130,9 @@ def create_app(config: ReviewServerConfig) -> FastAPI:
             "readOnly": config.read_only,
             "lowWc": config.low_wc,
             "goobiManaged": config.goobi_metadata_root is not None,
+            # The symbol keyboard's layout: one definition for both review
+            # UIs (symbols.py), so the keys cannot drift apart.
+            "symbols": keyboard_payload(),
         }
 
     @app.get("/healthz")

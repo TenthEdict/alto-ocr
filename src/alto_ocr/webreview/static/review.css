@@ -39,6 +39,11 @@
 
 * { box-sizing: border-box; }
 
+/* The script shows and hides panels with the `hidden` attribute. The
+   browser's own rule for it loses to any class that sets `display` (the
+   editor bars are `display: flex`), which left them on screen when hidden. */
+[hidden] { display: none !important; }
+
 body {
   margin: 0;
   background: var(--bg);
@@ -188,7 +193,18 @@ input[type=text]:focus, input[type=search]:focus {
 .badge { font-size: 12px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--ink-soft); }
 .badge.low { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
 .badge.new { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
-.glyphs { display: flex; flex-wrap: wrap; gap: 3px; }
+/* Symbol keyboard: category tabs over rows of keys. */
+.symbols { display: grid; gap: 4px; }
+.symbol-tabs { display: flex; flex-wrap: wrap; gap: 2px; }
+.symtab {
+  font: inherit; font-size: 12.5px; padding: 1px 9px; cursor: pointer;
+  border: 1px solid transparent; border-radius: 999px;
+  background: transparent; color: var(--ink-soft);
+}
+.symtab:hover { color: var(--accent); }
+.symtab[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+.glyphs { display: grid; gap: 3px; }
+.glyph-row { display: flex; flex-wrap: wrap; gap: 3px; }
 .glyphs button {
   font: inherit; min-width: 27px; padding: 1px 5px; cursor: pointer;
   border: 1px solid var(--line); border-radius: 4px;

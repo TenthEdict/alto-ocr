@@ -13,14 +13,13 @@
  */
 'use strict';
 
-const GLYPHS = ['π','Σ','Δ','θ','Ω','μ','√','∫','∞','±','×','÷',
-                '≈','≠','≤','≥','°','·','²','³','½','¼','¾','—'];
 const ZOOMS = [0.1, 0.15, 0.25, 0.33, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0];
 
 const view = document.getElementById('view');
 const crumbs = document.getElementById('crumbs');
 const banner = document.getElementById('banner');
-let CONFIG = { readOnly: false, lowWc: 0.5, version: '' };
+let CONFIG = { readOnly: false, lowWc: 0.5, version: '', symbols: { categories: [], labels: {} } };
+let symbolTab = null;  // the keyboard tab last used, kept across pages
 
 /* ---------------------------------------------------------------- utils */
 
@@ -61,8 +60,11 @@ const el = (tag, attrs = {}, ...kids) => {
   return node;
 };
 
-const fmt = (n, digits = 2) =>
-  (n === null || n === undefined) ? '—' : Number(n).toFixed(digits);
+/* A confidence (0..1) as a whole percentage, the way the Tk GUI shows it.
+ * Floored, not rounded, so the number agrees with the flag rule: under a
+ * 50% threshold a word shown as 49% is flagged and one shown as 50% is not. */
+const pct = (n) =>
+  (n === null || n === undefined) ? '—' : `${Math.floor(Number(n) * 100 + 1e-9)}%`;
 
 let bannerTimer = null;
 function flash(message, kind) {
@@ -125,7 +127,7 @@ async function renderWorklist() {
         el('td', {}, el('strong', { text: r.refId })),
         el('td', { class: 'num', text: String(r.pages) }),
         el('td', { class: 'num', text: String(r.pagesToReview) }),
-        el('td', { class: 'num', text: fmt(r.meanPc) }),
+        el('td', { class: 'num', text: pct(r.meanPc) }),
         el('td', { class: 'num', text: String(r.lowWords) }),
         el('td', {}, ...state),
         el('td', {}, el('span', { class: 'muted', text: '›' })),
@@ -190,7 +192,7 @@ async function renderObject(refId) {
       el('td', {}, el('span', { class: 'mono', text: p.stem }),
          p.hasImage ? null : el('span', { class: 'tag warn', text: ' no scan' })),
       el('td', {}, el('span', { class: `tag ${p.status === 'failed' ? 'failed' : p.status === 'empty' ? 'empty' : ''}`, text: p.status })),
-      el('td', { class: 'num', text: fmt(p.pc) }),
+      el('td', { class: 'num', text: pct(p.pc) }),
       el('td', { class: 'num', text: String(p.words) }),
       el('td', { class: 'num', text: String(p.lowWords) }),
       el('td', {}, p.reviewed ? el('span', { class: 'tag done', text: 'yes' }) : el('span', { class: 'muted', text: '—' })),
@@ -206,7 +208,7 @@ async function renderObject(refId) {
 
   const s = data.stats;
   statsLine.textContent =
-    `${s.pages} page(s) · ${s.pagesToReview} left to review · mean PC ${fmt(s.meanPc)} · `
+    `${s.pages} page(s) · ${s.pagesToReview} left to review · mean PC ${pct(s.meanPc)} · `
     + `${s.lowWords} low-confidence word(s) of ${s.words}`
     + (s.missingImages ? ` · ${s.missingImages} page(s) with no matching scan` : '')
     + `\n${data.objectDir}`;
@@ -368,7 +370,7 @@ async function renderPage(refId, stem) {
     editor.hidden = false;
     const wc = w.wc;
     const badge = $('ed-wc');
-    badge.textContent = wc === null || wc === undefined ? 'no WC' : `WC ${fmt(wc)}`;
+    badge.textContent = wc === null || wc === undefined ? 'no WC' : `WC ${pct(wc)}`;
     badge.className = 'badge' + ((wc === null || wc === undefined || wc < CONFIG.lowWc) ? ' low' : '');
     const flagged = page.flagged.filter(i => !pending.has(i));
     $('ed-pos').textContent = `word ${w.i + 1} of ${page.words.length} · ${flagged.length} flagged left`;
@@ -461,18 +463,35 @@ async function renderPage(refId, stem) {
     else if (ev.key === 'Escape') { ev.preventDefault(); select(null); }
   });
 
-  const glyphs = $('glyphs');
-  for (const g of GLYPHS) {
-    glyphs.append(el('button', {
-      type: 'button', text: g, title: `Insert ${g}`,
-      onclick: () => {
-        const at = edText.selectionStart ?? edText.value.length;
-        edText.value = edText.value.slice(0, at) + g + edText.value.slice(edText.selectionEnd ?? at);
-        edText.focus();
-        edText.setSelectionRange(at + g.length, at + g.length);
-      },
-    }));
-  }
+  /* Symbol keyboard: rows of keys under category tabs, in the layout the
+   * server sends (symbols.py -- the Tk GUI renders the same one, so the two
+   * offer identical keys). A key types like a key press: it replaces the
+   * selection and leaves the caret after it. mousedown is cancelled so a
+   * click never takes focus away from the word being edited. */
+  const insertSymbol = (g) => {
+    const at = edText.selectionStart ?? edText.value.length;
+    edText.value = edText.value.slice(0, at) + g + edText.value.slice(edText.selectionEnd ?? at);
+    edText.focus();
+    edText.setSelectionRange(at + g.length, at + g.length);
+  };
+  const keyboard = CONFIG.symbols || { categories: [], labels: {} };
+  const keepFocus = (ev) => ev.preventDefault();
+  const paintSymbols = () => {
+    const names = keyboard.categories.map(c => c.name);
+    if (!names.includes(symbolTab)) symbolTab = names[0] ?? null;
+    $('symbol-tabs').replaceChildren(...keyboard.categories.map(c => el('button', {
+      type: 'button', class: 'symtab', text: c.name,
+      'aria-pressed': String(c.name === symbolTab), onmousedown: keepFocus,
+      onclick: () => { symbolTab = c.name; paintSymbols(); },
+    })));
+    const shown = keyboard.categories.find(c => c.name === symbolTab);
+    $('glyphs').replaceChildren(...(shown ? shown.rows : []).map(row => el('div', { class: 'glyph-row' },
+      ...row.map(g => el('button', {
+        type: 'button', text: g, title: keyboard.labels[g] || g,
+        onmousedown: keepFocus, onclick: () => insertSymbol(g),
+      })))));
+  };
+  paintSymbols();
 
   /* ---- add-word mode ---- */
   const setAddMode = (on) => {
@@ -627,7 +646,7 @@ async function renderPage(refId, stem) {
     const worst = $('side-worst').checked;
     list.replaceChildren(...pageSort(objectPages, worst).map(p => el('li', {
       'aria-current': p.stem === stem ? 'true' : null,
-      title: `${p.status}${p.pc === null ? '' : ` · PC ${fmt(p.pc)}`}${p.reviewed ? ' · reviewed' : ''}`,
+      title: `${p.status}${p.pc === null ? '' : ` · PC ${pct(p.pc)}`}${p.reviewed ? ' · reviewed' : ''}`,
       onclick: () => {
         if (dirty() && !confirm('You have unsaved corrections on this page. Leave anyway?')) return;
         location.hash = `#/obj/${enc(refId)}/${enc(p.stem)}`;
@@ -635,7 +654,7 @@ async function renderPage(refId, stem) {
     },
       el('span', { class: 'dot' + (p.status === 'failed' ? ' failed' : p.reviewed ? ' reviewed' : '') }),
       el('span', { class: 'mono', text: p.stem }),
-      el('span', { class: 'pc', text: p.pc === null ? p.status : fmt(p.pc) }),
+      el('span', { class: 'pc', text: p.pc === null ? p.status : pct(p.pc) }),
     )));
   };
   $('side-ref').textContent = refId;
@@ -658,8 +677,8 @@ async function renderPage(refId, stem) {
   drawOverlay();
   refreshPending();
   const flaggedCount = page.flagged.length;
-  say(`${page.words.length} word(s), ${flaggedCount} flagged below WC ${CONFIG.lowWc}`
-      + (page.pc ? ` · page PC ${page.pc}` : '')
+  say(`${page.words.length} word(s), ${flaggedCount} flagged below ${pct(CONFIG.lowWc)}`
+      + (page.pc ? ` · page PC ${pct(page.pc)}` : '')
       + '. Click a word, or press n for the next flagged one.');
   if (flaggedCount) step(1);
 }
