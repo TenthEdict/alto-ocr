@@ -144,7 +144,8 @@ def find_tesseract(override: str | Path | None = None) -> Path:
     raise TesseractNotFoundError(
         "Tesseract not found. Install it (Linux: 'apt-get install tesseract-ocr'; "
         "Windows: https://github.com/UB-Mannheim/tesseract/wiki) and either add it "
-        "to PATH, set TESSERACT_PATH, or pass --tesseract-path on the CLI."
+        "to PATH, set TESSERACT_PATH, pass --tesseract-path on the CLI, or set "
+        "the Tesseract program under Tools > Advanced settings in the GUI."
     )
 
 

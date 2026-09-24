@@ -23,7 +23,14 @@ Semantics (agreed 2026-07-30):
 * **Deleting a word** (OCR hallucinated text on noise/marginalia) removes
   the ``<String>`` plus its neighboring ``<SP>``, and cascades upward:
   a ``<TextLine>``/``<TextBlock>``/``<ComposedBlock>`` left with no text
-  content is removed too, keeping the ALTO schema-shaped.
+  content is removed too, keeping the ALTO schema-shaped. The returned
+  ``Removal`` records every detached node with its parent and position, so
+  ``undo_delete`` puts the document back exactly as it was (2026-09-24:
+  the review GUI deletes without a confirmation prompt, and Ctrl+Z is
+  what makes that safe).
+* **Text a human types** is checked before it touches the tree
+  (``alto_format.content_problem``): a control character pasted in from
+  elsewhere is refused with a message, never half-applied.
 * **Clearing a page** (2026-07-31; the whole page is hallucinated OCR —
   covers/photographs where texture was read as thousands of garbage
   words) bulk-deletes every word in one operation, leaving the
@@ -73,6 +80,7 @@ from ._util import atomic_write_text
 from .alto_format import (
     ATTR_ORDER,
     alto_namespace,
+    content_problem,
     hardened_parser,
     qname,
     reorder_attrs,
@@ -138,6 +146,28 @@ class Word:
         return wc is None or wc < threshold
 
 
+@dataclass(frozen=True)
+class Removal:
+    """Everything one word removal detached from the tree, in detach order:
+    ``(parent, index, node)`` for the neighboring ``<SP>``, the ``<String>``
+    itself, and each container the cascade emptied. Replaying it backwards
+    re-inserts each node at its recorded index, which is exact because every
+    index was taken at the moment its node left. Opaque to callers — hand
+    it back to ``undo_delete``/``redo_add``."""
+
+    steps: tuple[tuple[etree._Element, int, etree._Element], ...]
+
+
+def _checked_content(text: str) -> str:
+    """Whitespace-collapsed text, refused (ValueError) when ALTO cannot
+    store it. The one gate for every word a human types into a page."""
+    content = " ".join(text.split())
+    problem = content_problem(content)
+    if problem is not None:
+        raise ValueError(f"{content!r} {problem}.")
+    return content
+
+
 class ReviewPage:
     """One ALTO file held open for editing, with pixel-space word geometry.
 
@@ -199,6 +229,9 @@ class ReviewPage:
         # forced) when the file changed on disk after this load. mtime ticks
         # are coarse on some network shares — best-effort, not a lock.
         self._loaded_mtime_ns = self.alto_path.stat().st_mtime_ns
+        # The tree as last loaded or saved, for settle(): a session whose
+        # changes have all been undone has nothing to save.
+        self._clean_state = etree.tostring(self.root)
 
         self.dirty = False
         self.session_edits = 0  # edits+deletions since load, folded into provenance on save
@@ -262,8 +295,10 @@ class ReviewPage:
     # ---------- edits -----------------------------------------------------
 
     def edit_word(self, word: Word, new_text: str) -> None:
-        """Set a word's CONTENT (whitespace-collapsed) and mark it verified."""
-        text = " ".join(new_text.split())
+        """Set a word's CONTENT (whitespace-collapsed) and mark it verified.
+        Raises ValueError, changing nothing, for empty text or text ALTO
+        cannot store."""
+        text = _checked_content(new_text)
         if not text:
             raise ValueError("Empty text — use delete_word to remove a word.")
         word.elem.set("CONTENT", text)
@@ -297,24 +332,44 @@ class ReviewPage:
         self.session_verifies += 1
         return True
 
-    def delete_word(self, word: Word) -> None:
-        """Remove a hallucinated word (plus a neighboring SP; cascade empties)."""
-        self._remove_string(word)
+    def delete_word(self, word: Word) -> Removal:
+        """Remove a hallucinated word (plus a neighboring SP; cascade empties).
+        The returned ``Removal`` lets ``undo_delete`` restore it exactly."""
+        removal = self._remove_string(word)
         self.dirty = True
         self.session_edits += 1
+        return removal
 
-    def _remove_string(self, word: Word) -> None:
+    def undo_delete(self, word: Word, removal: Removal) -> None:
+        """Undo one ``delete_word`` (GUI undo stack): put the String, its SP
+        and every container the cascade removed back where they were, and
+        un-count the deletion. ``dirty`` stays as-is, like ``revert_word`` —
+        other unsaved changes may exist; reloading is the full reset.
+
+        Only exact while the tree is as the deletion left it, which a strict
+        undo stack guarantees: every later change has been undone first."""
+        self._restore(word, removal)
+        self.session_edits = max(0, self.session_edits - 1)
+
+    def _remove_string(self, word: Word) -> Removal:
         """Detach a word's ``<String>`` plus a neighboring ``<SP>``, cascading
         away emptied containers. Shared by ``delete_word`` and ``undo_add``."""
+        steps: list[tuple[etree._Element, int, etree._Element]] = []
+
+        def detach(node: etree._Element) -> None:
+            parent_ = node.getparent()
+            steps.append((parent_, parent_.index(node), node))
+            parent_.remove(node)
+
         el = word.elem
         parent = el.getparent()
         sp_tag = qname(self.ns, "SP")
         prev, nxt = el.getprevious(), el.getnext()
         if prev is not None and prev.tag == sp_tag:
-            parent.remove(prev)
+            detach(prev)
         elif nxt is not None and nxt.tag == sp_tag:
-            parent.remove(nxt)
-        parent.remove(el)
+            detach(nxt)
+        detach(el)
 
         # Cascade: drop text containers left with no String anywhere below.
         # Only TextLine/TextBlock/ComposedBlock — never PrintSpace/Page/margins.
@@ -324,10 +379,27 @@ class ReviewPage:
         while node is not None and etree.QName(node).localname in removable:
             up = node.getparent()
             if next(node.iter(string_tag), None) is None:
-                up.remove(node)
+                detach(node)
             node = up
 
         self.words.remove(word)
+        return Removal(tuple(steps))
+
+    def _restore(self, word: Word, removal: Removal) -> None:
+        """Replay a ``Removal`` backwards and put the word back into
+        ``self.words`` at its reading-order position."""
+        for parent, index, node in reversed(removal.steps):
+            parent.insert(index, node)
+        self._insert_in_reading_order(word)
+
+    def _insert_in_reading_order(self, word: Word) -> None:
+        """Place an attached word in ``self.words`` by document order —
+        ``flagged()`` and the GUI's next-word stepping rely on that order."""
+        order = {id(s): i
+                 for i, s in enumerate(self.root.iter(qname(self.ns, "String")))}
+        pos = sum(1 for existing in self.words
+                  if order.get(id(existing.elem), -1) < order[id(word.elem)])
+        self.words.insert(pos, word)
 
     def clear_words(self) -> int:
         """Remove every word on the page — bulk rejection for pages whose
@@ -385,7 +457,7 @@ class ReviewPage:
         provenance total like any other correction. Returns the new Word,
         placed in reading order in ``self.words``.
         """
-        content = " ".join(text.split())
+        content = _checked_content(text)
         if not content:
             raise ValueError("Empty text — nothing to add.")
         x, y, w, h = box_px
@@ -412,24 +484,31 @@ class ReviewPage:
 
         word = Word(el, (hpos * self.sx, vpos * self.sy,
                          width * self.sx, height * self.sy))
-        # Keep self.words in document (reading) order — flagged() and the
-        # GUI's next-word stepping rely on it.
-        order = {id(s): i
-                 for i, s in enumerate(self.root.iter(qname(self.ns, "String")))}
-        pos = sum(1 for existing in self.words
-                  if order.get(id(existing.elem), -1) < order[id(el)])
-        self.words.insert(pos, word)
+        self._insert_in_reading_order(word)
 
         self.dirty = True
         self.session_edits += 1
         return word
 
-    def undo_add(self, word: Word) -> None:
+    def undo_add(self, word: Word) -> Removal:
         """Undo one ``add_word`` (GUI undo stack): detach the String again
         and un-count the edit. ``dirty`` stays as-is, like ``revert_word`` —
-        other unsaved changes may exist; reloading is the full reset."""
-        self._remove_string(word)
+        other unsaved changes may exist; reloading is the full reset.
+
+        Also how the GUI deletes a word added in the same session, netting
+        the add out of the provenance count instead of counting an add plus
+        a delete; the returned ``Removal`` lets ``redo_add`` bring it back
+        when that deletion is itself undone."""
+        removal = self._remove_string(word)
         self.session_edits = max(0, self.session_edits - 1)
+        return removal
+
+    def redo_add(self, word: Word, removal: Removal) -> None:
+        """Reverse ``undo_add``: re-attach the added word exactly where it
+        was and count it again."""
+        self._restore(word, removal)
+        self.dirty = True
+        self.session_edits += 1
 
     @staticmethod
     def _box_of(el: etree._Element) -> tuple[int, int, int, int] | None:
@@ -687,6 +766,19 @@ class ReviewPage:
             return True
         return False
 
+    def settle(self) -> bool:
+        """After an undo: clear ``dirty`` when the tree is byte-identical to
+        its last loaded or saved state — every change has been undone, so
+        nothing is left to save. Without this an undone session still asks
+        to be saved, and saving it stamps review provenance (and with it the
+        re-OCR guard) on a page nobody changed. Conservative by design: an
+        undo that is not byte-exact (``undo_add`` does not shrink the line
+        and block boxes an added word grew) keeps the page dirty. Returns
+        ``dirty``."""
+        if self.dirty and etree.tostring(self.root) == self._clean_state:
+            self.dirty = False
+        return self.dirty
+
     def undo_move(self, el: etree._Element, delta: int) -> bool:
         """Undo one ``move_element`` (GUI undo stack): apply the inverse
         move and un-count it. ``dirty`` stays as-is, like ``revert_word`` —
@@ -753,6 +845,7 @@ class ReviewPage:
         self.session_verifies = 0
         serialize_with_tabs(self.tree, self.alto_path)
         self._loaded_mtime_ns = self.alto_path.stat().st_mtime_ns
+        self._clean_state = etree.tostring(self.root)
 
         txt_path: Path | None = None
         text_dir = self.alto_path.parent.parent / "Text"

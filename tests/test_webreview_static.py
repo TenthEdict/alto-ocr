@@ -87,16 +87,23 @@ class StaticAssetTests(unittest.TestCase):
         self.assertTrue(sent)
         self.assertEqual(sorted(sent - set(ops._ALL_OPS)), [])
 
-    def test_glyph_palette_matches_the_tk_gui(self) -> None:
-        """Correctors move between the two UIs; the engineering-notebook
-        characters they cannot type must be the same set in both."""
-        try:
-            from src.alto_ocr.review import _GLYPHS
-        except ImportError as e:      # no tkinter on this box (headless build)
-            self.skipTest(f"review.py needs Tk to import: {e}")
-        js_glyphs = re.search(r"const GLYPHS = \[(.*?)\];", self.js, re.S).group(1)
-        found = tuple(re.findall(r"'([^']+)'", js_glyphs))
-        self.assertEqual(found, _GLYPHS)
+    def test_symbol_keyboard_comes_from_the_server(self) -> None:
+        """Correctors move between the two UIs; the characters they cannot
+        type must be the same keys in both. So neither UI hard-codes them:
+        the server hands the browser the one layout (``symbols.py``) that
+        the Tk GUI renders. This checks the wiring at both ends; the layout
+        itself is tested in test_symbols."""
+        self.assertNotRegex(self.js, r"const\s+GLYPHS\b",
+                            "review.js hard-codes a symbol palette again")
+        self.assertIn("CONFIG.symbols", self.js)
+        app_src = (STATIC.parent / "app.py").read_text(encoding="utf-8")
+        self.assertRegex(app_src, r'"symbols":\s*keyboard_payload\(\)')
+
+    def test_confidence_is_shown_as_percentages(self) -> None:
+        """Both UIs show confidence as whole percentages (the Tk tab's
+        ``review.pct``), floored so the number agrees with the flag rule."""
+        self.assertNotRegex(self.js, r"\bfmt\(", "a decimal formatter is back")
+        self.assertIn("Math.floor(Number(n) * 100 + 1e-9)", self.js)
 
 
 if __name__ == "__main__":

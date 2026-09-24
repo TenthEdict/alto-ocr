@@ -6,7 +6,9 @@ WC only, its own provenance clause and session counter, undo via
 unverify_word), next/previous-word stepping by document position
 (step_from/doc_index — a corrected word must not restart the page),
 whitespace handling, deletion with SP cleanup and
-container cascade (stopping at PrintSpace), page clearing (clear_words:
+container cascade (stopping at PrintSpace), exact undo of deletions
+(undo_delete; redo_add for a same-session added word), refusal of text
+ALTO cannot store (control characters), page clearing (clear_words:
 bulk rejection of hallucinated pages, PC drop, empty triage status),
 word insertion (add_word: line/block/PrintSpace placement, SP rebuild,
 fresh institution IDs, bbox expansion, undo_add), undo via revert_word,
@@ -158,6 +160,154 @@ class EditTests(_PageFixture):
         self.assertIn("P1_PS00001", xml)     # PrintSpace survives
         self.assertIn("P1_TB00001", xml)     # block with remaining words survives
         self.assertEqual([w.content for w in self.page.words], ["Board", "1927"])
+
+
+class DeleteUndoTests(_PageFixture):
+    """The review GUI deletes without a confirmation prompt (2026-09-24);
+    Ctrl+Z restoring the page *exactly* is what makes that safe."""
+
+    def _snapshot(self) -> tuple[bytes, list]:
+        return etree.tostring(self.page.root), list(self.page.words)
+
+    def test_undo_restores_the_document_byte_for_byte(self) -> None:
+        before_xml, before_words = self._snapshot()
+        word = self.page.words[1]  # "cf": its SP sits before it
+        removal = self.page.delete_word(word)
+        self.assertNotIn(b"P1_SP00001", etree.tostring(self.page.root))
+        self.page.undo_delete(word, removal)
+        self.assertEqual(etree.tostring(self.page.root), before_xml)
+        # The same Word objects, in the same reading order: undo stacks and
+        # canvas items the GUI keyed on them stay valid.
+        self.assertEqual(len(self.page.words), len(before_words))
+        for got, want in zip(self.page.words, before_words):
+            self.assertIs(got, want)
+        self.assertEqual(self.page.session_edits, 0)
+
+    def test_undo_brings_back_cascaded_containers_in_place(self) -> None:
+        before_xml, _ = self._snapshot()
+        by_content = {w.content: w for w in self.page.words}
+        # "1927" is alone on TL00002: the line goes, its block stays.
+        line_removal = self.page.delete_word(by_content["1927"])
+        self.assertNotIn(b"P1_TL00002", etree.tostring(self.page.root))
+        # "Lone" is alone in TB00002: line and block both go.
+        block_removal = self.page.delete_word(by_content["Lone"])
+        self.assertNotIn(b"P1_TB00002", etree.tostring(self.page.root))
+        self.page.undo_delete(by_content["Lone"], block_removal)
+        self.page.undo_delete(by_content["1927"], line_removal)
+        self.assertEqual(etree.tostring(self.page.root), before_xml)
+        self.assertEqual(alto_to_text(self.page.root), "Board cf\n1927\n\nLone\n")
+
+    def test_every_word_deleted_then_undone_in_reverse(self) -> None:
+        before_xml, _ = self._snapshot()
+        undo = [(w, self.page.delete_word(w)) for w in list(self.page.words)]
+        self.assertEqual(self.page.words, [])
+        self.assertEqual(self.page.session_edits, 4)
+        for word, removal in reversed(undo):
+            self.page.undo_delete(word, removal)
+        self.assertEqual(etree.tostring(self.page.root), before_xml)
+        self.assertEqual([w.content for w in self.page.words],
+                         ["Board", "cf", "1927", "Lone"])
+        self.assertEqual(self.page.session_edits, 0)
+
+    def test_restored_word_is_live_again(self) -> None:
+        word = self.page.words[1]
+        self.page.undo_delete(word, self.page.delete_word(word))
+        self.page.edit_word(word, "of")
+        self.page.save()
+        self.assertIn('CONTENT="of" WC="1.00"', self.alto.read_text(encoding="utf-8"))
+
+    def test_deleting_an_added_word_nets_out_and_redo_brings_it_back(self) -> None:
+        word = self.page.add_word(_px_box(500, 105, 100, 55), "and")
+        added_xml = etree.tostring(self.page.root)
+        removal = self.page.undo_add(word)  # the GUI's delete of an added word
+        self.assertEqual(self.page.session_edits, 0)
+        self.page.redo_add(word, removal)
+        self.assertEqual(etree.tostring(self.page.root), added_xml)
+        self.assertEqual(self.page.session_edits, 1)
+        self.assertIn(word, self.page.words)
+
+
+class SettleTests(_PageFixture):
+    """An undone session has nothing to save (settle): no "Save changes?"
+    prompt, and no review provenance stamped on a page nobody changed."""
+
+    def test_undone_delete_is_clean(self) -> None:
+        word = self.page.words[1]
+        self.page.undo_delete(word, self.page.delete_word(word))
+        self.assertTrue(self.page.dirty)
+        self.assertFalse(self.page.settle())
+
+    def test_undone_edit_and_move_are_clean(self) -> None:
+        word = self.page.words[1]  # "cf" @ 0.40
+        self.page.edit_word(word, "of")
+        self.page.revert_word(word, "cf", 0.40)
+        block = self.page.flow_children()[1]
+        self.page.move_element(block, -1)
+        self.page.undo_move(block, -1)
+        self.assertFalse(self.page.settle())
+
+    def test_partial_undo_stays_dirty(self) -> None:
+        first, second = self.page.words[0], self.page.words[1]
+        self.page.edit_word(first, "Boarded")
+        removal = self.page.delete_word(second)
+        self.page.undo_delete(second, removal)
+        self.assertTrue(self.page.settle())  # the edit is still there
+
+    def test_exact_undo_add_is_clean(self) -> None:
+        # Inside the line's box: the rebuilt SP gets its old ID and geometry
+        # back, so removing the word again restores the page byte for byte.
+        word = self.page.add_word(_px_box(500, 105, 100, 55), "and")
+        self.page.undo_add(word)
+        self.assertFalse(self.page.settle())
+
+    def test_inexact_undo_stays_dirty(self) -> None:
+        # Past the line's right edge the add grows the line and block boxes,
+        # and undo_add does not shrink them back: a real change remains.
+        word = self.page.add_word(_px_box(1000, 105, 100, 55), "and")
+        self.page.undo_add(word)
+        self.assertTrue(self.page.settle())
+
+    def test_clean_state_follows_a_save(self) -> None:
+        word = self.page.words[1]
+        self.page.edit_word(word, "of")
+        self.page.save()
+        self.page.edit_word(word, "off")
+        self.page.revert_word(word, "of", 1.0)
+        self.assertFalse(self.page.settle())  # back to the *saved* page
+
+
+class ContentGuardTests(_PageFixture):
+    """Text a corrector types (or pastes) must be storable in ALTO."""
+
+    def test_control_character_edit_is_refused_untouched(self) -> None:
+        word = self.page.words[1]
+        with self.assertRaisesRegex(ValueError, "U\\+0001"):
+            self.page.edit_word(word, "o\x01f")
+        self.assertEqual(word.content, "cf")
+        self.assertEqual(word.elem.get("WC"), "0.40")
+        self.assertFalse(self.page.dirty)
+        self.assertEqual(self.page.session_edits, 0)
+
+    def test_control_character_add_is_refused_untouched(self) -> None:
+        before = etree.tostring(self.page.root)
+        with self.assertRaises(ValueError):
+            self.page.add_word(_px_box(500, 105, 100, 55), "an\x07d")
+        self.assertEqual(etree.tostring(self.page.root), before)
+        self.assertFalse(self.page.dirty)
+
+    def test_whitespace_controls_are_collapsed_not_refused(self) -> None:
+        # VT/FF/the separators/NEL are whitespace to str.split(): collapsed,
+        # never stored.
+        word = self.page.words[1]
+        self.page.edit_word(word, "o\x0bf\x1f\x85")
+        self.assertEqual(word.content, "o f")
+
+    def test_content_problem(self) -> None:
+        from src.alto_ocr.alto_format import content_problem
+        for ok in ("Board", "½°μΩ", "naïve—“quoted”", "&<>\"'"):
+            self.assertIsNone(content_problem(ok), ok)
+        for bad in ("\x00", "a\x08", "\x7f", "\x9f", "￾", "\ud800"):
+            self.assertIsNotNone(content_problem(bad), repr(bad))
 
 
 class VerifyTests(_PageFixture):

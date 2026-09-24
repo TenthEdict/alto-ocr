@@ -1,26 +1,41 @@
 """Review tab for the Alto OCR GUI: correct transcripts over the page image.
 
-Layout: pick an OCR *output* object folder (the one containing ``ALTO/``)
-plus the matching *source image* folder (TIFs are deliberately not in the
+Layout: pick the **Transcript Folder** (an object's OCR output — the one
+containing ``ALTO/``) plus the matching *source image* folder (TIFs are deliberately not in the
 output tree — the preservation folder is the canonical copy). The page list
 shows per-page confidence (``PC``) and can sort worst-first, mirroring the
-``triage`` command's queue. The canvas shows the page with word boxes
+``triage`` command's queue. The page view shows the scan with word boxes
 colored by ``WC``; clicking a word (or stepping with Next/Prev) opens it in
 the editor bar with a magnified snippet of the actual scan region.
 
+Confidence is shown as a **percentage** throughout this tab (the ALTO keeps
+``0``–``1``). Percentages are floored, so the display agrees with the flag
+rule: under "Flag below 50%" a word shown as 49% is flagged and one shown as
+50% is not.
+
+**Pop out page** (toolbar) moves the whole page view — toolbars, scan,
+editor, symbol keyboard — into a window of its own, for a second monitor or
+a maximized window; closing that window docks it back. Nothing is rebuilt
+(``widgets.Detachable``), so unsaved edits and the undo history ride along.
+◀ Page / Page ▶ (Ctrl+Page Up/Down) step through the page list from inside
+the view, so a popped-out page needs no trips back to the main window. The
+list keeps its order while you work; re-tick "Worst first" or reload the
+object to re-rank it.
+
 Keyboard flow for correctors: **Enter** commits the edit and jumps to the
 next flagged word, **Escape** deselects, **n/p** step through flagged words
-(canvas focus), **Ctrl+Z** undoes the last edit. Enter on a word left
-*unchanged* confirms it — the OCR was right and only the confidence was low
-— stamping ``WC="1.00"`` so it leaves the queue for good
+(canvas focus), **Ctrl+Z** undoes the last change, **Ctrl+S** saves. Enter
+on a word left *unchanged* confirms it — the OCR was right and only the
+confidence was low — stamping ``WC="1.00"`` so it leaves the queue for good
 (``remediate.ReviewPage.verify_word``, counted apart from corrections in the
-page's provenance). Stepping is *positional* —
-the next flagged word below the one in hand, wrapping (with a status note)
-at the page end — so a correction never costs the corrector their place on
-the page (``remediate.ReviewPage.step_from``). Deletions (hallucinated
-words) confirm first and are undone only by reloading the page. On the
-canvas, plain scroll pans vertically, **Shift+scroll** horizontally, and
-**Ctrl+scroll** zooms about the mouse cursor.
+page's provenance). Stepping is *positional* — the next flagged word below
+the one in hand, wrapping (with a status note) at the page end — so a
+correction never costs the corrector their place on the page
+(``remediate.ReviewPage.step_from``). **Deleting** a hallucinated word
+happens at once, with no confirmation prompt; Ctrl+Z puts it back exactly
+(``remediate.ReviewPage.undo_delete``). On the canvas, plain scroll pans
+vertically, **Shift+scroll** horizontally, and **Ctrl+scroll** zooms about
+the mouse cursor.
 
 **Clear page** (toolbar, confirm-gated) bulk-deletes every word on a page
 whose OCR is wholly hallucinated — covers and photographs where fabric or
@@ -38,9 +53,15 @@ results polled back on the Tk main loop, mirroring ``gui.py``'s model.
 the OCR missed entirely: drag a box around the word on the scan, type it,
 press Enter — the word is inserted into the ALTO at the drawn position
 (``remediate.ReviewPage.add_word`` picks the line/block) with ``WC="1.00"``.
-Ctrl+Z removes it again. A glyph palette under the editor inserts math and
-engineering characters (π Σ √ ° …) correctors can't reach on a US keyboard
-— common in the institution's lab-notebook material.
+Ctrl+Z removes it again.
+
+The **symbol keyboard** under the editor types characters correctors can't
+reach on a US keyboard — math, Greek, super/subscripts and fractions,
+units and apothecary signs, typographic punctuation, arrows, accented
+letters — replacing selected text the way a key press would. Its layout,
+and the rules that keep every key storable in ALTO, live in the headless
+``symbols`` module (shared with the web review client). It can be hidden,
+or popped out into a small window of its own that stays above the page.
 
 **Reading order** mode (toolbar toggle, or ``r`` with canvas focus; mutually
 exclusive with Add word) fixes transcripts whose words are right but ordered
@@ -59,6 +80,7 @@ unit-tested); this module is only Tk plumbing.
 from __future__ import annotations
 
 import logging
+import math
 import queue
 import threading
 import tkinter as tk
@@ -71,6 +93,7 @@ from PIL import Image, ImageTk
 
 from .remediate import (
     ConcurrentEditError,
+    Removal,
     RepackageResult,
     ReviewPage,
     StubPageError,
@@ -81,6 +104,7 @@ from .remediate import (
 )
 from .triage import DEFAULT_LOW_WC, STATUS_RANK, scan_alto_file
 from .walker import natural_chunks, natural_key
+from .widgets import Detachable, SymbolKeyboard, Tooltip
 
 # Archival scans are huge (hundreds of megapixels), so raise Pillow's
 # decompression-bomb guard far past any real scan — but keep a ceiling so a
@@ -93,21 +117,23 @@ _MAX_RENDER_PX = 40_000_000
 
 logger = logging.getLogger("alto_ocr.review")
 
-_ZOOMS: tuple[str, ...] = ("Fit", "50%", "75%", "100%", "150%", "200%")
+# "Fit" shows the whole page; "Fit width" fills the view's width and
+# scrolls vertically — the useful one in a wide or popped-out window.
+_ZOOMS: tuple[str, ...] = ("Fit", "Fit width", "50%", "75%", "100%", "150%", "200%")
+_FIT_ZOOMS = ("Fit", "Fit width")
 
-# Characters correctors can't type on a US keyboard but the collections
-# need — engineering notebooks (math), lab reports (units), typescripts
-# (dashes/fractions). One click inserts at the editor cursor.
-_GLYPHS: tuple[str, ...] = (
-    "π", "Σ", "Δ", "θ", "Ω", "μ", "√", "∫", "∞", "±", "×", "÷",
-    "≈", "≠", "≤", "≥", "°", "·", "²", "³", "½", "¼", "¾", "—",
-)
+# "Flag below" choices: whole percentages, the way the tab shows confidence.
+THRESHOLD_CHOICES: tuple[str, ...] = tuple(f"{p}%" for p in range(0, 101, 5))
 
 # WC → outline color. Blue marks words edited this session (WC becomes 1.00
 # on disk, but the corrector should still see what they touched).
 _COLOR_EDITED = "#1f6feb"
 _COLOR_UNSCORED = "#c026d3"  # no WC (GLMOCR output): needs eyes everywhere
 _COLOR_ORDER = "#7c3aed"     # reading-order mode: block/line outlines + badges
+
+# Canvas items redrawn on every render carry this tag; the scan image does
+# not, so a re-render that keeps the zoom reuses it.
+_OVERLAY = "overlay"
 
 
 # Undo-stack entries. One interleaved stack so a single Ctrl+Z always
@@ -131,9 +157,47 @@ class _AddEntry:
 
 
 @dataclass
+class _DeleteEntry:
+    word: Word
+    removal: Removal
+    added: bool  # the word was added this session: undo re-adds it (redo_add)
+
+
+@dataclass
 class _MoveEntry:
     el: object  # the moved lxml element — opaque here; remediate owns lxml
     delta: int
+
+
+def pct(value: float | None) -> str:
+    """A confidence (``0``–``1``) as a whole percentage: ``0.87`` → ``"87%"``.
+
+    Floored, not rounded, so the display agrees with the flag rule
+    (``wc < threshold``): under a 50% threshold a word shown as 49% is
+    flagged and one shown as 50% is not, where rounding would show 0.496 as
+    "50%" and flag it anyway. The epsilon absorbs float error — 0.29 * 100
+    is 28.999…, which must still read as 29%.
+    """
+    if value is None:
+        return "—"
+    return f"{math.floor(value * 100 + 1e-9)}%"
+
+
+def threshold_text(value: float) -> str:
+    """A flag threshold for the "Flag below" box: ``0.5`` → ``"50%"``."""
+    return f"{round(max(0.0, min(1.0, value)) * 100)}%"
+
+
+def parse_pct(text: str) -> float | None:
+    """``"50%"`` (or ``"50"``) → ``0.5``, clamped to ``0``–``1``; None when
+    the text is not a number."""
+    try:
+        value = float(str(text).strip().rstrip("%").strip())
+    except ValueError:
+        return None
+    if math.isnan(value):
+        return None
+    return max(0.0, min(1.0, value / 100.0))
 
 
 def _wc_color(wc: float | None) -> str:
@@ -175,7 +239,7 @@ def repackage_summary(results: list[RepackageResult]) -> str:
 
 class ReviewFrame(ttk.Frame):
     """The Review tab. ``settings`` is the app's persisted dict; ``persist``
-    writes it to disk (called after path/threshold changes)."""
+    writes it to disk (called after path/threshold/window changes)."""
 
     def __init__(self, master: tk.Misc, settings: dict,
                  persist: Callable[[], None]) -> None:
@@ -190,11 +254,13 @@ class ReviewFrame(ttk.Frame):
         self._stem: Optional[str] = None
         self._pil: Optional[Image.Image] = None
         self._photo: Optional[ImageTk.PhotoImage] = None
+        self._photo_size: tuple[int, int] = (0, 0)
         self._snippet_photo: Optional[ImageTk.PhotoImage] = None
         self._scale = 1.0
         self._rect_by_word: dict[int, int] = {}   # id(Word) -> canvas item
         self._selected: Optional[Word] = None
-        self._undo: list[_EditEntry | _VerifyEntry | _AddEntry | _MoveEntry] = []
+        self._undo: list[_EditEntry | _VerifyEntry | _AddEntry
+                         | _DeleteEntry | _MoveEntry] = []
         # Reading-order mode state: the selected block plus parallel
         # listbox-row -> element lists (the _sorted_stems idiom).
         self._order_block: Optional[object] = None
@@ -205,6 +271,8 @@ class ReviewFrame(ttk.Frame):
         self._drag_start: Optional[tuple[float, float]] = None
         self._drag_item: Optional[int] = None
         self._pending_box: Optional[tuple[float, float, float, float]] = None
+        # A window resize fires <Configure> in bursts; re-fit once it settles.
+        self._fit_after: Optional[str] = None
         # Repackage runs on a worker thread; the result list comes back
         # through this queue, polled on the Tk main loop (gui.py's model).
         self._repack_worker: Optional[threading.Thread] = None
@@ -213,13 +281,17 @@ class ReviewFrame(ttk.Frame):
         self.var_object = tk.StringVar(value=str(settings.get("review_object_dir", "")))
         self.var_source = tk.StringVar(value=str(settings.get("review_source_dir", "")))
         self.var_worst_first = tk.BooleanVar(value=bool(settings.get("review_worst_first", True)))
-        self.var_threshold = tk.DoubleVar(
-            value=float(settings.get("review_threshold", DEFAULT_LOW_WC)))
+        try:
+            saved_threshold = float(settings.get("review_threshold", DEFAULT_LOW_WC))
+        except (TypeError, ValueError):
+            saved_threshold = DEFAULT_LOW_WC
+        self.var_threshold = tk.StringVar(value=threshold_text(saved_threshold))
         self.var_show_all = tk.BooleanVar(value=False)
         self.var_add_mode = tk.BooleanVar(value=False)
         self.var_reorder_mode = tk.BooleanVar(value=False)
         self.var_zoom = tk.StringVar(value="Fit")
-        self.var_status = tk.StringVar(value="Pick an output object folder and its source images.")
+        self.var_symbols = tk.BooleanVar(value=bool(settings.get("review_symbols", True)))
+        self.var_status = tk.StringVar(value="Pick a transcript folder and its source images.")
         self.var_edit = tk.StringVar()
 
         self._build_ui()
@@ -234,7 +306,7 @@ class ReviewFrame(ttk.Frame):
         paths = ttk.Frame(self)
         paths.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         paths.columnconfigure(1, weight=1)
-        ttk.Label(paths, text="Output object:").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Label(paths, text="Transcript Folder:").grid(row=0, column=0, sticky="w", padx=(0, 6))
         ttk.Entry(paths, textvariable=self.var_object).grid(row=0, column=1, sticky="ew")
         ttk.Button(paths, text="Browse…", command=self._browse_object).grid(
             row=0, column=2, padx=(6, 0))
@@ -250,7 +322,7 @@ class ReviewFrame(ttk.Frame):
                                         command=self._repackage)
         self.btn_repackage.grid(row=0, column=4, rowspan=2, padx=(6, 0), sticky="ns")
 
-        # -- Row 1: page list | canvas
+        # -- Row 1: page list | page view
         body = ttk.Frame(self)
         body.grid(row=1, column=0, sticky="nsew")
         body.columnconfigure(1, weight=1)
@@ -260,7 +332,7 @@ class ReviewFrame(ttk.Frame):
         left.grid(row=0, column=0, sticky="ns", padx=(0, 8))
         left.rowconfigure(1, weight=1)
         ttk.Checkbutton(left, text="Worst first", variable=self.var_worst_first,
-                        command=self._refresh_page_list).grid(row=0, column=0, sticky="w")
+                        command=self._on_worst_first_toggled).grid(row=0, column=0, sticky="w")
         self.lst_pages = tk.Listbox(left, width=30, exportselection=False)
         self.lst_pages.grid(row=1, column=0, sticky="ns")
         sb = ttk.Scrollbar(left, orient="vertical", command=self.lst_pages.yview)
@@ -268,28 +340,70 @@ class ReviewFrame(ttk.Frame):
         self.lst_pages.configure(yscrollcommand=sb.set)
         self.lst_pages.bind("<<ListboxSelect>>", self._on_page_selected)
 
-        center = ttk.Frame(body)
-        center.grid(row=0, column=1, sticky="nsew")
-        center.columnconfigure(0, weight=1)
-        center.rowconfigure(1, weight=1)
+        # The page view is a classic frame: only those can become a window
+        # of their own (widgets.Detachable).
+        self.workspace = tk.Frame(body)
+        self.workspace.grid(row=0, column=1, sticky="nsew")
+        self._build_workspace(self.workspace)
 
-        bar = ttk.Frame(center)
-        bar.grid(row=0, column=0, sticky="ew", pady=(0, 4))
-        ttk.Label(bar, text="Zoom:").pack(side="left")
-        cb = ttk.Combobox(bar, textvariable=self.var_zoom, values=_ZOOMS,
-                          width=6, state="readonly")
+        placeholder = ttk.Frame(body, padding=24)
+        ttk.Label(placeholder, text="The page is open in its own window.",
+                  font=("Segoe UI", 11)).pack(pady=(40, 10))
+        ttk.Button(placeholder, text="Bring the page back here",
+                   command=self._toggle_page_window).pack()
+        ttk.Label(placeholder, textvariable=self.var_status, foreground="#555",
+                  wraplength=460, justify="center").pack(pady=(18, 0))
+        self._page_window = Detachable(
+            self.workspace, title="Review — Alto OCR", placeholder=placeholder,
+            settings=self._settings, geometry_key="review_page_window",
+            persist=self._persist, default_size=(1200, 900),
+            on_change=self._on_page_window_changed)
+
+    def _build_workspace(self, ws: tk.Frame) -> None:
+        ws.columnconfigure(0, weight=1)
+        ws.rowconfigure(2, weight=1)
+
+        # -- Toolbar row 1: getting around (pages, zoom, what to flag)
+        nav = ttk.Frame(ws)
+        nav.grid(row=0, column=0, sticky="ew", pady=(0, 3))
+        b = ttk.Button(nav, text="◀ Page", command=lambda: self._goto_page(-1))
+        b.pack(side="left")
+        Tooltip(b, "Previous page in the list (Ctrl+Page Up)")
+        b = ttk.Button(nav, text="Page ▶", command=lambda: self._goto_page(+1))
+        b.pack(side="left", padx=(4, 0))
+        Tooltip(b, "Next page in the list (Ctrl+Page Down)")
+        ttk.Separator(nav, orient="vertical").pack(side="left", fill="y", padx=10)
+        ttk.Label(nav, text="Zoom:").pack(side="left")
+        cb = ttk.Combobox(nav, textvariable=self.var_zoom, values=_ZOOMS,
+                          width=9, state="readonly")
         cb.pack(side="left", padx=(2, 10))
         cb.bind("<<ComboboxSelected>>", lambda _e: self._render())
-        ttk.Label(bar, text="Flag WC <").pack(side="left")
-        sp = ttk.Spinbox(bar, from_=0.0, to=1.0, increment=0.05, width=5,
-                         textvariable=self.var_threshold, command=self._on_threshold_changed)
-        sp.pack(side="left", padx=(2, 10))
-        ttk.Checkbutton(bar, text="All words", variable=self.var_show_all,
-                        command=self._render).pack(side="left", padx=(0, 10))
-        ttk.Button(bar, text="◀ Prev", command=lambda: self._goto_flagged(-1)).pack(side="left")
-        ttk.Button(bar, text="Next ▶", command=lambda: self._goto_flagged(+1)).pack(
-            side="left", padx=(4, 10))
-        ttk.Button(bar, text="Undo", command=self._undo_edit).pack(side="left")
+        ttk.Label(nav, text="Flag below:").pack(side="left")
+        th = ttk.Combobox(nav, textvariable=self.var_threshold, values=THRESHOLD_CHOICES,
+                          width=5, state="readonly")
+        th.pack(side="left", padx=(2, 10))
+        th.bind("<<ComboboxSelected>>", lambda _e: self._on_threshold_changed())
+        Tooltip(th, "Words the OCR was less confident about than this are flagged for review")
+        ttk.Checkbutton(nav, text="All words", variable=self.var_show_all,
+                        command=self._render).pack(side="left")
+        self.btn_popout = ttk.Button(nav, text="⧉ Pop out page",
+                                     command=self._toggle_page_window)
+        self.btn_popout.pack(side="right")
+        Tooltip(self.btn_popout, "Move the page into a window of its own for more "
+                                 "room, and back again")
+
+        # -- Toolbar row 2: correcting
+        bar = ttk.Frame(ws)
+        bar.grid(row=1, column=0, sticky="ew", pady=(0, 4))
+        b = ttk.Button(bar, text="◀ Prev", command=lambda: self._goto_flagged(-1))
+        b.pack(side="left")
+        Tooltip(b, "Previous flagged word (p)")
+        b = ttk.Button(bar, text="Next ▶", command=lambda: self._goto_flagged(+1))
+        b.pack(side="left", padx=(4, 10))
+        Tooltip(b, "Next flagged word (n)")
+        b = ttk.Button(bar, text="Undo", command=self._undo_edit)
+        b.pack(side="left")
+        Tooltip(b, "Undo the last change on this page (Ctrl+Z)")
         ttk.Checkbutton(bar, text="Add word (a)", variable=self.var_add_mode,
                         command=self._on_add_mode_toggled).pack(side="left", padx=(10, 0))
         ttk.Checkbutton(bar, text="Reading order (r)", variable=self.var_reorder_mode,
@@ -297,32 +411,63 @@ class ReviewFrame(ttk.Frame):
         self.btn_save = ttk.Button(bar, text="Save page", command=self._save_page,
                                    state="disabled")
         self.btn_save.pack(side="right")
+        Tooltip(self.btn_save, "Write this page's ALTO and transcript (Ctrl+S)")
         ttk.Button(bar, text="Clear page…", command=self._clear_page).pack(
             side="right", padx=(0, 6))
 
-        self.canvas = tk.Canvas(center, background="#404040", highlightthickness=0)
-        self.canvas.grid(row=1, column=0, sticky="nsew")
-        vs = ttk.Scrollbar(center, orient="vertical", command=self.canvas.yview)
-        vs.grid(row=1, column=1, sticky="ns")
-        hs = ttk.Scrollbar(center, orient="horizontal", command=self.canvas.xview)
-        hs.grid(row=2, column=0, sticky="ew")
+        # -- Row 2: the scan, its scrollbars, and the reading-order panel
+        area = ttk.Frame(ws)
+        area.grid(row=2, column=0, sticky="nsew")
+        area.columnconfigure(0, weight=1)
+        area.rowconfigure(0, weight=1)
+        self.canvas = tk.Canvas(area, background="#404040", highlightthickness=0)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        vs = ttk.Scrollbar(area, orient="vertical", command=self.canvas.yview)
+        vs.grid(row=0, column=1, sticky="ns")
+        hs = ttk.Scrollbar(area, orient="horizontal", command=self.canvas.xview)
+        hs.grid(row=1, column=0, sticky="ew")
         self.canvas.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
-        self.canvas.bind("<Button-1>", self._on_canvas_click)
-        self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
-        self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
-        self.canvas.bind("<Configure>", lambda _e: self._render_if_fit())
-        self.canvas.bind("<MouseWheel>", self._on_wheel)
-        self.canvas.bind("<Shift-MouseWheel>", self._on_wheel_h)
-        self.canvas.bind("<Control-MouseWheel>", self._on_wheel_zoom)
-        self.canvas.bind("<Key-n>", lambda _e: self._goto_flagged(+1))
-        self.canvas.bind("<Key-p>", lambda _e: self._goto_flagged(-1))
-        self.canvas.bind("<Key-a>", lambda _e: self._toggle_add_mode())
-        self.canvas.bind("<Key-r>", lambda _e: self._toggle_reorder_mode())
-        self.canvas.bind("<Control-z>", lambda _e: self._undo_edit())
+        self._bind_canvas()
+        self._build_order_panel(area)
 
+        # -- Row 3: editor bar (+ symbol keyboard), row 4: status
+        self._build_editor(ws)
+        ttk.Label(ws, textvariable=self.var_status, foreground="#555").grid(
+            row=4, column=0, sticky="w", pady=(4, 0))
+
+        for widget in (self.canvas, self.ent_edit):
+            widget.bind("<Control-z>", lambda _e: self._undo_edit())
+            widget.bind("<Control-s>", lambda _e: self._save_page() or "break")
+            widget.bind("<Control-Prior>", lambda _e: self._goto_page(-1) or "break")
+            widget.bind("<Control-Next>", lambda _e: self._goto_page(+1) or "break")
+
+    def _bind_canvas(self) -> None:
+        c = self.canvas
+        c.bind("<Button-1>", self._on_canvas_click)
+        c.bind("<B1-Motion>", self._on_canvas_drag)
+        c.bind("<ButtonRelease-1>", self._on_canvas_release)
+        c.bind("<Configure>", self._on_canvas_configure)
+        # Windows and macOS report the wheel as <MouseWheel> with a delta.
+        c.bind("<MouseWheel>", lambda e: self._on_wheel(e.delta))
+        c.bind("<Shift-MouseWheel>", lambda e: self._on_wheel_h(e.delta))
+        c.bind("<Control-MouseWheel>", lambda e: self._on_wheel_zoom(e, e.delta))
+        if c.tk.call("tk", "windowingsystem") == "x11":
+            # X11 reports it as buttons 4 (up) and 5 (down) instead. (On
+            # Windows, 4/5 are the mouse's back/forward side buttons.)
+            for button, delta in (("4", 120), ("5", -120)):
+                c.bind(f"<Button-{button}>", lambda e, d=delta: self._on_wheel(d))
+                c.bind(f"<Shift-Button-{button}>", lambda e, d=delta: self._on_wheel_h(d))
+                c.bind(f"<Control-Button-{button}>",
+                       lambda e, d=delta: self._on_wheel_zoom(e, d))
+        c.bind("<Key-n>", lambda _e: self._goto_flagged(+1))
+        c.bind("<Key-p>", lambda _e: self._goto_flagged(-1))
+        c.bind("<Key-a>", lambda _e: self._toggle_add_mode())
+        c.bind("<Key-r>", lambda _e: self._toggle_reorder_mode())
+
+    def _build_order_panel(self, area: ttk.Frame) -> None:
         # Reading-order side panel: hidden until the mode is toggled on.
-        self.order_panel = ttk.Frame(body)
-        self.order_panel.grid(row=0, column=2, sticky="ns", padx=(8, 0))
+        self.order_panel = ttk.Frame(area)
+        self.order_panel.grid(row=0, column=2, rowspan=2, sticky="ns", padx=(8, 0))
         self.order_panel.rowconfigure(1, weight=3)
         self.order_panel.rowconfigure(4, weight=2)
         ttk.Label(self.order_panel, text="Blocks (reading order)").grid(
@@ -363,57 +508,149 @@ class ReviewFrame(ttk.Frame):
                      lambda _e, l=lst: self._move_selected(l, +1) or "break")
         self.order_panel.grid_remove()
 
-        # -- Row 2: editor bar
-        editor = ttk.LabelFrame(self, text="Selected word", padding=6)
-        editor.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+    def _build_editor(self, ws: tk.Frame) -> None:
+        editor = ttk.LabelFrame(ws, text="Selected word", padding=6)
+        editor.grid(row=3, column=0, sticky="ew", pady=(6, 0))
         editor.columnconfigure(2, weight=1)
         self.lbl_snippet = ttk.Label(editor)
         self.lbl_snippet.grid(row=0, column=0, rowspan=2, padx=(0, 10))
-        self.lbl_wc = ttk.Label(editor, text="—", width=14)
+        self.lbl_wc = ttk.Label(editor, text="—", width=24)
         self.lbl_wc.grid(row=0, column=1, sticky="w")
         self.ent_edit = ttk.Entry(editor, textvariable=self.var_edit, font=("Consolas", 12))
         self.ent_edit.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(0, 8))
         self.ent_edit.bind("<Return>", lambda _e: self._apply_edit(advance=True))
         self.ent_edit.bind("<Escape>", lambda _e: self._on_escape())
-        self.ent_edit.bind("<Control-z>", lambda _e: self._undo_edit())
         btns = ttk.Frame(editor)
         btns.grid(row=1, column=3, sticky="e")
         ttk.Button(btns, text="Apply / Confirm (Enter)",
                    command=lambda: self._apply_edit(advance=True)).pack(side="left")
-        ttk.Button(btns, text="Delete word", command=self._delete_word).pack(
-            side="left", padx=(6, 0))
-        glyphs = ttk.Frame(editor)
-        glyphs.grid(row=2, column=1, columnspan=3, sticky="w", pady=(4, 0))
-        for ch in _GLYPHS:
-            ttk.Button(glyphs, text=ch, width=2, style="Toolbutton",
-                       command=lambda c=ch: self._insert_glyph(c)).pack(side="left")
+        b = ttk.Button(btns, text="Delete word", command=self._delete_word)
+        b.pack(side="left", padx=(6, 0))
+        Tooltip(b, "Remove a word the OCR made up (Ctrl+Z puts it back)")
+        ttk.Checkbutton(btns, text="Symbols", variable=self.var_symbols,
+                        command=self._on_symbols_toggled).pack(side="left", padx=(10, 0))
 
-        ttk.Label(self, textvariable=self.var_status, foreground="#555").grid(
-            row=3, column=0, sticky="w", pady=(4, 0))
+        # The keyboard sits in a classic frame so it can become a small
+        # window of its own; it types into self.ent_edit wherever it is.
+        self.kb_holder = tk.Frame(editor)
+        self.kb_holder.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        self.keyboard = SymbolKeyboard(
+            self.kb_holder, self._insert_symbol, header=self._keyboard_header,
+            initial=str(self._settings.get("review_symbols_tab", "")),
+            on_category=self._on_symbol_category)
+        self.keyboard.pack(fill="x", padx=4, pady=(0, 4))
+        kb_placeholder = ttk.Frame(editor)
+        ttk.Label(kb_placeholder, text="The symbol keyboard is in its own window.",
+                  foreground="#555").pack(side="left")
+        ttk.Button(kb_placeholder, text="Dock it here",
+                   command=self._toggle_keyboard_window).pack(side="left", padx=(8, 0))
+        self._kb_window = Detachable(
+            self.kb_holder, title="Symbols — Alto OCR", placeholder=kb_placeholder,
+            settings=self._settings, geometry_key="review_symbols_window",
+            persist=self._persist, default_size=None,
+            # A palette: it stays above whichever window holds the editor.
+            owner=lambda: self.workspace.winfo_toplevel(),
+            on_change=self._on_keyboard_window_changed)
+        if not self.var_symbols.get():
+            self.kb_holder.grid_remove()
+
+    def _keyboard_header(self, strip: ttk.Frame) -> None:
+        self.btn_kb_popout = ttk.Button(strip, text="⧉ Pop out",
+                                        command=self._toggle_keyboard_window)
+        self.btn_kb_popout.pack(side="right")
+        Tooltip(self.btn_kb_popout, "Put the symbol keyboard in a small window of its own")
+
+    # ---------- windows: page view + symbol keyboard ----------------------
+
+    def _toggle_page_window(self) -> None:
+        self._page_window.toggle()
+
+    def _on_page_window_changed(self, detached: bool) -> None:
+        self.btn_popout.configure(text="⇲ Dock page" if detached else "⧉ Pop out page")
+        # Docked, the tab's padding frames it; on its own it needs a margin.
+        margin = 8 if detached else 0
+        self.workspace.configure(padx=margin, pady=margin)
+        # The keyboard palette follows the window that now holds the editor.
+        self._kb_window.reown()
+        self._update_window_title()
+        if detached:
+            self.canvas.focus_set()
+
+    def _update_window_title(self) -> None:
+        ref = Path(self.var_object.get().strip()).name
+        parts = [p for p in (self._stem, ref) if p]
+        self._page_window.set_title(" — ".join(parts + ["Review — Alto OCR"]))
+
+    def _on_symbols_toggled(self) -> None:
+        show = self.var_symbols.get()
+        self._settings["review_symbols"] = show
+        self._persist()
+        if show:
+            self.kb_holder.grid()
+        else:
+            self._kb_window.attach()
+            self.kb_holder.grid_remove()
+
+    def _toggle_keyboard_window(self) -> None:
+        if not self._kb_window.detached and not self.var_symbols.get():
+            self.var_symbols.set(True)
+            self._on_symbols_toggled()
+        self._kb_window.toggle()
+
+    def _on_keyboard_window_changed(self, detached: bool) -> None:
+        self.btn_kb_popout.configure(text="⇲ Dock" if detached else "⧉ Pop out")
+
+    def _on_symbol_category(self, name: str) -> None:
+        if self._settings.get("review_symbols_tab") != name:
+            self._settings["review_symbols_tab"] = name
+            self._persist()
+
+    def _insert_symbol(self, ch: str) -> None:
+        """Type a keyboard symbol into the word editor the way a key press
+        would: replacing any selected text, leaving the caret after it."""
+        ent = self.ent_edit
+        if ent.selection_present():
+            ent.delete("sel.first", "sel.last")
+        ent.insert("insert", ch)
+        if self._kb_window.detached:
+            # The click activated the keyboard's window; hand typing back to
+            # the window with the editor.
+            ent.focus_force()
+        else:
+            ent.focus_set()
+
+    def _ws_parent(self) -> tk.Misc:
+        """Where dialogs about the page belong: the window holding the page
+        view, which is not the main window while it is popped out."""
+        return self.workspace.winfo_toplevel()
 
     # ---------- object / page loading ------------------------------------
 
     def _browse_object(self) -> None:
-        d = filedialog.askdirectory(title="OCR output object folder (contains ALTO/)")
+        d = filedialog.askdirectory(title="Transcript folder: an object's OCR output (contains ALTO/)",
+                                    parent=self.winfo_toplevel())
         if d:
             self.var_object.set(d)
 
     def _browse_source(self) -> None:
-        d = filedialog.askdirectory(title="Source image folder for this object")
+        d = filedialog.askdirectory(title="Source image folder for this object",
+                                    parent=self.winfo_toplevel())
         if d:
             self.var_source.set(d)
 
     def load_object(self) -> None:
-        if not self._confirm_discard():
+        main = self.winfo_toplevel()
+        if not self._confirm_discard(parent=main):
             return
         obj = Path(self.var_object.get().strip())
         src = Path(self.var_source.get().strip())
         alto_dir = obj / "ALTO"
         if not alto_dir.is_dir():
-            messagebox.showerror("Review", f"No ALTO folder in:\n{obj}")
+            messagebox.showerror("Review", f"No ALTO folder in:\n{obj}", parent=main)
             return
         if not src.is_dir():
-            messagebox.showerror("Review", f"Source image folder not found:\n{src}")
+            messagebox.showerror("Review", f"Source image folder not found:\n{src}",
+                                 parent=main)
             return
 
         self._img_index = index_source_images(src)
@@ -429,17 +666,10 @@ class ReviewFrame(ttk.Frame):
         self._settings["review_source_dir"] = str(src)
         self._persist()
 
-        self._page = None
+        self._clear_view()
         self._stem = None
-        self._selected = None
-        self._undo.clear()
-        self._cancel_pending_add()
-        self._order_block = None
-        if self.var_reorder_mode.get():
-            self._refresh_order_panel()
-        self.canvas.delete("all")
-        self.btn_save.configure(state="disabled")
         self._refresh_page_list()
+        self._update_window_title()
         msg = f"{len(self._pages)} page(s) loaded."
         if missing:
             msg += f"  {missing} page(s) have no matching source image and can't be reviewed."
@@ -452,18 +682,34 @@ class ReviewFrame(ttk.Frame):
             return (rank, pc if pc is not None else 2.0, natural_chunks(stem))
         return (natural_chunks(stem),)
 
+    @staticmethod
+    def _page_label(stem: str, pc: float | None, status: str) -> str:
+        if status == "scored" and pc is not None:
+            return f"{stem}   {pct(pc)}"
+        return f"{stem}   [{status}]"
+
+    def _on_worst_first_toggled(self) -> None:
+        self._settings["review_worst_first"] = self.var_worst_first.get()
+        self._persist()
+        self._refresh_page_list()
+
     def _refresh_page_list(self) -> None:
+        """Rebuild the list in sort order. Only on load and on toggling the
+        sort: re-ranking after every save would move the page being worked
+        on out from under the corrector (and scramble ◀ Page / Page ▶)."""
         self.lst_pages.delete(0, "end")
         self._sorted_stems = []
         for stem, pc, status in sorted(self._pages, key=self._page_sort_key):
-            if status == "scored" and pc is not None:
-                label = f"{stem}   PC {pc:.2f}"
-            else:
-                label = f"{stem}   [{status}]"
-            self.lst_pages.insert("end", label)
+            self.lst_pages.insert("end", self._page_label(stem, pc, status))
             self._sorted_stems.append(stem)
-            if stem == self._stem:
-                self.lst_pages.selection_set("end")
+        self._select_list_row(self._stem)
+
+    def _select_list_row(self, stem: Optional[str]) -> None:
+        self.lst_pages.selection_clear(0, "end")
+        if stem in self._sorted_stems:
+            i = self._sorted_stems.index(stem)
+            self.lst_pages.selection_set(i)
+            self.lst_pages.see(i)
 
     def _on_page_selected(self, _event: object) -> None:
         sel = self.lst_pages.curselection()
@@ -474,27 +720,68 @@ class ReviewFrame(ttk.Frame):
         stem = self._sorted_stems[sel[0]]
         if stem == self._stem:
             return
-        if not self._confirm_discard():
-            self._refresh_page_list()
+        if not self._confirm_discard(parent=self.winfo_toplevel()):
+            self._select_list_row(self._stem)
             return
         self._open_page(stem)
 
-    def _confirm_discard(self) -> bool:
+    def _goto_page(self, delta: int) -> None:
+        """Previous/next page in the list, from inside the page view."""
+        if not self._sorted_stems:
+            self.var_status.set("Load an object first.")
+            return
+        if self._stem in self._sorted_stems:
+            i = self._sorted_stems.index(self._stem) + delta
+        else:
+            i = 0 if delta > 0 else len(self._sorted_stems) - 1
+        if not 0 <= i < len(self._sorted_stems):
+            self.var_status.set("That was the last page in the list." if delta > 0
+                                else "That was the first page in the list.")
+            return
+        if not self._confirm_discard(parent=self._ws_parent()):
+            return
+        stem = self._sorted_stems[i]
+        self._open_page(stem)
+        self._select_list_row(stem)
+
+    def _confirm_discard(self, parent: Optional[tk.Misc] = None) -> bool:
         """True → proceed (saved or discarded); False → stay on the page."""
         if self._page is None or not self._page.dirty:
             return True
+        parent = parent or self.winfo_toplevel()
         ans = messagebox.askyesnocancel(
-            "Review", f"Save changes to {self._stem} first?")
+            "Review", f"Save changes to {self._stem} first?", parent=parent)
         if ans is None:
             return False
         if ans:
-            self._save_page()
+            self._save_page(parent=parent)
             # A failed save (the error dialog came from _save_page) leaves
             # the page dirty — stay on it instead of discarding the edits.
             return not self._page.dirty
         return True
 
+    def _clear_view(self) -> None:
+        """Forget the open page: nothing on the canvas, nothing to undo."""
+        self._page = None
+        self._pil = None
+        self._photo = None
+        self._photo_size = (0, 0)
+        self._selected = None
+        self._undo.clear()
+        self._cancel_pending_add()
+        self._order_block = None
+        if self.var_reorder_mode.get():
+            self._refresh_order_panel()
+        self.canvas.delete("all")
+        self.btn_save.configure(state="disabled")
+        self._update_editor()
+
     def _open_page(self, stem: str) -> None:
+        # Whatever happens below, this is now the current page — so ◀ Page /
+        # Page ▶ move on from it even when it cannot be reviewed.
+        self._clear_view()
+        self._stem = stem
+        self._update_window_title()
         img_path = self._img_index.get(stem)
         if img_path is None:
             self.var_status.set(f"{stem}: no matching source image in the source folder.")
@@ -502,32 +789,22 @@ class ReviewFrame(ttk.Frame):
         try:
             pil = Image.open(img_path).convert("RGB")
         except OSError as e:
-            messagebox.showerror("Review", f"Could not open {img_path}:\n{e}")
+            self.var_status.set(f"{stem}: could not open {img_path.name}: {e}")
             return
         alto_path = Path(self.var_object.get().strip()) / "ALTO" / f"{stem}.xml"
         try:
             page = ReviewPage(alto_path, pil.size)
         except StubPageError as e:
-            self._page = None
-            self._stem = stem
-            self._pil = None
-            self._order_block = None
-            if self.var_reorder_mode.get():
-                self._refresh_order_panel()
-            self.canvas.delete("all")
             self.var_status.set(str(e))
+            return
+        except OSError as e:
+            self.var_status.set(f"{stem}: could not read {alto_path.name}: {e}")
             return
 
         self._page = page
-        self._stem = stem
         self._pil = pil
-        self._selected = None
-        self._undo.clear()
-        self._cancel_pending_add()
-        self._order_block = None
         if self.var_reorder_mode.get():
             self._refresh_order_panel()
-        self.btn_save.configure(state="disabled")
         self._render()
         self._update_editor()
         self._update_status()
@@ -536,31 +813,46 @@ class ReviewFrame(ttk.Frame):
 
     def _zoom_scale(self) -> float:
         z = self.var_zoom.get()
+        cw = max(self.canvas.winfo_width(), 1)
+        ch = max(self.canvas.winfo_height(), 1)
         if z == "Fit":
-            cw = max(self.canvas.winfo_width(), 1)
-            ch = max(self.canvas.winfo_height(), 1)
-            scale = max(min(cw / self._pil.width, ch / self._pil.height), 0.02)
+            scale = min(cw / self._pil.width, ch / self._pil.height)
+        elif z == "Fit width":
+            scale = cw / self._pil.width
         else:
             scale = int(z.rstrip("%")) / 100.0
         max_scale = (_MAX_RENDER_PX / (self._pil.width * self._pil.height)) ** 0.5
-        return min(scale, max_scale)
+        return min(max(scale, 0.02), max_scale)
 
-    def _render_if_fit(self) -> None:
-        if self._pil is not None and self.var_zoom.get() == "Fit":
-            self._render()
+    def _on_canvas_configure(self, _event: object = None) -> None:
+        if self._pil is None or self.var_zoom.get() not in _FIT_ZOOMS:
+            return
+        if self._fit_after is not None:
+            self.after_cancel(self._fit_after)
+        self._fit_after = self.after(80, self._fit_now)
+
+    def _fit_now(self) -> None:
+        self._fit_after = None
+        self._render()
 
     def _render(self) -> None:
         if self._pil is None or self._page is None:
             return
-        self._scale = self._zoom_scale()
-        w = max(int(self._pil.width * self._scale), 1)
-        h = max(int(self._pil.height * self._scale), 1)
-        resample = Image.LANCZOS if self._scale < 1 else Image.NEAREST
-        self._photo = ImageTk.PhotoImage(self._pil.resize((w, h), resample))
-
-        self.canvas.delete("all")
-        self.canvas.create_image(0, 0, image=self._photo, anchor="nw")
-        self.canvas.configure(scrollregion=(0, 0, w, h))
+        scale = self._zoom_scale()
+        w = max(int(self._pil.width * scale), 1)
+        h = max(int(self._pil.height * scale), 1)
+        if self._photo is None or (w, h) != self._photo_size:
+            # Resampling a scan of hundreds of megapixels is the slow part;
+            # overlay-only changes (threshold, edits, modes) reuse the image.
+            resample = Image.LANCZOS if scale < 1 else Image.NEAREST
+            self._photo = ImageTk.PhotoImage(self._pil.resize((w, h), resample))
+            self._photo_size = (w, h)
+            self.canvas.delete("all")
+            self.canvas.create_image(0, 0, image=self._photo, anchor="nw")
+            self.canvas.configure(scrollregion=(0, 0, w, h))
+        else:
+            self.canvas.delete(_OVERLAY)
+        self._scale = scale
 
         self._rect_by_word.clear()
         if self.var_reorder_mode.get():
@@ -577,29 +869,26 @@ class ReviewFrame(ttk.Frame):
             x, y, bw, bh = word.box_px
             color = _COLOR_EDITED if id(word) in edited else _wc_color(word.wc)
             item = self.canvas.create_rectangle(
-                x * self._scale, y * self._scale,
-                (x + bw) * self._scale, (y + bh) * self._scale,
+                x * scale, y * scale, (x + bw) * scale, (y + bh) * scale,
                 outline=color, width=3 if word is self._selected else 2,
+                tags=(_OVERLAY,),
             )
             self._rect_by_word[id(word)] = item
 
         # A pending add-word box survives re-renders (zoom, threshold
-        # changes) — redraw it; canvas.delete("all") above dropped the item.
+        # changes) — redraw it; the overlay sweep above dropped the item.
         if self._pending_box is not None:
             x, y, bw, bh = self._pending_box
             self._drag_item = self.canvas.create_rectangle(
-                x * self._scale, y * self._scale,
-                (x + bw) * self._scale, (y + bh) * self._scale,
-                outline=_COLOR_EDITED, width=2, dash=(4, 2),
+                x * scale, y * scale, (x + bw) * scale, (y + bh) * scale,
+                outline=_COLOR_EDITED, width=2, dash=(4, 2), tags=(_OVERLAY,),
             )
         else:
             self._drag_item = None
 
     def _threshold(self) -> float:
-        try:
-            return max(0.0, min(1.0, float(self.var_threshold.get())))
-        except (tk.TclError, ValueError):
-            return DEFAULT_LOW_WC
+        value = parse_pct(self.var_threshold.get())
+        return DEFAULT_LOW_WC if value is None else value
 
     def _on_threshold_changed(self) -> None:
         self._settings["review_threshold"] = self._threshold()
@@ -607,13 +896,13 @@ class ReviewFrame(ttk.Frame):
         self._render()
         self._update_status()
 
-    def _on_wheel(self, event: tk.Event) -> None:
-        self.canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+    def _on_wheel(self, delta: int) -> None:
+        self.canvas.yview_scroll(-1 if delta > 0 else 1, "units")
 
-    def _on_wheel_h(self, event: tk.Event) -> None:
-        self.canvas.xview_scroll(-1 if event.delta > 0 else 1, "units")
+    def _on_wheel_h(self, delta: int) -> None:
+        self.canvas.xview_scroll(-1 if delta > 0 else 1, "units")
 
-    def _on_wheel_zoom(self, event: tk.Event) -> None:
+    def _on_wheel_zoom(self, event: tk.Event, delta: int) -> None:
         """Ctrl+scroll: zoom about the mouse cursor, ~20% per notch.
         Steps the zoom percentage (leaving "Fit" mode) and re-anchors the
         view so the image point under the cursor stays put."""
@@ -621,11 +910,11 @@ class ReviewFrame(ttk.Frame):
             return
         ix = self.canvas.canvasx(event.x) / self._scale
         iy = self.canvas.canvasy(event.y) / self._scale
-        factor = 1.2 if event.delta > 0 else 1 / 1.2
-        pct = max(5, min(400, round(self._scale * factor * 100)))
-        if pct == round(self._scale * 100):
+        factor = 1.2 if delta > 0 else 1 / 1.2
+        pct_zoom = max(5, min(400, round(self._scale * factor * 100)))
+        if pct_zoom == round(self._scale * 100):
             return  # already at the zoom limit in this direction
-        self.var_zoom.set(f"{pct}%")
+        self.var_zoom.set(f"{pct_zoom}%")
         self._render()
         w = max(int(self._pil.width * self._scale), 1)
         h = max(int(self._pil.height * self._scale), 1)
@@ -793,7 +1082,7 @@ class ReviewFrame(ttk.Frame):
             selected = el is self._order_block
             self.canvas.create_rectangle(
                 x, y, x + bw, y + bh, outline=_COLOR_ORDER,
-                width=3 if selected else 2)
+                width=3 if selected else 2, tags=(_OVERLAY,))
             self._draw_order_badge(x, y, str(i + 1), large=True)
             if selected:
                 for j, ln in enumerate(self._order_lines):
@@ -803,7 +1092,7 @@ class ReviewFrame(ttk.Frame):
                     lx, ly, lw, lh = (v * s for v in lb)
                     self.canvas.create_rectangle(
                         lx, ly, lx + lw, ly + lh, outline=_COLOR_ORDER,
-                        width=1, dash=(4, 2))
+                        width=1, dash=(4, 2), tags=(_OVERLAY,))
                     self._draw_order_badge(lx, ly, str(j + 1), large=False)
 
     def _draw_order_badge(self, x: float, y: float, label: str, *, large: bool) -> None:
@@ -814,10 +1103,10 @@ class ReviewFrame(ttk.Frame):
         x0, y0, x1, y1 = self.canvas.bbox(probe)
         self.canvas.delete(probe)
         w, h = (x1 - x0) + 2 * pad, (y1 - y0) + 2 * pad
-        self.canvas.create_rectangle(x, y, x + w, y + h,
-                                     fill=_COLOR_ORDER, outline=_COLOR_ORDER)
+        self.canvas.create_rectangle(x, y, x + w, y + h, fill=_COLOR_ORDER,
+                                     outline=_COLOR_ORDER, tags=(_OVERLAY,))
         self.canvas.create_text(x + w / 2, y + h / 2, text=label,
-                                fill="white", font=font)
+                                fill="white", font=font, tags=(_OVERLAY,))
 
     def _cancel_pending_add(self) -> None:
         self._drag_start = None
@@ -835,7 +1124,8 @@ class ReviewFrame(ttk.Frame):
         x1, y1 = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
         if self._drag_item is None:
             self._drag_item = self.canvas.create_rectangle(
-                x0, y0, x1, y1, outline=_COLOR_EDITED, width=2, dash=(4, 2))
+                x0, y0, x1, y1, outline=_COLOR_EDITED, width=2, dash=(4, 2),
+                tags=(_OVERLAY,))
         else:
             self.canvas.coords(self._drag_item, x0, y0, x1, y1)
 
@@ -869,6 +1159,7 @@ class ReviewFrame(ttk.Frame):
             word = self._page.add_word(self._pending_box, text)
         except ValueError as e:
             self.var_status.set(str(e))
+            self.bell()
             return
         self._undo.append(_AddEntry(word))
         self._cancel_pending_add()
@@ -883,11 +1174,6 @@ class ReviewFrame(ttk.Frame):
             self.canvas.focus_set()
         else:
             self._select_word(None)
-
-    def _insert_glyph(self, ch: str) -> None:
-        """Type a palette glyph into the edit box at the cursor."""
-        self.ent_edit.insert("insert", ch)
-        self.ent_edit.focus_set()
 
     # ---------- selection -------------------------------------------------
 
@@ -938,7 +1224,7 @@ class ReviewFrame(ttk.Frame):
     def _update_editor(self) -> None:
         if self._pending_box is not None and self._pil is not None:
             self._set_snippet(*self._pending_box)
-            self.lbl_wc.configure(text="new word")
+            self.lbl_wc.configure(text="New word")
             self.var_edit.set("")
             return
         word = self._selected
@@ -950,7 +1236,8 @@ class ReviewFrame(ttk.Frame):
             return
         self._set_snippet(*word.box_px)
         self.lbl_wc.configure(
-            text=f"WC {word.wc:.2f}" if word.wc is not None else "WC —  (unscored)")
+            text=f"Confidence {pct(word.wc)}" if word.wc is not None
+            else "Confidence —  (unscored)")
         self.var_edit.set(word.content)
 
     def _apply_edit(self, advance: bool = False) -> None:
@@ -965,8 +1252,14 @@ class ReviewFrame(ttk.Frame):
             self._delete_word()
             return
         if " ".join(new_text.split()) != word.content:
-            self._undo.append(_EditEntry(word, word.content, word.wc))
-            self._page.edit_word(word, new_text)
+            old_content, old_wc = word.content, word.wc
+            try:
+                self._page.edit_word(word, new_text)
+            except ValueError as e:  # text ALTO cannot store: nothing changed
+                self.var_status.set(str(e))
+                self.bell()
+                return
+            self._undo.append(_EditEntry(word, old_content, old_wc))
             self._mark_touched(word)
         elif word.needs_review(self._threshold()):
             # Enter on a word left as-is: the OCR got this one right, the
@@ -990,29 +1283,25 @@ class ReviewFrame(ttk.Frame):
         self.btn_save.configure(state="normal")
 
     def _delete_word(self) -> None:
+        """Delete the selected word at once — no confirmation prompt; the
+        deletion goes on the undo stack and Ctrl+Z restores it exactly."""
         word = self._selected
         if word is None or self._page is None:
             return
-        if not messagebox.askyesno(
-            "Review",
-            f"Delete the word {word.content!r}?\n\n"
-            "Deletion can't be undone except by reloading the page unsaved.",
-        ):
-            return
         nxt = self._next_after(word)
-        if any(isinstance(e, _AddEntry) and e.word is word for e in self._undo):
-            # Deleting a word added this session: net it out of the
-            # provenance count instead of counting an add plus a delete.
-            self._page.undo_add(word)
+        added = any(isinstance(e, _AddEntry) and e.word is word for e in self._undo)
+        if added:
+            # A word added this session: net it out of the provenance count
+            # instead of counting an add plus a delete.
+            removal = self._page.undo_add(word)
         else:
-            self._page.delete_word(word)
-        self._undo = [e for e in self._undo
-                      if getattr(e, "word", None) is not word]
+            removal = self._page.delete_word(word)
+        self._undo.append(_DeleteEntry(word, removal, added))
         self._selected = None
         self.btn_save.configure(state="normal")
         self._render()
         self._select_word(nxt)
-        self._update_status()
+        self._update_status(f"Deleted “{word.content}” (Ctrl+Z puts it back).")
 
     def _clear_page(self) -> None:
         """Bulk-delete every word — for pages whose OCR is wholly
@@ -1029,6 +1318,7 @@ class ReviewFrame(ttk.Frame):
             "Use this when the whole page is hallucinated OCR — texture or "
             "noise read as text on covers, photographs, or blank pages.\n\n"
             "This can't be undone except by reloading the page unsaved.",
+            parent=self._ws_parent(),
         ):
             return
         removed = self._page.clear_words()
@@ -1068,6 +1358,18 @@ class ReviewFrame(ttk.Frame):
             self._update_editor()
             self._update_status()
             return
+        if isinstance(entry, _DeleteEntry):  # put the deleted word back
+            if entry.added:
+                self._page.redo_add(entry.word, entry.removal)
+            else:
+                self._page.undo_delete(entry.word, entry.removal)
+            self._maybe_disable_save()
+            if self.var_reorder_mode.get():  # its containers are back too
+                self._refresh_order_panel()
+            self._render()
+            self._select_word(entry.word)
+            self._update_status(f"Restored “{entry.word.content}”.")
+            return
         if isinstance(entry, _VerifyEntry):  # un-confirm: engine WC back
             self._page.unverify_word(entry.word, entry.old_wc)
         else:
@@ -1080,8 +1382,9 @@ class ReviewFrame(ttk.Frame):
         self._update_status()
 
     def _maybe_disable_save(self) -> None:
-        if (self._page.session_edits == 0 and self._page.session_moves == 0
-                and self._page.session_verifies == 0 and not self._page.dirty):
+        """After an undo: a page back exactly as it was loaded (or last
+        saved) has nothing to save — no Save button, no "Save changes?"."""
+        if not self._page.settle():
             self.btn_save.configure(state="disabled")
 
     def _touched_ids(self) -> set[int]:
@@ -1142,9 +1445,25 @@ class ReviewFrame(ttk.Frame):
 
     # ---------- save / status --------------------------------------------
 
-    def _save_page(self) -> None:
+    def _commit_typed_text(self) -> None:
+        """Before a save: apply a correction typed into the editor but not
+        yet applied with Enter, so Ctrl+S / Save page never drops it."""
+        text = self.var_edit.get()
+        if not text.strip():
+            return
+        if self._pending_box is not None:
+            self._commit_add()
+        elif (self._selected is not None
+              and " ".join(text.split()) != self._selected.content):
+            self._apply_edit(advance=False)
+
+    def _save_page(self, parent: Optional[tk.Misc] = None) -> None:
         if self._page is None:
             return
+        self._commit_typed_text()
+        if not self._page.dirty:
+            return
+        parent = parent or self._ws_parent()
         try:
             txt = self._page.save()
         except ConcurrentEditError as e:
@@ -1153,39 +1472,44 @@ class ReviewFrame(ttk.Frame):
             if not messagebox.askyesno(
                 "Review",
                 f"{e}\n\nOverwrite the on-disk version with your edits?",
+                parent=parent,
             ):
                 return
             try:
                 txt = self._page.save(force=True)
             except OSError as e2:
-                messagebox.showerror("Review", f"Save failed:\n{e2}")
+                messagebox.showerror("Review", f"Save failed:\n{e2}", parent=parent)
                 return
         except OSError as e:
-            messagebox.showerror("Review", f"Save failed:\n{e}")
+            messagebox.showerror("Review", f"Save failed:\n{e}", parent=parent)
             return
         self._undo.clear()
         self.btn_save.configure(state="disabled")
-        # Refresh this page's PC in the list (save recomputed it).
+        # Refresh this page's PC in the list (save recomputed it) — in its
+        # row, without re-ranking the list under the corrector.
         info = scan_alto_file(self._page.alto_path)
         self._pages = [
             (stem, info.pc if stem == self._stem else pc,
              info.status if stem == self._stem else status)
             for stem, pc, status in self._pages
         ]
-        self._refresh_page_list()
+        if self._stem in self._sorted_stems:
+            i = self._sorted_stems.index(self._stem)
+            self.lst_pages.delete(i)
+            self.lst_pages.insert(i, self._page_label(self._stem, info.pc, info.status))
+            self._select_list_row(self._stem)
         self._render()
         extra = f" + {txt.name}" if txt is not None else ""
         self.var_status.set(f"Saved {self._page.alto_path.name}{extra}.")
 
-    def _update_status(self) -> None:
+    def _update_status(self, note: str = "") -> None:
         if self._page is None:
             return
         n_flagged = len(self._flagged_now())
         dirty = "  •  unsaved changes" if self._page.dirty else ""
-        self.var_status.set(
-            f"{self._stem}: {len(self._page.words)} words, {n_flagged} flagged "
-            f"below {self._threshold():.2f}{dirty}"
-        )
+        summary = (f"{self._stem}: {len(self._page.words)} words, {n_flagged} flagged "
+                   f"below {threshold_text(self._threshold())}{dirty}")
+        self.var_status.set(f"{note}  {summary}" if note else summary)
 
     # ---------- repackage -------------------------------------------------
 
@@ -1196,24 +1520,25 @@ class ReviewFrame(ttk.Frame):
         one object folder or an output root holding several."""
         if self._repack_worker is not None and self._repack_worker.is_alive():
             return  # already running
+        main = self.winfo_toplevel()
         path = Path(self.var_object.get().strip())
         dirs = iter_object_dirs(path) if path.is_dir() else []
         if not dirs:
             messagebox.showerror(
                 "Review",
                 f"No ALTO folder found under:\n{path}\n\n"
-                "Point 'Output object' at an OCR output object folder "
-                "(or an output root containing them) first.")
+                "Point 'Transcript Folder' at an object's OCR output folder "
+                "(or an output root containing several) first.", parent=main)
             return
         if self._page is not None and self._page.dirty:
             ans = messagebox.askyesnocancel(
                 "Review",
                 f"{self._stem} has unsaved changes.\n\n"
-                "Save it first so the repackaged METS covers them?")
+                "Save it first so the repackaged METS covers them?", parent=main)
             if ans is None:
                 return
             if ans:
-                self._save_page()
+                self._save_page(parent=main)
                 if self._page.dirty:  # save failed; its error dialog already showed
                     return
         self.btn_repackage.configure(state="disabled")
@@ -1251,7 +1576,8 @@ class ReviewFrame(ttk.Frame):
             shown = "\n".join(problems[:12])
             if len(problems) > 12:
                 shown += f"\n… and {len(problems) - 12} more"
-            messagebox.showwarning("Review", f"{msg}\n\nProblems:\n{shown}")
+            messagebox.showwarning("Review", f"{msg}\n\nProblems:\n{shown}",
+                                   parent=self.winfo_toplevel())
             msg += f"  {len(problems)} problem(s) — see warning."
         self.var_status.set(msg)
 
@@ -1262,4 +1588,9 @@ class ReviewFrame(ttk.Frame):
 
     def confirm_close(self) -> bool:
         """Called by the app's close handler; True → OK to quit."""
-        return self._confirm_discard()
+        if not self._confirm_discard(parent=self.winfo_toplevel()):
+            return False
+        # Where the pop-out windows were, for next time.
+        self._page_window.remember_geometry()
+        self._kb_window.remember_geometry()
+        return True
