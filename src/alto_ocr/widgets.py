@@ -19,6 +19,7 @@ import tkinter.font as tkfont
 from tkinter import ttk
 from typing import Callable, Optional
 
+from . import theme
 from .symbols import SYMBOL_KEYBOARD, SymbolCategory, symbol_label
 
 _GEOMETRY_RE = re.compile(r"^(\d+)x(\d+)([+-]-?\d+)([+-]-?\d+)$")
@@ -131,6 +132,7 @@ class Detachable:
         # Unbound Wm methods work on a managed frame: it is a toplevel now.
         tk.Wm.wm_title(frame, self._title)
         tk.Wm.wm_protocol(frame, "WM_DELETE_WINDOW", self.attach)
+        theme.title_bar(frame)  # a dark title bar in the dark theme
         self._apply_owner()
         self._restore_geometry(home_xy)
         if self.placeholder is not None:
@@ -246,7 +248,8 @@ class Tooltip:
         tip.wm_overrideredirect(True)
         tip.wm_geometry(f"+{self.widget.winfo_rootx() + 6}"
                         f"+{self.widget.winfo_rooty() + self.widget.winfo_height() + 4}")
-        tk.Label(tip, text=self.text, background="#ffffe1", foreground="#222",
+        pal = theme.current()
+        tk.Label(tip, text=self.text, background=pal.tip_bg, foreground=pal.tip_fg,
                  relief="solid", borderwidth=1, padx=5, pady=2).pack()
         self._tip = tip
 
@@ -315,8 +318,11 @@ class SymbolKeyboard(ttk.Frame):
 
     def _add_key(self, parent: ttk.Frame, ch: str, row: int, col: int) -> None:
         # Classic buttons: raised like keys, compact, and never focusable.
+        pal = theme.current()
         key = tk.Button(parent, text=ch, font=self._font, width=2, padx=0, pady=0,
                         relief="raised", borderwidth=1, takefocus=0,
+                        background=pal.button, foreground=pal.fg,
+                        activebackground=pal.button_active, activeforeground=pal.fg,
                         command=lambda c=ch: self._on_symbol(c))
         key.grid(row=row, column=col, padx=1, pady=1, sticky="nsew")
         Tooltip(key, symbol_label(ch))

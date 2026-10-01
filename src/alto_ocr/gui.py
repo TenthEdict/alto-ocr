@@ -30,7 +30,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Mapping, Optional
 
-from . import __version__
+from . import __version__, theme
 from .glmocr import (
     DEFAULT_MODEL,
     DEFAULT_TIMEOUT_S,
@@ -293,6 +293,8 @@ class AltoOcrApp:
         self.var_glmocr_timeout = tk.StringVar(value=str(s.get("glmocr_timeout", gc.timeout_s)))
         self.var_with_checksums = tk.BooleanVar(value=bool(s.get("with_checksums", True)))
         self._adv_win: Optional[tk.Toplevel] = None
+        # View ▸ Theme: light (native look), dark, or match Windows.
+        self.var_theme = tk.StringVar(value=theme.normalize_mode(s.get("theme")))
 
         # Worker bookkeeping.
         self._worker: Optional[threading.Thread] = None
@@ -305,28 +307,62 @@ class AltoOcrApp:
 
         self._build_menu()
         self._build_ui()
+        self._apply_theme()
+        # "Match Windows" re-checks whenever the window comes forward, so a
+        # change in Windows' colour settings shows up without a restart.
+        self.root.bind("<Activate>", self._on_activate, add="+")
         self._install_logging()
         self._poll_after = self.root.after(self.POLL_MS, self._drain_queues)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ---------- UI construction ------------------------------------------------
 
+    _MENUS = ("File", "Tools", "View", "Help")
+
+    def _fill_menu(self, name: str, menu: tk.Menu) -> Optional[tk.Menu]:
+        """One menu's entries. Returns the Theme submenu for "View"."""
+        if name == "File":
+            menu.add_command(label="Exit", command=self._on_close)
+        elif name == "Tools":
+            menu.add_command(label="Advanced settings…", accelerator="Ctrl+,",
+                             command=self._open_advanced)
+        elif name == "View":
+            themes = tk.Menu(menu, tearoff=False)
+            for mode in theme.MODES:
+                themes.add_radiobutton(label=theme.MODE_LABELS[mode], value=mode,
+                                       variable=self.var_theme,
+                                       command=self._on_theme_chosen)
+            menu.add_cascade(label="Theme", menu=themes)
+            return themes
+        elif name == "Help":
+            menu.add_command(label="About Alto OCR", command=self._show_about)
+        return None
+
     def _build_menu(self) -> None:
+        # Windows draws the native menu bar itself and ignores Tk's colours,
+        # so the dark theme swaps it for a themed bar of menubuttons with the
+        # same menus (_apply_theme). Both copies share var_theme.
         menubar = tk.Menu(self.root)
-        file_menu = tk.Menu(menubar, tearoff=False)
-        file_menu.add_command(label="Exit", command=self._on_close)
-        menubar.add_cascade(label="File", menu=file_menu)
-        tools = tk.Menu(menubar, tearoff=False)
-        tools.add_command(label="Advanced settings…", accelerator="Ctrl+,",
-                          command=self._open_advanced)
-        menubar.add_cascade(label="Tools", menu=tools)
-        help_menu = tk.Menu(menubar, tearoff=False)
-        help_menu.add_command(label="About Alto OCR", command=self._show_about)
-        menubar.add_cascade(label="Help", menu=help_menu)
+        menus: dict[str, tk.Menu] = {}
+        themes: Optional[tk.Menu] = None
+        for name in self._MENUS:
+            menus[name] = tk.Menu(menubar, tearoff=False)
+            themes = self._fill_menu(name, menus[name]) or themes
+            menubar.add_cascade(label=name, menu=menus[name], underline=0)
+        themed = ttk.Frame(self.root, style="Menubar.TFrame")
+        for name in self._MENUS:
+            button = ttk.Menubutton(themed, text=name, style="Menubar.TMenubutton",
+                                    takefocus=False)
+            menu = tk.Menu(button, tearoff=False)
+            self._fill_menu(name, menu)
+            button.configure(menu=menu)
+            button.pack(side="left")
         self.root.configure(menu=menubar)
         self.root.bind("<Control-comma>", lambda _e: self._open_advanced())
         self.menubar = menubar
-        self.tools_menu = tools
+        self.themed_menubar = themed
+        self.tools_menu = menus["Tools"]
+        self.theme_menu = themes
 
     def _build_ui(self) -> None:
         # Only the notebook: everything about a run — Run/Cancel, progress,
@@ -384,7 +420,7 @@ class AltoOcrApp:
         ttk.Radiobutton(radio_row, text="GLMOCR (handwriting)",
                         variable=self.var_engine, value="glmocr").pack(side="left")
         hint = ttk.Label(
-            engine_frame, cursor="hand2", foreground="#1f6feb",
+            engine_frame, cursor="hand2", style="Link.TLabel",
             text="Tesseract location and other engine options: Tools ▸ Advanced settings…")
         hint.pack(anchor="w", pady=(6, 0))
         hint.bind("<Button-1>", lambda _e: self._open_advanced())
@@ -399,7 +435,7 @@ class AltoOcrApp:
         self.btn_clear = ttk.Button(actions, text="Clear log",
                                     command=self._clear_log)
         self.btn_clear.pack(side="left", padx=(8, 0))
-        ttk.Label(actions, textvariable=self.var_status, foreground="#666").pack(
+        ttk.Label(actions, textvariable=self.var_status, style="Muted.TLabel").pack(
             side="right")
 
         self.progress = ttk.Progressbar(tab, mode="determinate")
@@ -418,6 +454,7 @@ class AltoOcrApp:
         scroll_y = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
         scroll_y.grid(row=0, column=1, sticky="ns")
         self.log_text.configure(yscrollcommand=scroll_y.set, state="disabled")
+        self.log_text.theme_exempt = True  # dark in both themes
         self.log_text.tag_configure("ERROR", foreground="#ff6e6e")
         self.log_text.tag_configure("WARNING", foreground="#ffd166")
         self.log_text.tag_configure("INFO", foreground="#d8d8d8")
@@ -446,12 +483,34 @@ class AltoOcrApp:
                    command=self._on_reset_advanced).pack(side="left")
         ttk.Button(buttons, text="Close", command=self._close_advanced).pack(side="right")
         ttk.Label(buttons, text="Changes apply to the next OCR run.",
-                  foreground="#888").pack(side="right", padx=(0, 12))
+                  style="Muted.TLabel").pack(side="right", padx=(0, 12))
 
+        theme.recolor_tree(win)
         win.protocol("WM_DELETE_WINDOW", self._close_advanced)
         win.bind("<Escape>", lambda _e: self._close_advanced())
         win.geometry(f"+{self.root.winfo_rootx() + 60}+{self.root.winfo_rooty() + 40}")
         self._adv_win = win
+
+    # ---------- Theme ----------------------------------------------------------
+
+    def _apply_theme(self) -> None:
+        palette = theme.apply(self.root, self.var_theme.get())
+        self._theme_dark = palette.dark
+        if palette.dark:
+            self.root.configure(menu="")
+            self.themed_menubar.pack(side="top", fill="x", before=self._nb)
+        else:
+            self.themed_menubar.pack_forget()
+            self.root.configure(menu=self.menubar)
+
+    def _on_theme_chosen(self) -> None:
+        self._apply_theme()
+        self._update_settings({"theme": self.var_theme.get()})
+
+    def _on_activate(self, event: tk.Event) -> None:
+        if (event.widget is self.root and self.var_theme.get() == "system"
+                and theme.system_prefers_dark() != self._theme_dark):
+            self._apply_theme()
 
     def _close_advanced(self) -> None:
         """Validate and save; an invalid field keeps the window open."""
@@ -481,7 +540,7 @@ class AltoOcrApp:
         ttk.Button(tess, text="Browse…", command=self._browse_tesseract).grid(
             row=0, column=3, padx=(8, 0))
         ttk.Label(
-            tess, foreground="#888",
+            tess, style="Muted.TLabel",
             text="Leave empty to find it automatically (PATH, TESSERACT_PATH, "
                  "or the standard install folder).",
         ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(2, 6))
@@ -500,7 +559,7 @@ class AltoOcrApp:
             ttk.Label(tess, text=label).grid(row=row, column=0, sticky="w",
                                              padx=(0, 8), pady=(4, 0))
             widget.grid(row=row, column=1, sticky="w", pady=(4, 0))
-            ttk.Label(tess, text=hint, foreground="#888").grid(
+            ttk.Label(tess, text=hint, style="Muted.TLabel").grid(
                 row=row, column=2, columnspan=2, sticky="w", padx=(8, 0), pady=(4, 0))
 
         # ----- GLMOCR (handwriting) -----
@@ -512,13 +571,13 @@ class AltoOcrApp:
             row=0, column=1, columnspan=2, sticky="ew")
         ttk.Label(
             gl, text="Leave empty to use OLLAMA_HOST or the built-in default.",
-            foreground="#888",
+            style="Muted.TLabel",
         ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 0))
         ttk.Label(gl, text="Model:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
         ttk.Entry(gl, textvariable=self.var_glmocr_model, width=24).grid(
             row=2, column=1, sticky="w", pady=(6, 0))
         ttk.Label(
-            gl, text="Ollama model tag, e.g. 'glm-ocr:q8_0'.", foreground="#888",
+            gl, text="Ollama model tag, e.g. 'glm-ocr:q8_0'.", style="Muted.TLabel",
         ).grid(row=2, column=2, sticky="w", padx=(8, 0), pady=(6, 0))
         ttk.Label(gl, text="Timeout (sec):").grid(
             row=3, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
@@ -538,7 +597,7 @@ class AltoOcrApp:
         ).grid(row=0, column=1, sticky="w")
         ttk.Label(
             pp, text="Upscale low-DPI scans to at least this DPI before OCR.",
-            foreground="#888",
+            style="Muted.TLabel",
         ).grid(row=0, column=2, sticky="w", padx=(8, 0))
         stages = ttk.Frame(pp)
         stages.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(8, 0))
@@ -549,7 +608,7 @@ class AltoOcrApp:
         ttk.Checkbutton(stages, text="Binarize",
                         variable=self.var_do_binarize).pack(side="left", padx=(0, 12))
         ttk.Label(
-            pp, foreground="#888",
+            pp, style="Muted.TLabel",
             text="Deskew and border crop always stay off: they would move the "
                  "text away from where the word boxes place it on the original scan.",
         ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(2, 0))
@@ -561,7 +620,7 @@ class AltoOcrApp:
             row=3, column=3, padx=(8, 0), pady=(8, 0))
         ttk.Label(
             pp, text="Leave empty to skip; useful for debugging OCR accuracy.",
-            foreground="#888",
+            style="Muted.TLabel",
         ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(2, 0))
 
         # ----- METS -----
@@ -1012,15 +1071,7 @@ class AltoOcrApp:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     root = tk.Tk()
-    style = ttk.Style()
-    for preferred in ("vista", "winnative", "clam", "default"):
-        if preferred in style.theme_names():
-            try:
-                style.theme_use(preferred)
-                break
-            except tk.TclError:
-                continue
-    AltoOcrApp(root)
+    AltoOcrApp(root)  # applies the saved theme (theme.apply)
     root.mainloop()
 
 

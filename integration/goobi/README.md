@@ -239,7 +239,8 @@ coloured by confidence with a **Flag below** threshold and an **All words**
 toggle, the word editor with its symbol keyboard (hideable), delete without
 a prompt, **Undo**, **Add word**, **Clear page**, **◀ Page / Page ▶**, and
 zoom by dropdown (Fit page, Fit width, percentages) or Ctrl+scroll about the
-pointer.
+pointer. An **Auto / Light / Dark** switch in the header sets the
+appearance (Auto follows the system setting); each browser remembers it.
 
 **Reading order** fixes transcripts whose words are right but ordered wrong
 — two columns read straight across, a caption read into a paragraph. Select

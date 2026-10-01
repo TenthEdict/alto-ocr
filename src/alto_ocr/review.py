@@ -96,6 +96,7 @@ from typing import Callable, Optional
 
 from PIL import Image, ImageTk
 
+from . import theme
 from .remediate import (
     ConcurrentEditError,
     Removal,
@@ -364,7 +365,7 @@ class ReviewFrame(ttk.Frame):
                   font=("Segoe UI", 11)).pack(pady=(40, 10))
         ttk.Button(placeholder, text="Bring the page back here",
                    command=self._toggle_page_window).pack()
-        ttk.Label(placeholder, textvariable=self.var_status, foreground="#555",
+        ttk.Label(placeholder, textvariable=self.var_status, style="Muted.TLabel",
                   wraplength=460, justify="center").pack(pady=(18, 0))
         self._page_window = Detachable(
             self.workspace, title="Review — Alto OCR", placeholder=placeholder,
@@ -433,7 +434,8 @@ class ReviewFrame(ttk.Frame):
         area.grid(row=2, column=0, sticky="nsew")
         area.columnconfigure(0, weight=1)
         area.rowconfigure(0, weight=1)
-        self.canvas = tk.Canvas(area, background="#404040", highlightthickness=0)
+        self.canvas = tk.Canvas(area, background=theme.current().canvas,
+                                highlightthickness=0)
         self.canvas.grid(row=0, column=0, sticky="nsew")
         vs = ttk.Scrollbar(area, orient="vertical", command=self.canvas.yview)
         vs.grid(row=0, column=1, sticky="ns")
@@ -445,7 +447,7 @@ class ReviewFrame(ttk.Frame):
 
         # -- Row 3: editor bar (+ symbol keyboard), row 4: status
         self._build_editor(ws)
-        ttk.Label(ws, textvariable=self.var_status, foreground="#555").grid(
+        ttk.Label(ws, textvariable=self.var_status, style="Muted.TLabel").grid(
             row=4, column=0, sticky="w", pady=(4, 0))
 
         for widget in (self.canvas, self.ent_edit, self.txt_order):
@@ -489,7 +491,7 @@ class ReviewFrame(ttk.Frame):
         panel.rowconfigure(4, weight=1)
         ttk.Label(panel, text="Reading order", font=("Segoe UI", 10, "bold")).grid(
             row=0, column=0, columnspan=2, sticky="w")
-        ttk.Label(panel, textvariable=self.var_order_hint, foreground="#555",
+        ttk.Label(panel, textvariable=self.var_order_hint, style="Muted.TLabel",
                   wraplength=300, justify="left").grid(
             row=1, column=0, columnspan=2, sticky="w", pady=(2, 6))
         btns = ttk.Frame(panel)
@@ -514,8 +516,9 @@ class ReviewFrame(ttk.Frame):
                                  font=("Segoe UI", 10), state="disabled",
                                  padx=6, pady=4)
         self.txt_order.grid(row=4, column=0, sticky="ns")
-        self.txt_order.tag_configure("chosen", background="#cfe0ff",
-                                     foreground="#0b3d91")
+        pal = theme.current()
+        self.txt_order.tag_configure("chosen", background=pal.chosen_bg,
+                                     foreground=pal.chosen_fg)
         sb = ttk.Scrollbar(panel, orient="vertical", command=self.txt_order.yview)
         sb.grid(row=4, column=1, sticky="ns")
         self.txt_order.configure(yscrollcommand=sb.set)
@@ -563,7 +566,7 @@ class ReviewFrame(ttk.Frame):
         self.keyboard.pack(fill="x", padx=4, pady=(0, 4))
         kb_placeholder = ttk.Frame(editor)
         ttk.Label(kb_placeholder, text="The symbol keyboard is in its own window.",
-                  foreground="#555").pack(side="left")
+                  style="Muted.TLabel").pack(side="left")
         ttk.Button(kb_placeholder, text="Dock it here",
                    command=self._toggle_keyboard_window).pack(side="left", padx=(8, 0))
         self._kb_window = Detachable(

@@ -38,7 +38,7 @@ try:
     import tkinter as tk
     from tkinter import ttk
 
-    from src.alto_ocr import gui, review, widgets
+    from src.alto_ocr import gui, review, theme, widgets
 except ImportError:  # pragma: no cover - no tkinter on this machine
     tk = None
 
@@ -265,6 +265,69 @@ class MainWindowTests(_AppFixture):
         saved = json.loads(self.settings_path.read_text(encoding="utf-8"))
         self.assertEqual((saved["min_dpi"], saved["psm"]), (400, 1))
         self.assertNotIn("tesseract_path", saved)
+
+
+class ThemeTests(_AppFixture):
+    """View ▸ Theme: Light keeps the native look, Dark recolours both kinds
+    of widget and swaps in a themed menu bar, Match Windows follows the
+    system, and the choice is saved."""
+
+    def choose(self, mode: str) -> None:
+        self.app.var_theme.set(mode)
+        self.app._on_theme_chosen()
+
+    def test_light_is_the_default_and_native(self) -> None:
+        self.assertEqual(self.app.var_theme.get(), "light")
+        style = ttk.Style(self.app.root)
+        self.assertEqual(style.theme_use(), theme.native_theme(style))
+        self.assertEqual(str(self.app.root.cget("menu")), str(self.app.menubar))
+        self.assertFalse(self.app.themed_menubar.winfo_manager())
+
+    def test_dark_recolours_and_swaps_the_menu_bar(self) -> None:
+        self.choose("dark")
+        self.assertEqual(ttk.Style(self.app.root).theme_use(), "clam")
+        self.assertEqual(self.app.review.lst_pages.cget("background"), theme.DARK.field)
+        self.assertEqual(self.app.review.canvas.cget("background"), theme.DARK.canvas)
+        self.assertEqual(self.app.review.txt_order.tag_cget("chosen", "background"),
+                         theme.DARK.chosen_bg)
+        self.assertEqual(str(self.app.root.cget("menu")), "")
+        self.assertEqual(self.app.themed_menubar.winfo_manager(), "pack")
+        self.assertEqual(ttk.Style(self.app.root).lookup("Muted.TLabel", "foreground"),
+                         theme.DARK.muted)
+        # The run log keeps its own dark colours in both themes.
+        self.assertEqual(self.app.log_text.cget("background"), "#101418")
+        saved = json.loads(self.settings_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["theme"], "dark")
+
+    def test_back_to_light_restores_everything(self) -> None:
+        self.choose("dark")
+        self.choose("light")
+        style = ttk.Style(self.app.root)
+        self.assertEqual(style.theme_use(), theme.native_theme(style))
+        self.assertEqual(self.app.review.lst_pages.cget("background"), theme.LIGHT.field)
+        self.assertEqual(str(self.app.root.cget("menu")), str(self.app.menubar))
+        self.assertFalse(self.app.themed_menubar.winfo_manager())
+
+    def test_match_windows_follows_the_system(self) -> None:
+        with mock.patch.object(theme, "system_prefers_dark", return_value=True):
+            self.choose("system")
+            self.assertTrue(self.app._theme_dark)
+        with mock.patch.object(theme, "system_prefers_dark", return_value=False):
+            # Coming back to the window re-checks the system setting.
+            self.app._on_activate(mock.Mock(widget=self.app.root))
+            self.assertFalse(self.app._theme_dark)
+
+    def test_unknown_saved_mode_falls_back_to_light(self) -> None:
+        self.assertEqual(theme.normalize_mode("purple"), "light")
+        self.assertEqual(theme.normalize_mode(None), "light")
+        self.assertIs(theme.resolve("dark"), theme.DARK)
+
+    def test_both_menu_bars_offer_the_theme_choice(self) -> None:
+        labels = [self.app.theme_menu.entrycget(i, "label")
+                  for i in range(self.app.theme_menu.index("end") + 1)]
+        self.assertEqual(labels, ["Light", "Dark", "Match Windows"])
+        buttons = [w.cget("text") for w in self.app.themed_menubar.winfo_children()]
+        self.assertEqual(buttons, ["File", "Tools", "View", "Help"])
 
 
 class ReviewFixture(_AppFixture):
