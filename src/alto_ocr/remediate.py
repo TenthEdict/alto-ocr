@@ -45,15 +45,20 @@ Semantics (agreed 2026-07-30):
   best overlaps the box, else a new TextLine in the best-overlapping
   TextBlock, else a new TextBlock in PrintSpace. Like an edit, the added
   word is human-verified (``WC="1.00"``) and counts toward provenance.
-* **Reordering** (2026-08-06; OCR read the page in the wrong order —
-  wrong column sequence, captions/margin notes interleaved into the
-  body) moves a TextBlock/ComposedBlock among its sibling blocks or a
-  TextLine within its TextBlock. Reading order *is* document order
-  (``alto_to_text`` ignores coordinates and ``<SP>`` entirely), so a
-  pure sibling relocation is the whole fix: geometry, IDs, and SP runs
-  are untouched — the boxes still land on the same pixels. A
-  ComposedBlock moves as one atomic unit; the TextBlocks inside it are
-  themselves reorderable (``flow_children``). Reorders are counted
+* **Reordering** (OCR read the page in the wrong order — wrong column
+  sequence, captions/margin notes interleaved into the body) works on
+  **words** (2026-10-01; it moved Tesseract's blocks and lines before,
+  and those units rarely matched what was actually out of order).
+  ``move_words`` takes a run of words and places it directly after another
+  word (or at the page start); ``nudge_words`` shifts a run one word
+  earlier or later. Reading order *is* document order (``alto_to_text``
+  ignores coordinates and ``<SP>``), so a move relocates ``<String>``
+  elements: a run from one line goes in-line beside its target word, a
+  run spanning several lines keeps its line breaks as lines of their own
+  (splitting the target's line when the target is mid-line). Word boxes
+  never change; containers whose membership changed are re-fitted to their
+  contents, SP runs rebuilt, emptied ones removed. Undo restores a
+  snapshot of the layout, so it is byte-exact. Reorders are counted
   separately from word corrections in the review provenance
   ("… N reading-order change(s)").
 * **Saving** re-serializes with the institution conventions (tab indent,
@@ -156,6 +161,22 @@ class Removal:
     it back to ``undo_delete``/``redo_add``."""
 
     steps: tuple[tuple[etree._Element, int, etree._Element], ...]
+
+
+@dataclass(frozen=True)
+class WordMove:
+    """The page layout as it was before one ``move_words``: each container's
+    children in order, and the attributes of every element a move may
+    rewrite. Opaque to callers — hand it back to ``undo_move_words``.
+
+    A snapshot rather than a list of steps, because a move touches several
+    containers at once (lines split, re-fitted, rebuilt SP runs, emptied
+    ones dropped) and replaying the snapshot is exact by construction. The
+    ``<String>`` elements themselves are never copied, so every ``Word`` the
+    GUI holds stays valid across move and undo."""
+
+    children: tuple[tuple[etree._Element, tuple[etree._Element, ...]], ...]
+    attrs: tuple[tuple[etree._Element, tuple[tuple[str, str], ...]], ...]
 
 
 def _checked_content(text: str) -> str:
@@ -518,12 +539,16 @@ class ReviewPage:
         except ValueError:
             return None
 
-    def _next_id(self, local: str) -> str:
+    def _next_id(self, local: str, reserved: set[str] | None = None) -> str:
         """Fresh institution-style ID (e.g. ``P1_ST00005``): continue past
         the highest existing number for the element type; never reuse an ID
-        (deleted words leave gaps, which is fine — nothing renumbers)."""
+        (deleted words leave gaps, which is fine — nothing renumbers).
+        ``reserved`` adds IDs held by elements momentarily out of the tree
+        (a line a move is relocating) and receives the new one."""
         prefix = f"{self.page.get('ID', 'P1')}_{self._ID_CODES[local]}"
         used = {e.get("ID") for e in self.root.iter() if e.get("ID") is not None}
+        if reserved:
+            used |= reserved
         pat = re.compile(re.escape(prefix) + r"(\d+)$")
         n = 0
         for uid in used:
@@ -533,6 +558,8 @@ class ReviewPage:
         n += 1
         while f"{prefix}{n:05d}" in used:
             n += 1
+        if reserved is not None:
+            reserved.add(f"{prefix}{n:05d}")
         return f"{prefix}{n:05d}"
 
     def _best_line(self, hpos: int, vpos: int, width: int, height: int
@@ -702,69 +729,267 @@ class ReviewPage:
 
     # ---------- reading order ---------------------------------------------
 
-    # Which child elements form the reorderable "flow" of a container.
-    _FLOW_BY_PARENT = {"PrintSpace": ("TextBlock", "ComposedBlock"),
-                       "ComposedBlock": ("TextBlock", "ComposedBlock"),
-                       "TextBlock": ("TextLine",)}
+    # Containers that hold words; a move re-fits and may remove these.
+    _WORD_CONTAINERS = frozenset({"TextLine", "TextBlock", "ComposedBlock"})
 
-    def flow_children(self, parent: etree._Element | None = None) -> list[etree._Element]:
-        """Reorderable children of ``parent`` in document (reading) order.
+    def move_words(self, words: list[Word], after: Word | None) -> WordMove | None:
+        """Move ``words`` so they are read directly after ``after`` — or
+        first on the page when ``after`` is None. Returns the ``WordMove``
+        that ``undo_move_words`` takes, or None (nothing changed) when the
+        words are already read there.
 
-        ``None`` means the page's PrintSpace (``[]`` when absent — failure
-        stubs, cleared-to-skeleton edge cases). PrintSpace/ComposedBlock
-        yield their TextBlock+ComposedBlock units; a TextBlock yields its
-        TextLines. Two-level UI note: lines inside a TextBlock that is
-        nested in a ComposedBlock are reachable only via that inner block.
+        The words travel in their current reading order. Where they land:
+
+        * a run from **one line** goes in-line, straight after ``after``
+          (before the page's first word for ``None``) — the case of a word
+          or phrase read out of place;
+        * a run spanning **several lines** keeps its line breaks: each
+          source line's share becomes a line of its own after ``after``'s
+          line (before the first line for ``None``). When ``after`` is
+          mid-line, its line is split so the moved lines sit between its
+          two halves. A source line that moved whole is reused, ID and all.
+
+        Word boxes never change — they still sit on the same pixels. Lines
+        and blocks that gained or lost words are re-fitted to what they now
+        contain, their ``<SP>`` runs rebuilt, and emptied ones removed like a
+        deletion's cascade. Counts once toward the provenance reading-order
+        total. Raises ValueError when ``after`` is one of ``words``.
         """
-        if parent is None:
-            parent = self.page.find(qname(self.ns, "PrintSpace"))
-            if parent is None:
-                return []
-        flow = self._FLOW_BY_PARENT.get(etree.QName(parent).localname)
-        if flow is None:
-            return []
-        return [c for c in parent
-                if isinstance(c.tag, str) and etree.QName(c).localname in flow]
+        pos = {id(w.elem): i for i, w in enumerate(self.words)}
+        unique = {id(w.elem): w for w in words if id(w.elem) in pos}
+        run = sorted(unique.values(), key=lambda w: pos[id(w.elem)])
+        if not run:
+            return None
+        if after is not None:
+            if id(after.elem) in unique:
+                raise ValueError("Words cannot be placed after one of themselves.")
+            if id(after.elem) not in pos:
+                raise ValueError("The target word is no longer on this page.")
+        start = pos[id(after.elem)] + 1 if after is not None else 0
+        if [pos[id(w.elem)] for w in run] == list(range(start, start + len(run))):
+            return None  # already read exactly there
 
-    def _move_flow(self, el: etree._Element, delta: int) -> bool:
-        """Relocate ``el`` ``delta`` positions among its flow siblings.
-        Pure sibling reorder — geometry, IDs, and SPs untouched. False (no
-        state change) at a boundary, for delta 0, or when ``el`` is
-        detached or not a flow element. Exactly inverted by ``-delta``."""
-        parent = el.getparent()
-        if parent is None or delta == 0:
-            return False
-        local = etree.QName(el).localname
-        if local == "TextLine":
-            flow = ("TextLine",)
-        elif local in ("TextBlock", "ComposedBlock"):
-            flow = ("TextBlock", "ComposedBlock")
+        snapshot = self._layout_snapshot()
+        string_tag = qname(self.ns, "String")
+        # Lines are relocated by detaching them, which hides their IDs from
+        # _next_id: reserve every ID on the page before anything moves.
+        ids = {e.get("ID") for e in self.root.iter() if e.get("ID") is not None}
+
+        # Each touched line's String membership before the move, and the
+        # containers it sat in: re-fitting is for containers whose contents
+        # changed, never for a line whose words were only reordered.
+        before: dict[int, tuple[etree._Element, frozenset[int]]] = {}
+        blocks: dict[int, etree._Element] = {}
+
+        def touch(line: etree._Element) -> None:
+            if id(line) not in before:
+                before[id(line)] = (line, frozenset(
+                    id(s) for s in line.findall(string_tag)))
+
+        # The word the run goes beside: ``after``, or (page start) the first
+        # String that is not itself moving. Found before anything detaches,
+        # so the target line's membership is recorded as it was.
+        if after is not None:
+            anchor = after.elem
         else:
-            return False
-        sibs = [c for c in parent
-                if isinstance(c.tag, str) and etree.QName(c).localname in flow]
-        j = sibs.index(el) + delta
-        if not 0 <= j < len(sibs):
-            return False
+            anchor = next((s for s in self.page.iter(string_tag)
+                           if id(s) not in unique), None)
+            if anchor is None:
+                return None
+        target = anchor.getparent()
+        touch(target)
+
+        # Segments: consecutive run words sharing a source line.
+        segments: list[tuple[etree._Element, list[etree._Element]]] = []
+        for w in run:
+            line = w.elem.getparent()
+            if segments and segments[-1][0] is line:
+                segments[-1][1].append(w.elem)
+            else:
+                segments.append((line, [w.elem]))
+        for line, elems in segments:
+            touch(line)
+            for el in elems:
+                line.remove(el)
+
+        if len(segments) == 1:
+            elems = segments[0][1]
+            if after is not None:
+                for el in reversed(elems):
+                    anchor.addnext(el)
+            else:
+                for el in elems:
+                    anchor.addprevious(el)
+        else:
+            new_lines = []
+            for source, elems in segments:
+                if source is not target and next(source.iter(string_tag), None) is None:
+                    # The whole line moved: reuse it (its ID survives).
+                    old_parent = source.getparent()
+                    if old_parent is not None:
+                        self._collect_blocks(source, blocks)
+                        old_parent.remove(source)
+                        self._drop_if_empty(old_parent, blocks)
+                    line = source
+                else:
+                    line = self._new_line(ids)
+                for el in elems:
+                    line.append(el)
+                touch(line)
+                new_lines.append(line)
+            tail = None
+            if after is not None:
+                rest = list(anchor.itersiblings(string_tag))
+                if rest:  # target mid-line: split it around the moved lines
+                    tail = self._new_line(ids)
+                    touch(tail)
+                    for el in rest:
+                        tail.append(el)
+            if after is None:
+                for line in new_lines:
+                    target.addprevious(line)
+            else:
+                prev = target
+                for line in new_lines + ([tail] if tail is not None else []):
+                    prev.addnext(line)
+                    prev = line
+            # The target's block gained lines (a reused one unchanged inside).
+            self._collect_blocks(target, blocks)
+
+        # Tidy every touched line: drop it when emptied, else rebuild its SP
+        # run (word order changed) and re-fit it when its words changed.
+        for line, members in before.values():
+            if not self._attached(line):
+                continue
+            strings = line.findall(string_tag)
+            if not strings:
+                self._collect_blocks(line, blocks)
+                self._drop_if_empty(line, blocks)
+                continue
+            self._rebuild_line_sps(line)
+            if frozenset(id(s) for s in strings) != members:
+                self._fit_box(line, strings)
+                self._collect_blocks(line, blocks)
+        # Innermost first, so a ComposedBlock fits its re-fitted blocks.
+        for block in sorted(blocks.values(), key=self._depth, reverse=True):
+            if self._attached(block):
+                self._fit_box(block, [
+                    c for c in block if isinstance(c.tag, str)
+                    and etree.QName(c).localname in self._WORD_CONTAINERS])
+
+        self._resort_words()
+        self.dirty = True
+        self.session_moves += 1
+        return snapshot
+
+    def nudge_words(self, words: list[Word], delta: int) -> WordMove | None:
+        """Move ``words`` one word earlier (``delta`` < 0) or later in reading
+        order — ``move_words`` with the neighboring word as the target. None
+        at the page's start/end (nothing to step past)."""
+        pos = {id(w.elem): i for i, w in enumerate(self.words)}
+        chosen = {id(w.elem) for w in words if id(w.elem) in pos}
+        if not chosen or delta == 0:
+            return None
+        idx = sorted(pos[i] for i in chosen)
         if delta < 0:
-            sibs[j].addprevious(el)
+            earlier = [w for w in self.words[:idx[0]] if id(w.elem) not in chosen]
+            if not earlier:
+                return None
+            after = earlier[-2] if len(earlier) >= 2 else None
         else:
-            sibs[j].addnext(el)
-        # Keep self.words in document (reading) order — flagged() and the
-        # GUI's next-word stepping rely on it.
+            later = [w for w in self.words[idx[-1] + 1:] if id(w.elem) not in chosen]
+            if not later:
+                return None
+            after = later[0]
+        return self.move_words(words, after)
+
+    def undo_move_words(self, move: WordMove) -> None:
+        """Undo one ``move_words``/``nudge_words`` (GUI undo stack): put the
+        layout back exactly and un-count the move. ``dirty`` stays as-is,
+        like ``revert_word`` — reloading is the full reset.
+
+        Only exact while the tree is as the move left it, which a strict
+        undo stack guarantees: every later change has been undone first."""
+        self._restore_layout(move)
+        self.session_moves = max(0, self.session_moves - 1)
+
+    def _layout_snapshot(self) -> WordMove:
+        children = []
+        attrs = []
+        rewritable = self._WORD_CONTAINERS | {"SP"}
+        for el in self.page.iter():
+            if not isinstance(el.tag, str):
+                continue
+            if len(el):
+                children.append((el, tuple(el)))
+            if etree.QName(el).localname in rewritable:
+                attrs.append((el, tuple(el.attrib.items())))
+        return WordMove(tuple(children), tuple(attrs))
+
+    def _restore_layout(self, move: WordMove) -> None:
+        for parent, kids in move.children:
+            parent[:] = list(kids)
+        for el, items in move.attrs:
+            el.attrib.clear()
+            for key, value in items:
+                el.set(key, value)
+        self._resort_words()
+
+    def _resort_words(self) -> None:
+        """Keep ``self.words`` in document (reading) order — ``flagged()``
+        and the GUI's next-word stepping rely on it."""
         order = {id(s): i
                  for i, s in enumerate(self.root.iter(qname(self.ns, "String")))}
         self.words.sort(key=lambda w: order.get(id(w.elem), 1 << 30))
-        self.dirty = True
-        return True
 
-    def move_element(self, el: etree._Element, delta: int) -> bool:
-        """Move a block/line in reading order (see ``_move_flow``). Counts
-        toward the provenance reading-order total on success."""
-        if self._move_flow(el, delta):
-            self.session_moves += 1
-            return True
-        return False
+    def _new_line(self, reserved: set[str]) -> etree._Element:
+        line = etree.Element(qname(self.ns, "TextLine"))
+        line.set("ID", self._next_id("TextLine", reserved))
+        return line
+
+    def _collect_blocks(self, el: etree._Element,
+                        into: dict[int, etree._Element]) -> None:
+        """Queue every text container above ``el`` for re-fitting."""
+        node = el.getparent()
+        while node is not None and etree.QName(node).localname in self._WORD_CONTAINERS:
+            into[id(node)] = node
+            node = node.getparent()
+
+    def _drop_if_empty(self, node: etree._Element,
+                       blocks: dict[int, etree._Element]) -> None:
+        """Remove ``node`` and each ancestor container left with no String —
+        the deletion cascade, never PrintSpace or above. The first surviving
+        container is queued for re-fitting."""
+        string_tag = qname(self.ns, "String")
+        while node is not None and etree.QName(node).localname in self._WORD_CONTAINERS:
+            parent = node.getparent()
+            if parent is None:
+                return
+            if next(node.iter(string_tag), None) is not None:
+                blocks[id(node)] = node
+                return
+            parent.remove(node)
+            node = parent
+
+    def _fit_box(self, el: etree._Element, children: list[etree._Element]) -> None:
+        """Set ``el``'s box (ALTO units) to the union of its children's."""
+        boxes = [b for b in (self._box_of(c) for c in children) if b is not None]
+        if not boxes:
+            return
+        x = min(b[0] for b in boxes)
+        y = min(b[1] for b in boxes)
+        x2 = max(b[0] + b[2] for b in boxes)
+        y2 = max(b[1] + b[3] for b in boxes)
+        for attr, val in (("HPOS", x), ("VPOS", y),
+                          ("WIDTH", x2 - x), ("HEIGHT", y2 - y)):
+            el.set(attr, str(val))
+
+    def _attached(self, el: etree._Element) -> bool:
+        return any(a is self.page for a in el.iterancestors())
+
+    @staticmethod
+    def _depth(el: etree._Element) -> int:
+        return sum(1 for _ in el.iterancestors())
 
     def settle(self) -> bool:
         """After an undo: clear ``dirty`` when the tree is byte-identical to
@@ -778,36 +1003,6 @@ class ReviewPage:
         if self.dirty and etree.tostring(self.root) == self._clean_state:
             self.dirty = False
         return self.dirty
-
-    def undo_move(self, el: etree._Element, delta: int) -> bool:
-        """Undo one ``move_element`` (GUI undo stack): apply the inverse
-        move and un-count it. ``dirty`` stays as-is, like ``revert_word`` —
-        other unsaved changes may exist; reloading is the full reset."""
-        if self._move_flow(el, -delta):
-            self.session_moves = max(0, self.session_moves - 1)
-            return True
-        return False
-
-    def box_px_of(self, el: etree._Element) -> tuple[float, float, float, float] | None:
-        """An element's box scaled to image pixels (like ``Word.box_px``);
-        None for malformed boxes. For the GUI's block/line overlays."""
-        b = self._box_of(el)
-        if b is None:
-            return None
-        h, v, w, ht = b
-        return (h * self.sx, v * self.sy, w * self.sx, ht * self.sy)
-
-    def text_preview(self, el: etree._Element, limit: int = 30) -> str:
-        """First words of an element's text content, truncated — labels the
-        GUI's reading-order panel entries."""
-        text = " ".join(
-            s.get("CONTENT", "")
-            for s in el.iter(qname(self.ns, "String"))
-            if s.get("CONTENT")
-        )
-        if not text:
-            return "(no text)"
-        return text[:limit] + "…" if len(text) > limit else text
 
     # ---------- save ------------------------------------------------------
 
@@ -925,17 +1120,39 @@ def alto_to_text(root: etree._Element) -> str:
     prefixed (external editors), and namespace-less ALTO all render alike —
     a prefixed file must never silently render as an empty transcript.
     """
-    blocks: list[str] = []
+    return transcript_spans(root)[0]
+
+
+def transcript_spans(
+    root: etree._Element,
+) -> tuple[str, list[tuple[etree._Element, int, int]]]:
+    """``alto_to_text``'s transcript plus where each word sits in it:
+    ``(String, start, end)`` character offsets, in reading order. The Review
+    tab's reading-order panel shows the transcript and maps clicks in it
+    back to words; rendering both from one function keeps the panel showing
+    exactly the text a save will write."""
+    blocks: list[list[list[etree._Element]]] = []
     for tb in root.iter("{*}TextBlock"):
-        lines: list[str] = []
+        lines = []
         for tl in tb.iter("{*}TextLine"):
-            words = [s.get("CONTENT", "") for s in tl.iter("{*}String")]
-            line = " ".join(w for w in words if w)
-            if line:
-                lines.append(line)
+            words = [s for s in tl.iter("{*}String") if s.get("CONTENT", "")]
+            if words:
+                lines.append(words)
         if lines:
-            blocks.append("\n".join(lines))
-    return "\n\n".join(blocks) + "\n" if blocks else ""
+            blocks.append(lines)
+    out: list[str] = []
+    spans: list[tuple[etree._Element, int, int]] = []
+    at = 0
+    for bi, lines in enumerate(blocks):
+        for li, words in enumerate(lines):
+            for wi, s in enumerate(words):
+                sep = " " if wi else "\n" if li else "\n\n" if bi else ""
+                content = s.get("CONTENT")
+                out.append(sep + content)
+                at += len(sep)
+                spans.append((s, at, at + len(content)))
+                at += len(content)
+    return ("".join(out) + "\n" if blocks else ""), spans
 
 
 @dataclass

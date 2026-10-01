@@ -219,7 +219,9 @@ class MainWindowTests(_AppFixture):
             yield w
             for child in w.winfo_children():
                 yield from texts(child)
-        self.assertFalse([w for w in texts(self.app.review) if isinstance(w, tk.Text)],
+        # The reading-order transcript panel is the Review tab's one Text.
+        self.assertFalse([w for w in texts(self.app.review) if isinstance(w, tk.Text)
+                          and w is not self.app.review.txt_order],
                          "the Review tab must not carry a log")
 
     def test_output_folder_button_says_browse(self) -> None:
@@ -392,6 +394,114 @@ class ReviewTabTests(ReviewFixture):
         self.rv.keyboard.select_category("Greek")
         saved = json.loads(self.settings_path.read_text(encoding="utf-8"))
         self.assertEqual(saved["review_symbols_tab"], "Greek")
+
+
+class ReadingOrderTests(ReviewFixture):
+    """Word-level reading order: select a word (Shift extends), click the
+    word it should follow; nudges, page start, undo, and the transcript
+    panel showing exactly what a save writes."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.open("p1")
+        self.rv._toggle_reorder_mode()
+        self.words = {w.content: w for w in self.rv._page.words}
+
+    def transcript(self) -> str:
+        return self.rv.txt_order.get("1.0", "end-1c")
+
+    def highlighted(self) -> list[str]:
+        ranges = self.rv.txt_order.tag_ranges("chosen")
+        return [self.rv.txt_order.get(a, b) for a, b in zip(ranges[::2], ranges[1::2])]
+
+    def test_panel_shows_the_transcript_a_save_writes(self) -> None:
+        self.assertTrue(self.rv.order_panel.winfo_manager())
+        self.assertEqual(self.transcript(), "Board cf\nTrustees\n")
+        self.assertEqual([w.content for _a, _b, w in self.rv._order_spans],
+                         ["Board", "cf", "Trustees"])
+        self.assertIn("drag a box", self.rv.var_order_hint.get())
+
+    def test_transcript_positions_map_to_words(self) -> None:
+        at = self.rv._order_word_at
+        self.assertIs(at("1.0"), self.words["Board"])
+        self.assertIs(at("1.7"), self.words["cf"])
+        self.assertIs(at("2.3"), self.words["Trustees"])
+        self.assertIsNone(at("end"))  # past the last word
+
+    def test_select_then_click_target_moves_and_undo_restores(self) -> None:
+        before = etree.tostring(self.rv._page.root)
+        self.rv._order_pick(self.words["Trustees"], shift=False)
+        self.assertEqual(self.highlighted(), ["Trustees"])
+        self.rv._order_pick(self.words["Board"], shift=False)
+        self.assertEqual(self.transcript(), "Board Trustees cf\n")
+        self.assertEqual(self.highlighted(), ["Trustees"])  # still selected
+        self.assertIn("Moved 1 word(s) after “Board”", self.rv.var_status.get())
+        self.assertEqual(str(self.rv.btn_save.cget("state")), "normal")
+        self.rv._undo_edit()
+        self.assertEqual(etree.tostring(self.rv._page.root), before)
+        self.assertEqual(self.transcript(), "Board cf\nTrustees\n")
+        self.assertEqual(str(self.rv.btn_save.cget("state")), "disabled")
+
+    def test_shift_extends_and_nudge_moves_the_run(self) -> None:
+        self.rv._order_pick(self.words["Board"], shift=False)
+        self.rv._order_pick(self.words["cf"], shift=True)
+        self.assertEqual(self.highlighted(), ["Board cf"])  # one run, space included
+        self.rv._order_nudge(+1)
+        self.assertEqual(self.transcript(), "Trustees Board cf\n")
+        self.rv._order_nudge(+1)  # already last: nothing happens, it says so
+        self.assertIn("already read there", self.rv.var_status.get())
+
+    def test_page_start_and_escape(self) -> None:
+        self.rv._order_pick(self.words["Trustees"], shift=False)
+        self.rv._order_to_start()
+        self.assertEqual(self.transcript(), "Trustees Board cf\n")
+        self.rv._on_canvas_escape()
+        self.assertEqual(self.rv._order_sel, [])
+        self.assertEqual(self.highlighted(), [])
+
+    def test_clicking_inside_the_selection_starts_over(self) -> None:
+        self.rv._order_pick(self.words["Board"], shift=False)
+        self.rv._order_pick(self.words["cf"], shift=True)
+        self.rv._order_pick(self.words["cf"], shift=False)
+        self.assertEqual(self.highlighted(), ["cf"])
+        self.assertEqual(self.transcript(), "Board cf\nTrustees\n")  # nothing moved
+
+    def test_save_writes_the_new_order_with_provenance(self) -> None:
+        self.rv._order_pick(self.words["Trustees"], shift=False)
+        self.rv._order_to_start()
+        self.rv._save_page()
+        self.assertEqual((self.obj / "Text" / "p1.txt").read_text(encoding="utf-8"),
+                         "Trustees Board cf\n")
+        body = (self.obj / "ALTO" / "p1.xml").read_text(encoding="utf-8")
+        self.assertIn("1 reading-order change(s)", body)
+
+    def test_ctrl_click_toggles_words_in_and_out(self) -> None:
+        self.rv._order_toggle(self.words["Trustees"])
+        self.rv._order_toggle(self.words["Board"])
+        # Kept in reading order, whatever order they were picked in.
+        self.assertEqual([w.content for w in self.rv._order_sel], ["Board", "Trustees"])
+        self.assertEqual(self.highlighted(), ["Board", "Trustees"])
+        self.rv._order_toggle(self.words["Board"])
+        self.assertEqual([w.content for w in self.rv._order_sel], ["Trustees"])
+
+    def test_box_selects_words_by_center_and_shift_adds(self) -> None:
+        def box(word):  # a box snug around one word, in image px
+            x, y, w, h = word.box_px
+            return (x - 1, y - 1, w + 2, h + 2)
+        self.rv._order_box_select(box(self.words["cf"]), add=False)
+        self.assertEqual([w.content for w in self.rv._order_sel], ["cf"])
+        self.rv._order_box_select(box(self.words["Trustees"]), add=True)
+        self.assertEqual([w.content for w in self.rv._order_sel], ["cf", "Trustees"])
+        self.rv._order_box_select((0, 0, 1, 1), add=False)  # empty: says so, keeps
+        self.assertIn("No words", self.rv.var_status.get())
+        self.assertEqual(len(self.rv._order_sel), 2)
+
+    def test_add_word_mode_turns_reading_order_off(self) -> None:
+        self.rv._order_pick(self.words["Board"], shift=False)
+        self.rv._toggle_add_mode()
+        self.assertFalse(self.rv.var_reorder_mode.get())
+        self.assertFalse(self.rv.order_panel.winfo_manager())
+        self.assertEqual(self.rv._order_sel, [])
 
 
 class PopOutTests(ReviewFixture):

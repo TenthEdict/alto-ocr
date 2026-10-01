@@ -5,15 +5,19 @@
  * the server's (remediate.py). This file's whole job is: show the scan with
  * its word boxes, collect what the corrector did, and post it as one batch.
  *
- * Pending corrections are kept in a Map keyed by word index, so a corrector
- * who fixes the same word twice produces one operation, not two. The server
- * rejects a batch with two operations on one word precisely because a double
- * count would overstate how many words a human changed in the ALTO's
- * provenance -- coalescing here is what keeps that honest.
+ * Pending corrections are one ordered log: a corrector who fixes the same
+ * word twice produces one operation, not two (the newer replaces the older).
+ * The server rejects a batch with two operations on one word precisely
+ * because a double count would overstate how many words a human changed in
+ * the ALTO's provenance -- coalescing here is what keeps that honest. The
+ * log is also the undo history, and it is sent in the order it was made,
+ * because reading-order moves run where they sit in the batch.
+ *
+ * The reading order the page shows is never computed here: the pending
+ * batch is posted to the server's preview endpoint, which applies it with
+ * the same code a save runs and answers with the resulting order.
  */
 'use strict';
-
-const ZOOMS = [0.1, 0.15, 0.25, 0.33, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0];
 
 const view = document.getElementById('view');
 const crumbs = document.getElementById('crumbs');
@@ -87,20 +91,6 @@ function setCrumbs(parts) {
 }
 
 const template = (id) => document.getElementById(id).content.cloneNode(true);
-
-/* Which colour class a word's box gets. Mirrors the Tk GUI's convention so
- * a corrector moving between the two reads the same page the same way. */
-function boxClass(word, pending) {
-  const op = pending.get(word.i);
-  if (op) {
-    if (op.op === 'delete') return 'gone';
-    return 'done';
-  }
-  if (word.wc === null || word.wc === undefined) return 'flag';
-  if (word.wc >= 1.0) return 'done';
-  if (word.wc < CONFIG.lowWc) return 'flag';
-  return 'good';
-}
 
 /* ------------------------------------------------------------ worklist */
 
@@ -176,6 +166,7 @@ function pageSort(pages, worstFirst) {
 
 async function renderObject(refId) {
   setCrumbs([{ label: 'Objects', href: '#/' }, { label: refId }]);
+  walk = null;   // coming back to the list re-ranks the page walk
   view.replaceChildren(template('tpl-object'));
   document.getElementById('obj-title').textContent = refId;
   const statsLine = document.getElementById('obj-stats');
@@ -241,6 +232,31 @@ async function renderObject(refId) {
 
 /* ---------------------------------------------------------------- page */
 
+/* Per-viewer preferences (threshold, All words, the symbol keyboard). Only
+ * conveniences live here; storage can be unavailable, so every access is
+ * guarded and a default always stands in. */
+const prefs = {
+  get(key, fallback) {
+    try {
+      const v = localStorage.getItem('altoReview.' + key);
+      return v === null ? fallback : JSON.parse(v);
+    } catch { return fallback; }
+  },
+  set(key, value) {
+    try { localStorage.setItem('altoReview.' + key, JSON.stringify(value)); } catch { /* private window */ }
+  },
+};
+
+/* The page walk for ◀ Page / Page ▶: the sidebar's order, frozen for one
+ * object until "Worst first" is toggled or the object list is revisited --
+ * the same rule as the Tk tab, so saving a page (which moves its PC) never
+ * reshuffles the list under the corrector. */
+let walk = null;
+
+const WORD_OPS = new Set(['edit', 'verify', 'delete']);
+const ZOOM_CHOICES = [['fit', 'Fit page'], ['width', 'Fit width'], [0.25, '25%'], [0.5, '50%'],
+                      [0.75, '75%'], [1, '100%'], [1.5, '150%'], [2, '200%'], [3, '300%']];
+
 async function renderPage(refId, stem) {
   setCrumbs([{ label: 'Objects', href: '#/' },
              { label: refId, href: `#/obj/${enc(refId)}` },
@@ -254,31 +270,95 @@ async function renderPage(refId, stem) {
   /* ---- state ---- */
   let page = null;               // server payload for the current page
   let objectPages = [];          // sidebar
-  const pending = new Map();     // word index -> {op, index, text?}
-  const adds = [];               // {op:'add', box, text}
+  // Every correction, in the order it was made: the batch a save posts. A
+  // word carries at most one edit/verify/delete (a newer one replaces the
+  // older and moves to the end, which keeps the server's one-op-per-word
+  // rule); adds and reading-order moves append. Order matters for moves,
+  // which run where they sit in the batch.
+  const log = [];
+  const undoStack = [];          // {op, prev?}: Ctrl+Z takes `op` out, puts `prev` back
   let clearPending = false;
-  let selected = null;           // word object
-  let zoom = null;               // null = fit
-  let addMode = false;
-  let draw = null;               // in-progress drag {x0,y0,x1,y1}
-  let pendingBox = null;         // committed drag awaiting text
+  let selected = null;           // word being edited
+  let zoom = 'fit';              // 'fit' | 'width' | a scale factor
+  let mode = null;               // null | 'add' | 'order'
+  let draw = null;               // add mode: drag in progress {x0,y0,x1,y1}
+  let pendingBox = null;         // add mode: drawn box awaiting its text
+  let threshold = Number(prefs.get('threshold', CONFIG.lowWc));
+  if (!(threshold >= 0 && threshold <= 1)) threshold = CONFIG.lowWc;
+  let showAll = prefs.get('showAll', true) !== false;
+  // Reading-order mode. `order` is the server's preview of the pending
+  // batch: the words in reading order with their boxes, line breaks and
+  // places in the transcript -- computed by the code that will save it.
+  let order = null;
+  let orderSel = [];             // load-time word indices, in reading order
+  let orderAnchor = null;        // where Shift+click extends from
+  let orderSeq = 0;              // discards out-of-date preview responses
+  let press = null;              // order mode: mouse press, until release says click or box
 
   const say = (msg, kind) => { status.textContent = msg || ''; status.className = 'status' + (kind ? ' ' + kind : ''); };
-  const dirty = () => pending.size > 0 || adds.length > 0 || clearPending;
+  const dirty = () => log.length > 0 || clearPending;
+  const flagged = (w) => w.wc === null || w.wc === undefined || w.wc < threshold;
+  const wordOp = (i) => log.find(o => o.index === i && WORD_OPS.has(o.op));
+  const wordText = (i) => {
+    const op = wordOp(i);
+    return op && op.op === 'edit' ? op.text : page.words[i].text;
+  };
+  const unresolved = () => page.words.filter(w => flagged(w) && !wordOp(w.i));
 
-  const opCount = () => pending.size + adds.length + (clearPending ? 1 : 0);
   const refreshPending = () => {
-    const n = opCount();
+    const n = log.length + (clearPending ? 1 : 0);
     $('pending').textContent = n ? `${n} unsaved change${n === 1 ? '' : 's'}` : '';
     $('save').disabled = !n || CONFIG.readOnly;
+    $('undo').disabled = !undoStack.length;
+  };
+
+  /* Record one correction. Returns a promise that settles once the views
+   * have caught up (the reading-order preview is a round trip), or null
+   * when the correction was refused. */
+  const record = (op) => {
+    if (clearPending && op.op !== 'add') {
+      say('The page is queued to be cleared — save that first.', 'err');
+      return null;
+    }
+    const entry = { op };
+    if (WORD_OPS.has(op.op)) {
+      entry.prev = wordOp(op.index);
+      if (entry.prev) log.splice(log.indexOf(entry.prev), 1);
+    }
+    log.push(op);
+    undoStack.push(entry);
+    return changed();
+  };
+
+  const changed = () => {
+    refreshPending();
+    drawOverlay();
+    return mode === 'order' ? refreshOrder() : Promise.resolve();
+  };
+
+  const undo = () => {
+    const entry = undoStack.pop();
+    if (!entry) { say('Nothing to undo on this page.'); return; }
+    const at = log.indexOf(entry.op);
+    if (at >= 0) log.splice(at, 1);
+    if (entry.prev) log.push(entry.prev);
+    const op = entry.op;
+    if (WORD_OPS.has(op.op)) {
+      say(`Undone: ${op.op === 'delete' ? 'deletion of' : op.op === 'verify' ? 'confirmation of' : 'correction of'} “${page.words[op.index].text}”.`);
+      if (mode === null) select(page.words[op.index]);
+    } else {
+      say(op.op === 'add' ? `Undone: added word “${op.text}”.` : 'Undone: reading-order move.');
+    }
+    changed();
   };
 
   /* ---- geometry ---- */
   const scale = () => {
     if (!page) return 1;
-    if (zoom !== null) return zoom;
-    const avail = Math.max(scroller.clientWidth - 34, 200);
-    return Math.min(avail / page.imageWidth, 1);
+    if (typeof zoom === 'number') return zoom;
+    const fitW = Math.max(scroller.clientWidth - 34, 200) / page.imageWidth;
+    if (zoom === 'width') return fitW;
+    return Math.min(fitW, Math.max(scroller.clientHeight - 34, 200) / page.imageHeight);
   };
   const applyScale = () => {
     if (!page) return;
@@ -289,7 +369,16 @@ async function renderPage(refId, stem) {
     stage.style.height = h + 'px';
     scan.width = w; scan.height = h;
     overlay.setAttribute('viewBox', `0 0 ${page.imageWidth} ${page.imageHeight}`);
-    $('zoom-label').textContent = zoom === null ? 'fit' : Math.round(zoom * 100) + '%';
+    const select = $('zoom');
+    const custom = select.querySelector('option[value="custom"]');
+    if (typeof zoom === 'number' && !ZOOM_CHOICES.some(([v]) => v === zoom)) {
+      custom.hidden = false;
+      custom.textContent = `${Math.round(zoom * 100)}%`;
+      select.value = 'custom';
+    } else {
+      custom.hidden = true;
+      select.value = String(zoom);
+    }
   };
   /* Pointer position in source-image pixels -- the frame every box and every
    * add-word box is expressed in, on both sides of the API. */
@@ -298,11 +387,12 @@ async function renderPage(refId, stem) {
     const s = rect.width / page.imageWidth;
     return { x: (event.clientX - rect.left) / s, y: (event.clientY - rect.top) / s };
   };
+  const center = (box) => [box[0] + box[2] / 2, box[1] + box[3] / 2];
 
   /* ---- overlay ---- */
   const svgEl = (tag, attrs) => {
     const node = document.createElementNS('http://www.w3.org/2000/svg', tag);
-    for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
+    for (const [k, v] of Object.entries(attrs)) if (v !== null && v !== undefined) node.setAttribute(k, v);
     return node;
   };
 
@@ -312,30 +402,43 @@ async function renderPage(refId, stem) {
     return node;
   };
 
+  /* Which colour class a word's box gets. Mirrors the Tk GUI's convention so
+   * a corrector moving between the two reads the same page the same way. */
+  const boxClass = (w) => {
+    const op = wordOp(w.i);
+    if (op) return op.op === 'delete' ? 'gone' : 'done';
+    if (flagged(w)) return 'flag';
+    if (w.wc >= 1.0) return 'done';
+    return 'good';
+  };
+
   const drawOverlay = () => {
     overlay.replaceChildren();
     if (!page) return;
+    if (mode === 'order') { drawOrder(); return; }
     if (!clearPending) {
       for (const w of page.words) {
+        const op = wordOp(w.i);
+        const isSel = selected && selected.i === w.i;
+        if (!showAll && !flagged(w) && !op && !isSel) continue;
         const [x, y, bw, bh] = w.box;
         const rect = svgEl('rect', { x, y, width: Math.max(bw, 1), height: Math.max(bh, 1) });
-        rect.setAttribute('class', 'wbox ' + boxClass(w, pending) + (selected && selected.i === w.i ? ' sel' : ''));
-        rect.addEventListener('mousedown', (ev) => { if (!addMode) ev.stopPropagation(); });
+        rect.setAttribute('class', 'wbox ' + boxClass(w) + (isSel ? ' sel' : ''));
+        rect.addEventListener('mousedown', (ev) => { if (mode !== 'add') ev.stopPropagation(); });
         rect.addEventListener('click', (ev) => {
-          if (addMode) return;
+          if (mode === 'add') return;
           ev.stopPropagation();
           select(w);
         });
-        const op = pending.get(w.i);
         const label = op && op.op === 'edit' ? `${w.text} → ${op.text}`
                     : op && op.op === 'delete' ? `${w.text} (delete)`
                     : op && op.op === 'verify' ? `${w.text} (confirmed)`
-                    : w.text;
+                    : `${w.text} · ${pct(w.wc)}`;
         rect.append(svgTitle(label));
         overlay.append(rect);
       }
     }
-    for (const a of adds) {
+    for (const a of log.filter(o => o.op === 'add')) {
       const [x, y, bw, bh] = a.box;
       const rect = svgEl('rect', { x, y, width: bw, height: bh });
       rect.setAttribute('class', 'wbox added');
@@ -355,13 +458,54 @@ async function renderPage(refId, stem) {
     }
   };
 
+  /* Reading-order view: every word outlined, the selection heavy, and the
+   * reading path -- a thin line from word to word along each line and an
+   * arrow from the end of one line to the start of the next -- so a page
+   * read in the wrong order shows at a glance. */
+  const drawOrder = () => {
+    if (!order) return;
+    const size = Math.max(page.imageWidth / 130, 8);
+    const marker = svgEl('marker', {
+      id: 'order-arrow', viewBox: '0 0 10 10', refX: 10, refY: 5, orient: 'auto',
+      markerUnits: 'userSpaceOnUse', markerWidth: size, markerHeight: size,
+    });
+    marker.append(svgEl('path', { d: 'M0,0 L10,5 L0,10 z', class: 'oarrow' }));
+    const defs = svgEl('defs', {});
+    defs.append(marker);
+    overlay.append(defs);
+    const placed = order.order.filter(o => o.box);
+    let prev = null;
+    for (const o of placed) {
+      const [x2, y2] = center(o.box);
+      if (prev) {
+        const [x1, y1] = center(prev.box);
+        const brk = prev.line !== o.line;
+        overlay.append(svgEl('line', {
+          x1, y1, x2, y2, class: 'opath' + (brk ? ' brk' : ''),
+          'marker-end': brk ? 'url(#order-arrow)' : null,
+        }));
+      }
+      prev = o;
+    }
+    const chosen = new Set(orderSel);
+    for (const o of placed) {
+      const [x, y, bw, bh] = o.box;
+      const cls = o.i === null ? ' added' : chosen.has(o.i) ? ' chosen' : '';
+      overlay.append(svgEl('rect', {
+        x, y, width: Math.max(bw, 1), height: Math.max(bh, 1), class: 'obox' + cls,
+      }));
+    }
+    if (press && press.dragging) {
+      overlay.append(svgEl('rect', {
+        class: 'drawbox',
+        x: Math.min(press.x0, press.x1), y: Math.min(press.y0, press.y1),
+        width: Math.abs(press.x1 - press.x0), height: Math.abs(press.y1 - press.y0),
+      }));
+    }
+  };
+
   /* ---- editor ---- */
   const editor = $('editor'), edText = $('ed-text');
-
-  const effectiveText = (w) => {
-    const op = pending.get(w.i);
-    return op && op.op === 'edit' ? op.text : w.text;
-  };
 
   const select = (w) => {
     selected = w;
@@ -370,41 +514,32 @@ async function renderPage(refId, stem) {
     editor.hidden = false;
     const wc = w.wc;
     const badge = $('ed-wc');
-    badge.textContent = wc === null || wc === undefined ? 'no WC' : `WC ${pct(wc)}`;
-    badge.className = 'badge' + ((wc === null || wc === undefined || wc < CONFIG.lowWc) ? ' low' : '');
-    const flagged = page.flagged.filter(i => !pending.has(i));
-    $('ed-pos').textContent = `word ${w.i + 1} of ${page.words.length} · ${flagged.length} flagged left`;
-    edText.value = effectiveText(w);
+    badge.textContent = wc === null || wc === undefined ? 'unscored' : `confidence ${pct(wc)}`;
+    badge.className = 'badge' + (flagged(w) ? ' low' : '');
+    $('ed-pos').textContent = `word ${w.i + 1} of ${page.words.length} · ${unresolved().length} flagged left`;
+    edText.value = wordText(w.i);
     const [x, y, bw, bh] = w.box;
     $('snippet').src = `${pageUrl(refId, stem)}/crop?x=${x}&y=${y}&w=${bw}&h=${bh}&zoom=2.5`;
     drawOverlay();
-    scrollWordIntoView(w);
+    scrollToBox(w.box);
     edText.focus();
     edText.select();
   };
 
-  const scrollWordIntoView = (w) => {
+  const scrollToBox = (box) => {
     const s = scale();
-    const cx = (w.box[0] + w.box[2] / 2) * s;
-    const cy = (w.box[1] + w.box[3] / 2) * s;
+    const cx = (box[0] + box[2] / 2) * s;
+    const cy = (box[1] + box[3] / 2) * s;
     const stageRect = stage.getBoundingClientRect();
     const scrRect = scroller.getBoundingClientRect();
     const offsetX = stageRect.left - scrRect.left + scroller.scrollLeft;
     const offsetY = stageRect.top - scrRect.top + scroller.scrollTop;
-    const targetX = offsetX + cx - scroller.clientWidth / 2;
-    const targetY = offsetY + cy - scroller.clientHeight / 2;
     if (cx + offsetX < scroller.scrollLeft || cx + offsetX > scroller.scrollLeft + scroller.clientWidth
         || cy + offsetY < scroller.scrollTop || cy + offsetY > scroller.scrollTop + scroller.clientHeight) {
-      scroller.scrollTo({ left: Math.max(0, targetX), top: Math.max(0, targetY), behavior: 'smooth' });
+      scroller.scrollTo({ left: Math.max(0, offsetX + cx - scroller.clientWidth / 2),
+                          top: Math.max(0, offsetY + cy - scroller.clientHeight / 2),
+                          behavior: 'smooth' });
     }
-  };
-
-  /* Queue one word operation, coalescing on the word index. */
-  const queue = (op) => {
-    if (clearPending) { say('The page is queued to be cleared — save that first.', 'err'); return; }
-    pending.set(op.index, op);
-    refreshPending();
-    drawOverlay();
   };
 
   /* Next/previous *unresolved* flagged word after the one in hand, by
@@ -413,50 +548,53 @@ async function renderPage(refId, stem) {
    * flagged set immediately, so "where am I" cannot be answered by looking
    * the current word up in the list. */
   const step = (delta) => {
-    if (!page || !page.words.length) return;
-    const pool = page.words.filter(w => w.flagged && !pending.has(w.i));
-    if (!pool.length) { say('No flagged words left on this page.', 'ok'); return; }
+    if (!page || !page.words.length || mode === 'order') return;
+    const pool = unresolved();
+    if (!pool.length) { select(null); say('No flagged words left on this page. Save, then go to the next page.', 'ok'); return; }
     const here = selected ? selected.i : (delta > 0 ? -1 : page.words.length);
     const later = pool.filter(w => w.i > here);
     const earlier = pool.filter(w => w.i < here);
-    let next;
-    if (delta > 0) next = later.length ? later[0] : pool[0];
-    else next = earlier.length ? earlier[earlier.length - 1] : pool[pool.length - 1];
-    const wrapped = delta > 0 ? !later.length : !earlier.length;
+    const next = delta > 0 ? (later.length ? later[0] : pool[0])
+                           : (earlier.length ? earlier[earlier.length - 1] : pool[pool.length - 1]);
+    const wrapped = selected && (delta > 0 ? !later.length : !earlier.length);
     select(next);
-    if (wrapped) say('Wrapped around to the ' + (delta > 0 ? 'first' : 'last') + ' flagged word.');
+    if (wrapped) say(`Wrapped to the ${delta > 0 ? 'top' : 'bottom'} of the page — ${pool.length} flagged word(s) still unreviewed.`);
   };
 
   const commitEdit = (advance) => {
     if (!selected) return;
     const text = edText.value.trim();
-    if (!text) { say('Empty text. Use Delete to remove a hallucinated word.', 'err'); return; }
+    if (!text) { deleteSelected(); return; }
     if (text === selected.text) {
       // Unchanged text means "the OCR was right, the confidence was just
       // low" -- the same claim as an edit, recorded as a confirmation so
       // the count of words a human actually *changed* stays honest.
-      queue({ op: 'verify', index: selected.i });
+      if (!record({ op: 'verify', index: selected.i })) return;
       say(`Confirmed “${text}”.`);
     } else {
-      queue({ op: 'edit', index: selected.i, text });
+      if (!record({ op: 'edit', index: selected.i, text })) return;
       say(`Queued “${selected.text}” → “${text}”.`);
     }
     if (advance) step(1); else select(selected);
   };
 
+  /* Deleting happens at once, without an "are you sure?" -- Ctrl+Z puts
+   * the word back. */
+  const deleteSelected = () => {
+    if (!selected) return;
+    const w = selected;
+    if (!record({ op: 'delete', index: w.i })) return;
+    step(1);
+    say(`Deleted “${w.text}” (Ctrl+Z puts it back).`);
+  };
+
   $('ed-commit').addEventListener('click', () => commitEdit(true));
   $('ed-confirm').addEventListener('click', () => {
     if (!selected) return;
-    queue({ op: 'verify', index: selected.i });
-    say(`Confirmed “${selected.text}”.`);
-    step(1);
+    edText.value = selected.text;
+    commitEdit(true);
   });
-  $('ed-delete').addEventListener('click', () => {
-    if (!selected) return;
-    queue({ op: 'delete', index: selected.i });
-    say(`Queued deletion of “${selected.text}”.`);
-    step(1);
-  });
+  $('ed-delete').addEventListener('click', deleteSelected);
   $('ed-cancel').addEventListener('click', () => select(null));
   edText.addEventListener('keydown', (ev) => {
     if (ev.key === 'Enter') { ev.preventDefault(); commitEdit(true); }
@@ -492,46 +630,265 @@ async function renderPage(refId, stem) {
       })))));
   };
   paintSymbols();
+  const symbolsOn = $('symbols-on');
+  symbolsOn.checked = prefs.get('symbols', true) !== false;
+  $('symbols').hidden = !symbolsOn.checked;
+  symbolsOn.addEventListener('change', () => {
+    $('symbols').hidden = !symbolsOn.checked;
+    prefs.set('symbols', symbolsOn.checked);
+  });
+
+  /* ---- modes: add word / reading order (one at a time) ---- */
+  const setMode = (next) => {
+    if (mode === next) next = null;
+    mode = next;
+    $('add-mode').setAttribute('aria-pressed', String(mode === 'add'));
+    $('order-mode').setAttribute('aria-pressed', String(mode === 'order'));
+    stage.classList.toggle('adding', mode === 'add');
+    stage.classList.toggle('ordering', mode === 'order');
+    $('order-panel').hidden = mode !== 'order';
+    pendingBox = null; draw = null; press = null;
+    $('addbar').hidden = true;
+    selected = null;
+    editor.hidden = true;
+    orderSel = []; orderAnchor = null; order = null;
+    if (mode === 'add') say('Drag a box around the word the OCR missed.');
+    if (mode === 'order') { paintOrderPanel(); refreshOrder(); }
+    applyScale();   // the reading-order panel takes width from the scan
+    drawOverlay();
+  };
+  $('add-mode').addEventListener('click', () => setMode('add'));
+  $('order-mode').addEventListener('click', () => setMode('order'));
 
   /* ---- add-word mode ---- */
-  const setAddMode = (on) => {
-    addMode = on;
-    $('add-mode').setAttribute('aria-pressed', String(on));
-    stage.classList.toggle('adding', on);
-    if (!on) { pendingBox = null; draw = null; $('addbar').hidden = true; drawOverlay(); }
-    else { select(null); say('Drag a box around the word the OCR missed.'); }
-  };
-  $('add-mode').addEventListener('click', () => setAddMode(!addMode));
   $('add-cancel').addEventListener('click', () => { pendingBox = null; $('addbar').hidden = true; drawOverlay(); });
   $('add-commit').addEventListener('click', () => {
     const text = $('add-text').value.trim();
     if (!pendingBox) { say('Draw the box first.', 'err'); return; }
     if (!text) { say('Type the word to add.', 'err'); return; }
-    adds.push({ op: 'add', box: pendingBox, text });
-    say(`Queued new word “${text}”.`);
+    const box = pendingBox;
     pendingBox = null;
     $('add-text').value = '';
     $('addbar').hidden = true;
-    refreshPending();
-    drawOverlay();
+    record({ op: 'add', box, text });
+    say(`Queued new word “${text}”.`);
   });
   $('add-text').addEventListener('keydown', (ev) => {
     if (ev.key === 'Enter') { ev.preventDefault(); $('add-commit').click(); }
   });
 
+  /* ---- reading-order mode ---- */
+  const batch = () => (clearPending
+    ? [{ op: 'clear' }, ...log.filter(o => o.op === 'add')]
+    : [...log]);
+
+  const refreshOrder = async () => {
+    const seq = ++orderSeq;
+    try {
+      const res = await postJSON(`${pageUrl(refId, stem)}/preview`, { ops: batch() });
+      if (seq !== orderSeq || mode !== 'order') return;
+      // A move that changed nothing (the words were already read there, or
+      // already first or last) is dropped, so it neither counts as a change
+      // nor waits on the undo stack doing nothing.
+      if (!clearPending && res.report.noops.length) {
+        const dead = new Set(res.report.noops.map(k => log[k]));
+        for (let k = log.length - 1; k >= 0; k--) if (dead.has(log[k])) log.splice(k, 1);
+        for (let k = undoStack.length - 1; k >= 0; k--) if (dead.has(undoStack[k].op)) undoStack.splice(k, 1);
+        say('Nothing to move — the words are already read there.');
+        refreshPending();
+      }
+      order = res;
+      const present = new Set(order.order.map(o => o.i));
+      orderSel = orderSel.filter(i => present.has(i));
+      if (!present.has(orderAnchor)) orderAnchor = orderSel[0] ?? null;
+      paintOrderPanel();
+      drawOverlay();
+    } catch (e) {
+      if (seq === orderSeq) say(`Could not show the reading order: ${e.message}`, 'err');
+    }
+  };
+
+  const paintOrderPanel = () => {
+    const n = orderSel.length;
+    $('order-hint').textContent = n
+      ? `${n} word(s) selected. Now click the word they should come after — on the scan or in the transcript. “Page start” puts them first; Ctrl+↑/Ctrl+↓ nudge them one word; Esc clears; Ctrl+Z undoes a move.`
+      : 'Select the words that are out of place: click one (on the scan or in the transcript below), Shift+click to extend to a run, Ctrl+click to add or drop a word, or drag a box around a whole column or caption on the scan.';
+    for (const id of ['order-earlier', 'order-later', 'order-start', 'order-clear']) $(id).disabled = !n;
+    const box = $('order-text');
+    if (!order) { box.textContent = 'Loading…'; return; }
+    const text = order.transcript;
+    if (!text) { box.textContent = '(no words on this page)'; return; }
+    box.replaceChildren();
+    const chosen = new Set(orderSel);
+    let at = 0, prevChosen = false, first = null;
+    for (const o of order.order) {
+      const isChosen = o.i !== null && chosen.has(o.i);
+      const gap = text.slice(at, o.start);
+      // The space between two selected words is part of the selection.
+      if (gap) box.append(prevChosen && isChosen && !gap.includes('\n')
+        ? el('span', { class: 'chosen', text: gap }) : document.createTextNode(gap));
+      const span = el('span', {
+        class: 'tw' + (isChosen ? ' chosen' : '') + (o.i === null ? ' added' : ''),
+        text: text.slice(o.start, o.end),
+        'data-i': o.i === null ? null : String(o.i),
+      });
+      box.append(span);
+      if (isChosen && !first) first = span;
+      at = o.end;
+      prevChosen = isChosen;
+    }
+    box.append(document.createTextNode(text.slice(at)));
+    if (first) first.scrollIntoView({ block: 'nearest' });
+  };
+
+  const orderPos = () => {
+    const pos = new Map();
+    order.order.forEach((o, k) => { if (o.i !== null) pos.set(o.i, k); });
+    return pos;
+  };
+  const setOrderSel = (indices, anchor) => {
+    const pos = orderPos();
+    orderSel = [...new Set(indices)].filter(i => pos.has(i)).sort((a, b) => pos.get(a) - pos.get(b));
+    orderAnchor = anchor;
+    paintOrderPanel();
+    drawOverlay();
+  };
+
+  /* One click in reading-order mode, on the scan or in the transcript.
+   * Nothing selected: the word becomes the selection. Shift: the selection
+   * becomes every word from the first one picked to this one. A selection
+   * and a plain click elsewhere: the selection moves to read right after
+   * the clicked word. A plain click inside the selection starts over. */
+  const orderPick = (i, shift) => {
+    if (!order) return;
+    if (i === null || i === undefined) {
+      if (!shift && orderSel.length) setOrderSel([], null);
+      return;
+    }
+    if (shift && orderAnchor !== null) {
+      const pos = orderPos();
+      const a = pos.get(orderAnchor), b = pos.get(i);
+      if (a !== undefined && b !== undefined) {
+        const [lo, hi] = a < b ? [a, b] : [b, a];
+        setOrderSel(order.order.slice(lo, hi + 1).map(o => o.i).filter(v => v !== null), orderAnchor);
+        return;
+      }
+    }
+    if (!orderSel.length || shift || orderSel.includes(i)) { setOrderSel([i], i); return; }
+    moveSelection({ op: 'move', indices: [...orderSel], after: i }, `after “${wordText(i)}”`);
+  };
+
+  const orderToggle = (i) => {
+    if (i === null || i === undefined || !order) return;
+    if (orderSel.includes(i)) {
+      const rest = orderSel.filter(v => v !== i);
+      setOrderSel(rest, orderAnchor === i ? (rest[0] ?? null) : orderAnchor);
+    } else {
+      setOrderSel([...orderSel, i], i);
+    }
+  };
+
+  /* Select the words whose centres fall inside a box: a column or a caption
+   * in one drag, where the OCR's lines interleave it with the text beside
+   * it. With Shift or Ctrl held the box adds to the selection. */
+  const orderBoxSelect = (box, add) => {
+    const [x, y, bw, bh] = box;
+    let hits = order.order.filter(o => o.i !== null && o.box).filter(o => {
+      const [cx, cy] = center(o.box);
+      return cx >= x && cx <= x + bw && cy >= y && cy <= y + bh;
+    }).map(o => o.i);
+    if (!hits.length) { say('No words inside that box.'); return; }
+    const anchor = add && orderAnchor !== null ? orderAnchor : hits[0];
+    if (add) hits = [...orderSel, ...hits];
+    setOrderSel(hits, anchor);
+  };
+
+  const orderEntryAt = (x, y) => {
+    let best = null;
+    for (const o of order.order) {
+      if (o.i === null || !o.box) continue;
+      const [bx, by, bw, bh] = o.box;
+      if (x >= bx && x <= bx + bw && y >= by && y <= by + bh
+          && (!best || bw * bh < best.box[2] * best.box[3])) best = o;
+    }
+    return best;
+  };
+
+  const moveSelection = async (op, where) => {
+    if (!orderSel.length) return;
+    const n = orderSel.length;
+    const done = record(op);
+    if (!done) return;
+    await done;
+    if (log.includes(op)) say(`Moved ${n} word(s) ${where}. Ctrl+Z undoes.`);
+  };
+  const nudge = (delta) => {
+    if (mode === 'order' && orderSel.length) {
+      moveSelection({ op: 'nudge', indices: [...orderSel], delta },
+                    delta < 0 ? 'one word earlier' : 'one word later');
+    }
+  };
+  $('order-earlier').addEventListener('click', () => nudge(-1));
+  $('order-later').addEventListener('click', () => nudge(1));
+  $('order-start').addEventListener('click', () => {
+    moveSelection({ op: 'move', indices: [...orderSel], after: null }, 'to the start of the page');
+  });
+  $('order-clear').addEventListener('click', () => setOrderSel([], null));
+  const orderText = $('order-text');
+  orderText.addEventListener('mousedown', (ev) => ev.preventDefault());  // no text selection
+  orderText.addEventListener('click', (ev) => {
+    const span = ev.target.closest('.tw');
+    const i = span && span.dataset.i !== undefined ? Number(span.dataset.i) : null;
+    if (ev.ctrlKey || ev.metaKey) orderToggle(i);
+    else orderPick(i, ev.shiftKey);
+  });
+
+  /* ---- mouse on the scan: add-word drags, reading-order clicks and boxes ---- */
   stage.addEventListener('mousedown', (ev) => {
-    if (!addMode || !page || ev.button !== 0) return;
+    if (!page || ev.button !== 0) return;
+    if (mode === 'order') {
+      if (!order) return;
+      ev.preventDefault();
+      const p = toImage(ev);
+      press = { x0: p.x, y0: p.y, x1: p.x, y1: p.y, cx: ev.clientX, cy: ev.clientY,
+                mods: ev.shiftKey ? 'shift' : (ev.ctrlKey || ev.metaKey) ? 'ctrl' : '',
+                dragging: false };
+      return;
+    }
+    if (mode !== 'add') return;
     ev.preventDefault();
     const p = toImage(ev);
     draw = { x0: p.x, y0: p.y, x1: p.x, y1: p.y };
   });
-  window.addEventListener('mousemove', (ev) => {
+  const onMove = (ev) => {
+    if (press) {
+      const p = toImage(ev);
+      press.x1 = p.x; press.y1 = p.y;
+      // A few pixels of wobble is still a click.
+      if (!press.dragging && Math.hypot(ev.clientX - press.cx, ev.clientY - press.cy) > 5) press.dragging = true;
+      if (press.dragging) drawOverlay();
+      return;
+    }
     if (!draw) return;
     const p = toImage(ev);
     draw.x1 = p.x; draw.y1 = p.y;
     drawOverlay();
-  });
-  window.addEventListener('mouseup', () => {
+  };
+  const onUp = () => {
+    if (press) {
+      const p = press;
+      press = null;
+      if (p.dragging) {
+        orderBoxSelect([Math.min(p.x0, p.x1), Math.min(p.y0, p.y1),
+                        Math.abs(p.x1 - p.x0), Math.abs(p.y1 - p.y0)], p.mods !== '');
+        drawOverlay();
+      } else {
+        const hit = orderEntryAt(p.x0, p.y0);
+        if (p.mods === 'ctrl') orderToggle(hit && hit.i);
+        else orderPick(hit ? hit.i : null, p.mods === 'shift');
+      }
+      return;
+    }
     if (!draw) return;
     const box = [Math.min(draw.x0, draw.x1), Math.min(draw.y0, draw.y1),
                  Math.abs(draw.x1 - draw.x0), Math.abs(draw.y1 - draw.y0)];
@@ -542,7 +899,9 @@ async function renderPage(refId, stem) {
     $('addbar').hidden = false;
     $('add-text').focus();
     drawOverlay();
-  });
+  };
+  window.addEventListener('mousemove', onMove);
+  window.addEventListener('mouseup', onUp);
 
   /* ---- clear page ---- */
   $('clear-page').addEventListener('click', () => {
@@ -550,52 +909,105 @@ async function renderPage(refId, stem) {
       clearPending = false;
       say('Clear cancelled.');
     } else {
-      if (pending.size) { say('Save or discard the queued word corrections first — clear cannot be combined with them.', 'err'); return; }
+      if (log.some(o => o.op !== 'add')) { say('Save or undo the queued corrections first — clear cannot be combined with them.', 'err'); return; }
       if (!confirm(`Remove every word on ${stem}?\n\nFor pages whose OCR is wholly hallucinated — covers, photographs, blank pages where texture read as text. The page skeleton stays, so you can add back any words that were real.`)) return;
       clearPending = true;
-      select(null);
+      selected = null;
+      editor.hidden = true;
       say(`${page.words.length} word(s) queued for removal. Save to apply.`, 'err');
     }
     $('clear-page').setAttribute('aria-pressed', String(clearPending));
-    refreshPending();
-    drawOverlay();
+    changed();
   });
 
   /* ---- zoom ---- */
+  const zoomSelect = $('zoom');
+  zoomSelect.replaceChildren(
+    ...ZOOM_CHOICES.map(([v, label]) => el('option', { value: String(v), text: label })),
+    el('option', { value: 'custom', hidden: true }));
   const setZoom = (z) => { zoom = z; applyScale(); drawOverlay(); };
+  zoomSelect.addEventListener('change', () => {
+    const v = zoomSelect.value;
+    if (v === 'custom') return;
+    setZoom(v === 'fit' || v === 'width' ? v : Number(v));
+  });
+  const ZOOM_STEPS = [0.1, 0.15, 0.25, 0.33, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0];
   $('zoom-in').addEventListener('click', () => {
     const cur = scale();
-    setZoom(ZOOMS.find(z => z > cur + 0.001) ?? ZOOMS[ZOOMS.length - 1]);
+    setZoom(ZOOM_STEPS.find(z => z > cur + 0.001) ?? ZOOM_STEPS[ZOOM_STEPS.length - 1]);
   });
   $('zoom-out').addEventListener('click', () => {
     const cur = scale();
-    setZoom([...ZOOMS].reverse().find(z => z < cur - 0.001) ?? ZOOMS[0]);
+    setZoom([...ZOOM_STEPS].reverse().find(z => z < cur - 0.001) ?? ZOOM_STEPS[0]);
   });
-  $('zoom-fit').addEventListener('click', () => setZoom(null));
-  window.addEventListener('resize', () => { if (zoom === null) { applyScale(); drawOverlay(); } });
+  // Ctrl+scroll zooms about the pointer, ~20% a notch: the point under the
+  // cursor stays under it. Plain and Shift+scroll keep panning.
+  scroller.addEventListener('wheel', (ev) => {
+    if (!(ev.ctrlKey || ev.metaKey) || !page) return;
+    ev.preventDefault();
+    const before = scan.getBoundingClientRect();
+    const s0 = before.width / page.imageWidth;   // the scale on screen now
+    const ix = (ev.clientX - before.left) / s0, iy = (ev.clientY - before.top) / s0;
+    const s1 = Math.min(4, Math.max(0.05, s0 * (ev.deltaY < 0 ? 1.2 : 1 / 1.2)));
+    if (Math.abs(s1 - s0) < 1e-4) return;
+    setZoom(s1);
+    const after = scan.getBoundingClientRect();
+    scroller.scrollLeft += after.left + ix * s1 - ev.clientX;
+    scroller.scrollTop += after.top + iy * s1 - ev.clientY;
+  }, { passive: false });
+  // The fit zooms follow the scan area itself, not just the window: the
+  // editor bar and the reading-order panel take room from it too.
+  const onResize = () => { if (page && typeof zoom !== 'number') applyScale(); };
+  const resizeWatch = new ResizeObserver(onResize);
+  resizeWatch.observe(scroller);
+
+  /* ---- what to flag, what to show ---- */
+  const thresholdSelect = $('threshold');
+  const choices = Array.from({ length: 21 }, (_, k) => k * 5);
+  const current = Math.round(threshold * 100);
+  if (!choices.includes(current)) {
+    choices.push(current);
+    choices.sort((a, b) => a - b);
+  }
+  thresholdSelect.replaceChildren(...choices.map(p => el('option', { value: String(p), text: `${p}%` })));
+  thresholdSelect.value = String(current);
+  thresholdSelect.addEventListener('change', () => {
+    threshold = Number(thresholdSelect.value) / 100;
+    prefs.set('threshold', threshold);
+    drawOverlay();
+    if (selected) select(selected);
+    say(`${unresolved().length} word(s) flagged below ${pct(threshold)}.`);
+  });
+  const showAllBox = $('show-all');
+  showAllBox.checked = showAll;
+  showAllBox.addEventListener('change', () => {
+    showAll = showAllBox.checked;
+    prefs.set('showAll', showAll);
+    drawOverlay();
+  });
 
   /* ---- save ---- */
   const save = async (force) => {
     if (!dirty()) { say('Nothing to save.'); return; }
-    const batch = clearPending
-      ? [{ op: 'clear' }, ...adds]
-      : [...pending.values(), ...adds];
+    if (CONFIG.readOnly) { say('Read-only server: corrections cannot be saved.', 'err'); return; }
     $('save').disabled = true;
     say('Saving…');
     try {
-      const res = await postJSON(pageUrl(refId, stem), { token: page.token, ops: batch, force: !!force });
-      pending.clear(); adds.length = 0; clearPending = false;
+      const res = await postJSON(pageUrl(refId, stem), { token: page.token, ops: batch(), force: !!force });
+      log.length = 0; undoStack.length = 0; clearPending = false;
       $('clear-page').setAttribute('aria-pressed', 'false');
       selected = null;
       editor.hidden = true;
+      // Word indices are positions in the saved page now: the old ones
+      // (and a reading-order selection made of them) are spent.
+      orderSel = []; orderAnchor = null;
       page = res.page || page;
-      if (res.page) { applyScale(); }
-      drawOverlay();
-      refreshPending();
+      applyScale();
+      await changed();
       say(res.report.summary + (res.txt ? ' Transcript regenerated.' : ''), 'ok');
       loadSidebar();          // PC and reviewed-state have moved
     } catch (e) {
-      $('save').disabled = false;
+      refreshPending();
       if (e.status === 409) {
         say(e.message, 'err');
         if (confirm(e.message + '\n\nOverwrite the newer version with your corrections?')) {
@@ -608,33 +1020,81 @@ async function renderPage(refId, stem) {
     }
   };
   $('save').addEventListener('click', () => save(false));
+  $('undo').addEventListener('click', undo);
   $('prev-flag').addEventListener('click', () => step(-1));
   $('next-flag').addEventListener('click', () => step(1));
 
+  /* ---- pages ---- */
+  const gotoPage = (delta) => {
+    const stems = walk && walk.refId === refId ? walk.stems : objectPages.map(p => p.stem);
+    const k = stems.indexOf(stem);
+    const next = stems[k + delta];
+    if (k < 0 || next === undefined) {
+      say(delta > 0 ? 'This is the last page in the list.' : 'This is the first page in the list.');
+      return;
+    }
+    if (dirty() && !confirm('You have unsaved corrections on this page. Leave anyway?')) return;
+    location.hash = `#/obj/${enc(refId)}/${enc(next)}`;
+  };
+  $('page-prev').addEventListener('click', () => gotoPage(-1));
+  $('page-next').addEventListener('click', () => gotoPage(1));
+
   /* ---- keyboard ---- */
   const onKey = (ev) => {
-    if (ev.key === 's' && (ev.ctrlKey || ev.metaKey)) { ev.preventDefault(); save(false); return; }
-    const typing = ev.target instanceof HTMLInputElement || ev.target instanceof HTMLTextAreaElement;
+    const mod = ev.ctrlKey || ev.metaKey;
+    if (mod && ev.key === 's') { ev.preventDefault(); save(false); return; }
+    // Browsers keep Ctrl+Page Up/Down for their own tabs; Alt takes the
+    // Tk tab's page-walk shortcut instead.
+    if (ev.altKey && (ev.key === 'PageUp' || ev.key === 'PageDown')) {
+      ev.preventDefault();
+      gotoPage(ev.key === 'PageUp' ? -1 : 1);
+      return;
+    }
+    const target = ev.target;
+    const typing = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement
+                || target instanceof HTMLSelectElement;
+    // Ctrl+Z undoes the last correction -- except while the corrector has
+    // typed into the word box, where it undoes their typing.
+    const untouchedEditor = target === edText && selected && edText.value === wordText(selected.i);
+    if (mod && ev.key.toLowerCase() === 'z' && !ev.shiftKey && (!typing || untouchedEditor)) {
+      ev.preventDefault();
+      undo();
+      return;
+    }
     if (typing) return;
+    if (mode === 'order' && mod && (ev.key === 'ArrowUp' || ev.key === 'ArrowDown')) {
+      ev.preventDefault();
+      nudge(ev.key === 'ArrowUp' ? -1 : 1);
+      return;
+    }
+    if (mod || ev.altKey) return;
     if (ev.key === 'n') { ev.preventDefault(); step(1); }
     else if (ev.key === 'p') { ev.preventDefault(); step(-1); }
-    else if (ev.key === 'a') { ev.preventDefault(); setAddMode(!addMode); }
-    else if (ev.key === 'Escape') { select(null); if (addMode) setAddMode(false); }
+    else if (ev.key === 'a') { ev.preventDefault(); setMode('add'); }
+    else if (ev.key === 'r') { ev.preventDefault(); setMode('order'); }
+    else if (ev.key === 'Escape') {
+      if (mode === 'order' && orderSel.length) setOrderSel([], null);
+      else if (mode === 'add') setMode(null);
+      else select(null);
+    }
   };
   document.addEventListener('keydown', onKey);
-  // Hash navigation replaces #view wholesale; drop the listener with it so
-  // handlers for a page nobody is looking at do not accumulate.
+  const onLeave = (ev) => { if (dirty()) { ev.preventDefault(); ev.returnValue = ''; } };
+  window.addEventListener('beforeunload', onLeave);
+  // Hash navigation replaces #view wholesale; drop the window-level
+  // listeners with it so handlers for a page nobody is looking at do not
+  // accumulate.
   const observer = new MutationObserver(() => {
     if (!document.body.contains(status)) {
       document.removeEventListener('keydown', onKey);
       window.removeEventListener('beforeunload', onLeave);
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      resizeWatch.disconnect();
       observer.disconnect();
     }
   });
   observer.observe(view, { childList: true });
-
-  const onLeave = (ev) => { if (dirty()) { ev.preventDefault(); ev.returnValue = ''; } };
-  window.addEventListener('beforeunload', onLeave);
 
   /* ---- sidebar ---- */
   const loadSidebar = async () => {
@@ -642,12 +1102,19 @@ async function renderPage(refId, stem) {
       const data = await api(objUrl(refId));
       objectPages = data.pages;
     } catch { return; }
-    const list = $('side-pages');
     const worst = $('side-worst').checked;
-    list.replaceChildren(...pageSort(objectPages, worst).map(p => el('li', {
+    if (!walk || walk.refId !== refId || walk.worst !== worst) {
+      walk = { refId, worst, stems: pageSort(objectPages, worst).map(p => p.stem) };
+    }
+    const byStem = new Map(objectPages.map(p => [p.stem, p]));
+    const listed = [...walk.stems.filter(s => byStem.has(s)),
+                    ...objectPages.map(p => p.stem).filter(s => !walk.stems.includes(s))];
+    walk.stems = listed;
+    $('side-pages').replaceChildren(...listed.map(s => byStem.get(s)).map(p => el('li', {
       'aria-current': p.stem === stem ? 'true' : null,
       title: `${p.status}${p.pc === null ? '' : ` · PC ${pct(p.pc)}`}${p.reviewed ? ' · reviewed' : ''}`,
       onclick: () => {
+        if (p.stem === stem) return;
         if (dirty() && !confirm('You have unsaved corrections on this page. Leave anyway?')) return;
         location.hash = `#/obj/${enc(refId)}/${enc(p.stem)}`;
       },
@@ -656,13 +1123,17 @@ async function renderPage(refId, stem) {
       el('span', { class: 'mono', text: p.stem }),
       el('span', { class: 'pc', text: p.pc === null ? p.status : pct(p.pc) }),
     )));
+    const current = $('side-pages').querySelector('[aria-current="true"]');
+    if (current) current.scrollIntoView({ block: 'nearest' });
   };
   $('side-ref').textContent = refId;
-  $('side-worst').addEventListener('change', loadSidebar);
+  if (walk && walk.refId === refId) $('side-worst').checked = walk.worst;
+  $('side-worst').addEventListener('change', () => { walk = null; loadSidebar(); });
 
   /* ---- go ---- */
   say('Loading page…');
   loadSidebar();
+  refreshPending();
   try {
     page = await api(pageUrl(refId, stem));
   } catch (e) {
@@ -676,9 +1147,9 @@ async function renderPage(refId, stem) {
   applyScale();
   drawOverlay();
   refreshPending();
-  const flaggedCount = page.flagged.length;
-  say(`${page.words.length} word(s), ${flaggedCount} flagged below ${pct(CONFIG.lowWc)}`
-      + (page.pc ? ` · page PC ${pct(page.pc)}` : '')
+  const flaggedCount = unresolved().length;
+  say(`${page.words.length} word(s), ${flaggedCount} flagged below ${pct(threshold)}`
+      + (page.pc ? ` · page confidence ${pct(page.pc)}` : '')
       + '. Click a word, or press n for the next flagged one.');
   if (flaggedCount) step(1);
 }

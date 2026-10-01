@@ -15,6 +15,14 @@ chosen, not incidental:
   tree, and nothing reaches disk until every one of them has succeeded. A
   batch that fails half way leaves the file on disk exactly as it was.
 
+**Reading-order moves** (``move``: put words after another word or first
+on the page; ``nudge``: one word earlier/later) ride in the same batch and
+run in batch order, so the client sends its log chronologically. The
+preview path applies a batch to a throwaway load and reports the resulting
+reading order and transcript without writing anything (``order_payload``):
+the browser shows the order ``remediate.move_words`` actually produces
+rather than re-implementing it.
+
 Words are addressed by their **index in document order at load time**
 (``ReviewPage.words``), which is stable for the life of one loaded page and
 needs no IDs -- ALTO from an external editor cannot be relied on to carry
@@ -31,7 +39,7 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..remediate import ConcurrentEditError, ReviewPage, Word
+from ..remediate import ConcurrentEditError, ReviewPage, Word, transcript_spans
 from ..triage import DEFAULT_LOW_WC
 
 logger = logging.getLogger("alto_ocr.webreview.ops")
@@ -41,8 +49,11 @@ VERIFY = "verify"
 DELETE = "delete"
 CLEAR = "clear"
 ADD = "add"
+MOVE = "move"
+NUDGE = "nudge"
 _WORD_OPS = (EDIT, VERIFY, DELETE)
-_ALL_OPS = (EDIT, VERIFY, DELETE, CLEAR, ADD)
+_ORDER_OPS = (MOVE, NUDGE)
+_ALL_OPS = (EDIT, VERIFY, DELETE, CLEAR, ADD, MOVE, NUDGE)
 
 
 class OperationError(ValueError):
@@ -57,6 +68,11 @@ class Operation:
     index: int | None = None
     text: str | None = None
     box: tuple[float, float, float, float] | None = None
+    # move/nudge: the words to move; move's target word (None: page start);
+    # nudge's direction.
+    indices: tuple[int, ...] = ()
+    after: int | None = None
+    delta: int = 0
 
 
 @dataclass
@@ -68,13 +84,17 @@ class ApplyReport:
     deleted: int = 0
     added: int = 0
     cleared: int = 0
+    moved: int = 0
     already_verified: int = 0
     notes: list[str] = field(default_factory=list)
+    # Positions (in the batch) of move/nudge ops that changed nothing --
+    # the words were already read there, or already first/last.
+    noops: list[int] = field(default_factory=list)
 
     @property
     def changed(self) -> bool:
         return bool(self.edited or self.verified or self.deleted
-                    or self.added or self.cleared)
+                    or self.added or self.cleared or self.moved)
 
     def summary(self) -> str:
         """One sentence, in the vocabulary the provenance element uses."""
@@ -89,6 +109,8 @@ class ApplyReport:
             parts.append(f"{self.added} added")
         if self.cleared:
             parts.append(f"page cleared ({self.cleared} words removed)")
+        if self.moved:
+            parts.append(f"{self.moved} reading-order change(s)")
         if not parts:
             return "No changes to save."
         return "Saved: " + ", ".join(parts) + "."
@@ -97,8 +119,9 @@ class ApplyReport:
         return {
             "edited": self.edited, "verified": self.verified,
             "deleted": self.deleted, "added": self.added,
-            "cleared": self.cleared, "alreadyVerified": self.already_verified,
-            "notes": self.notes, "summary": self.summary(),
+            "cleared": self.cleared, "moved": self.moved,
+            "alreadyVerified": self.already_verified,
+            "notes": self.notes, "noops": self.noops, "summary": self.summary(),
         }
 
 
@@ -142,6 +165,31 @@ def parse_operations(payload: object) -> list[Operation]:
                 ops.append(Operation(name, index=index))
             continue
 
+        if name in _ORDER_OPS:
+            indices = raw.get("indices")
+            if (not isinstance(indices, list) or not indices
+                    or not all(_is_index(v) for v in indices)
+                    or len(set(indices)) != len(indices)):
+                raise OperationError(
+                    f"Operation {i}: {name} needs indices, a non-empty list of "
+                    "distinct non-negative integers.")
+            if name == MOVE:
+                after = raw.get("after")
+                if after is not None and not _is_index(after):
+                    raise OperationError(
+                        f"Operation {i}: move needs after, a word index or null "
+                        "(null puts the words first on the page).")
+                if after in indices:
+                    raise OperationError(
+                        f"Operation {i}: words cannot be placed after one of themselves.")
+                ops.append(Operation(MOVE, indices=tuple(indices), after=after))
+            else:
+                delta = raw.get("delta")
+                if isinstance(delta, bool) or delta not in (-1, 1):
+                    raise OperationError(f"Operation {i}: nudge needs delta -1 or 1.")
+                ops.append(Operation(NUDGE, indices=tuple(indices), delta=delta))
+            continue
+
         if name == ADD:
             text = raw.get("text")
             if not isinstance(text, str) or not text.strip():
@@ -163,7 +211,7 @@ def parse_operations(payload: object) -> list[Operation]:
     clears = sum(1 for o in ops if o.op == CLEAR)
     if clears > 1:
         raise OperationError("A batch may clear the page at most once.")
-    if clears and any(o.op in _WORD_OPS for o in ops):
+    if clears and any(o.op in _WORD_OPS + _ORDER_OPS for o in ops):
         # Clearing removes every word, so a per-word operation in the same
         # batch either targets a word that is about to vanish or one that
         # already has -- neither is a correction anyone meant to make.
@@ -173,6 +221,10 @@ def parse_operations(payload: object) -> list[Operation]:
             "Clear cannot be combined with per-word operations. Save the "
             "cleared page first, then add the words that were real.")
     return ops
+
+
+def _is_index(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def resolve_targets(page: ReviewPage, ops: list[Operation]) -> dict[int, Word]:
@@ -185,13 +237,17 @@ def resolve_targets(page: ReviewPage, ops: list[Operation]) -> dict[int, Word]:
     """
     targets: dict[int, Word] = {}
     for op in ops:
-        if op.index is None:
-            continue
-        if op.index >= len(page.words):
-            raise OperationError(
-                f"Word {op.index} is not on this page any more (it has "
-                f"{len(page.words)} words). Reload the page and re-apply.")
-        targets[op.index] = page.words[op.index]
+        wanted = list(op.indices)
+        if op.index is not None:
+            wanted.append(op.index)
+        if op.after is not None:
+            wanted.append(op.after)
+        for index in wanted:
+            if index >= len(page.words):
+                raise OperationError(
+                    f"Word {index} is not on this page any more (it has "
+                    f"{len(page.words)} words). Reload the page and re-apply.")
+            targets[index] = page.words[index]
     return targets
 
 
@@ -199,8 +255,23 @@ def apply_operations(page: ReviewPage, ops: list[Operation]) -> ApplyReport:
     """Run a validated batch against a loaded page. Nothing is written here."""
     targets = resolve_targets(page, ops)
     report = ApplyReport()
-    for op in ops:
-        if op.op == EDIT:
+    for position, op in enumerate(ops):
+        if op.op in _ORDER_OPS:
+            words = [targets[i] for i in op.indices]
+            if op.op == MOVE:
+                after = targets[op.after] if op.after is not None else None
+                if after is not None and all(w is not after for w in page.words):
+                    raise OperationError(
+                        f"Word {op.after} was deleted earlier in this batch, so "
+                        "nothing can be placed after it.")
+                moved = page.move_words(words, after)
+            else:
+                moved = page.nudge_words(words, op.delta)
+            if moved is None:
+                report.noops.append(position)
+            else:
+                report.moved += 1
+        elif op.op == EDIT:
             page.edit_word(targets[op.index], op.text)
             report.edited += 1
         elif op.op == VERIFY:
@@ -272,6 +343,37 @@ def check_token(alto_path: Path, token: str | None) -> None:
             "review session, the Tk review GUI, or an external editor). "
             "Reload to pick up the newer version, or force-save to overwrite "
             "it with your corrections.")
+
+
+def order_payload(page: ReviewPage, load_words: list[Word]) -> dict:
+    """The page's reading order and transcript as they stand now (after a
+    batch was applied to this in-memory load).
+
+    ``order`` lists every word in reading order as ``{i, box, line, start,
+    end}``: ``i`` is the word's load-time index (None for a word added in
+    the batch -- it has none), ``box`` its source-image pixel box, ``line``
+    a counter that changes at each line break, and ``start``/``end`` its
+    span in ``transcript``, which is exactly the text a save would write.
+    """
+    index_of = {id(w.elem): i for i, w in enumerate(load_words)}
+    word_of = {id(w.elem): w for w in page.words}
+    text, spans = transcript_spans(page.root)
+    order = []
+    line = -1
+    parent = None
+    for el, start, end in spans:
+        if el.getparent() is not parent:
+            parent = el.getparent()
+            line += 1
+        word = word_of.get(id(el))
+        order.append({
+            "i": index_of.get(id(el)),
+            "box": [round(v, 2) for v in word.box_px] if word else None,
+            "line": line,
+            "start": start,
+            "end": end,
+        })
+    return {"transcript": text, "order": order}
 
 
 def page_payload(page: ReviewPage, *, stem: str, alto_path: Path,

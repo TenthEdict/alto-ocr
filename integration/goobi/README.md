@@ -227,16 +227,37 @@ environment, so a unit drop-in can change one without rewriting `ExecStart`:
 | `ALTO_OCR_REVIEW_OUTPUT_ROOT` | — | standalone output root instead |
 | `ALTO_OCR_REVIEW_SOURCE_ROOT` | — | preservation scans for the above |
 | `ALTO_OCR_REVIEW_CACHE_DIR` | system temp | rendered page JPEGs |
-| `ALTO_OCR_REVIEW_LOW_WC` | `0.50` | flag words below this confidence |
+| `ALTO_OCR_REVIEW_LOW_WC` | `0.50` | default "Flag below"; each corrector can change it on the page (remembered per browser) |
 | `ALTO_OCR_REVIEW_PAGE_PX` | `2400` | full-page render cap (long edge) |
 | `ALTO_OCR_REVIEW_WORKING_PX` | `4000` | cached working-copy cap |
 | `ALTO_OCR_REVIEW_READ_ONLY` | `false` | serve without the save path |
 
+### What a corrector gets
+
+The same tools as the desktop Review tab: worst-first page list, word boxes
+coloured by confidence with a **Flag below** threshold and an **All words**
+toggle, the word editor with its symbol keyboard (hideable), delete without
+a prompt, **Undo**, **Add word**, **Clear page**, **◀ Page / Page ▶**, and
+zoom by dropdown (Fit page, Fit width, percentages) or Ctrl+scroll about the
+pointer.
+
+**Reading order** fixes transcripts whose words are right but ordered wrong
+— two columns read straight across, a caption read into a paragraph. Select
+the words out of place (click, Shift+click a run, Ctrl+click to add or drop
+one, or drag a box around a column), then click the word they should follow;
+"Page start" puts them first. The scan shows the reading path and a side
+panel shows the transcript exactly as it will be saved — computed by the
+server's preview endpoint, which applies the pending batch with the same
+code a save runs, so the browser never re-implements the move.
+
 ### Keyboard
 
 `n` / `p` next/previous flagged word · `Enter` correct (or confirm, if the
-text is unchanged) and advance · `a` add-word mode · `Esc` close the editor ·
-`Ctrl+S` save.
+text is unchanged) and advance · `a` add-word mode · `r` reading-order mode ·
+`Ctrl+↑` / `Ctrl+↓` nudge the selected words one word (reading order) ·
+`Esc` close the editor or clear the selection · `Ctrl+Z` undo · `Ctrl+S`
+save · `Alt+Page Up` / `Alt+Page Down` previous/next page (browsers keep
+`Ctrl+Page Up/Down` for their own tabs).
 
 Corrections accumulate in the browser and post as **one batch per save**: one
 file write, one provenance update, and nothing held server-side, so a closed

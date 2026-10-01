@@ -65,13 +65,17 @@ or popped out into a small window of its own that stays above the page.
 
 **Reading order** mode (toolbar toggle, or ``r`` with canvas focus; mutually
 exclusive with Add word) fixes transcripts whose words are right but ordered
-wrong — wrong column sequence, captions interleaved into the body. A side
-panel lists the page's blocks (and the selected block's lines) in reading
-order with Move Up/Down buttons (Ctrl+Up/Ctrl+Down); the canvas
-shows numbered outlines instead of word boxes, and clicking a block selects
-it in the panel. Moves relocate elements in the ALTO document order
-(``remediate.ReviewPage.move_element`` — geometry and IDs untouched) and
-Ctrl+Z undoes them, interleaved with word edits.
+wrong — wrong column sequence, captions or margin notes read into the body.
+It works on **words**: select the words out of place — click one, Shift+click
+to extend to a run, Ctrl+click to add or drop a word, or drag a box around a
+column or caption (Tesseract's lines often run across both columns, so a
+column is never a contiguous run) — then click the word they should come
+after; "Page start" puts them first, Ctrl+Up/Ctrl+Down nudge them one word. The scan shows the
+reading path (word to word, an arrow at each line break) and a side panel
+shows the transcript exactly as a save will write it — clicks there work
+like clicks on the scan. ``remediate.ReviewPage.move_words``/``nudge_words``
+do the moving (word boxes untouched); Ctrl+Z undoes, interleaved with word
+edits.
 
 All ALTO mutation/save semantics live in ``remediate.py`` (headless,
 unit-tested); this module is only Tk plumbing.
@@ -79,6 +83,7 @@ unit-tested); this module is only Tk plumbing.
 
 from __future__ import annotations
 
+import bisect
 import logging
 import math
 import queue
@@ -98,9 +103,11 @@ from .remediate import (
     ReviewPage,
     StubPageError,
     Word,
+    WordMove,
     index_source_images,
     iter_object_dirs,
     repackage_object,
+    transcript_spans,
 )
 from .triage import DEFAULT_LOW_WC, STATUS_RANK, scan_alto_file
 from .walker import natural_chunks, natural_key
@@ -129,7 +136,7 @@ THRESHOLD_CHOICES: tuple[str, ...] = tuple(f"{p}%" for p in range(0, 101, 5))
 # on disk, but the corrector should still see what they touched).
 _COLOR_EDITED = "#1f6feb"
 _COLOR_UNSCORED = "#c026d3"  # no WC (GLMOCR output): needs eyes everywhere
-_COLOR_ORDER = "#7c3aed"     # reading-order mode: block/line outlines + badges
+_COLOR_ORDER = "#7c3aed"     # reading-order mode: word outlines + reading path
 
 # Canvas items redrawn on every render carry this tag; the scan image does
 # not, so a re-render that keeps the zoom reuses it.
@@ -165,8 +172,7 @@ class _DeleteEntry:
 
 @dataclass
 class _MoveEntry:
-    el: object  # the moved lxml element — opaque here; remediate owns lxml
-    delta: int
+    move: WordMove  # opaque here; remediate.undo_move_words replays it
 
 
 def pct(value: float | None) -> str:
@@ -261,11 +267,17 @@ class ReviewFrame(ttk.Frame):
         self._selected: Optional[Word] = None
         self._undo: list[_EditEntry | _VerifyEntry | _AddEntry
                          | _DeleteEntry | _MoveEntry] = []
-        # Reading-order mode state: the selected block plus parallel
-        # listbox-row -> element lists (the _sorted_stems idiom).
-        self._order_block: Optional[object] = None
-        self._order_blocks: list = []
-        self._order_lines: list = []
+        # Reading-order mode state: the words selected to move (reading
+        # order), the word a Shift+click extends from, and the transcript
+        # panel's (start, end, word) character spans.
+        self._order_sel: list[Word] = []
+        self._order_anchor: Optional[Word] = None
+        self._order_spans: list[tuple[int, int, Word]] = []
+        self._order_buttons: list[ttk.Button] = []
+        # A press on the scan in reading-order mode: (canvas x, y, modifier)
+        # until release decides whether it was a click or a box drag.
+        self._order_press_at: Optional[tuple[float, float, str]] = None
+        self._order_rect: Optional[int] = None
         # Add-word mode state: the drag in progress and the finalized box
         # (image-pixel space) awaiting its text.
         self._drag_start: Optional[tuple[float, float]] = None
@@ -286,12 +298,13 @@ class ReviewFrame(ttk.Frame):
         except (TypeError, ValueError):
             saved_threshold = DEFAULT_LOW_WC
         self.var_threshold = tk.StringVar(value=threshold_text(saved_threshold))
-        self.var_show_all = tk.BooleanVar(value=False)
+        self.var_show_all = tk.BooleanVar(value=True)
         self.var_add_mode = tk.BooleanVar(value=False)
         self.var_reorder_mode = tk.BooleanVar(value=False)
         self.var_zoom = tk.StringVar(value="Fit")
         self.var_symbols = tk.BooleanVar(value=bool(settings.get("review_symbols", True)))
         self.var_status = tk.StringVar(value="Pick a transcript folder and its source images.")
+        self.var_order_hint = tk.StringVar()
         self.var_edit = tk.StringVar()
 
         self._build_ui()
@@ -435,7 +448,7 @@ class ReviewFrame(ttk.Frame):
         ttk.Label(ws, textvariable=self.var_status, foreground="#555").grid(
             row=4, column=0, sticky="w", pady=(4, 0))
 
-        for widget in (self.canvas, self.ent_edit):
+        for widget in (self.canvas, self.ent_edit, self.txt_order):
             widget.bind("<Control-z>", lambda _e: self._undo_edit())
             widget.bind("<Control-s>", lambda _e: self._save_page() or "break")
             widget.bind("<Control-Prior>", lambda _e: self._goto_page(-1) or "break")
@@ -444,6 +457,8 @@ class ReviewFrame(ttk.Frame):
     def _bind_canvas(self) -> None:
         c = self.canvas
         c.bind("<Button-1>", self._on_canvas_click)
+        c.bind("<Shift-Button-1>", lambda e: self._on_canvas_modified_click(e, "shift"))
+        c.bind("<Control-Button-1>", lambda e: self._on_canvas_modified_click(e, "ctrl"))
         c.bind("<B1-Motion>", self._on_canvas_drag)
         c.bind("<ButtonRelease-1>", self._on_canvas_release)
         c.bind("<Configure>", self._on_canvas_configure)
@@ -463,50 +478,57 @@ class ReviewFrame(ttk.Frame):
         c.bind("<Key-p>", lambda _e: self._goto_flagged(-1))
         c.bind("<Key-a>", lambda _e: self._toggle_add_mode())
         c.bind("<Key-r>", lambda _e: self._toggle_reorder_mode())
+        c.bind("<Escape>", lambda _e: self._on_canvas_escape())
+        c.bind("<Control-Up>", lambda _e: self._order_nudge(-1) or "break")
+        c.bind("<Control-Down>", lambda _e: self._order_nudge(+1) or "break")
 
     def _build_order_panel(self, area: ttk.Frame) -> None:
         # Reading-order side panel: hidden until the mode is toggled on.
-        self.order_panel = ttk.Frame(area)
-        self.order_panel.grid(row=0, column=2, rowspan=2, sticky="ns", padx=(8, 0))
-        self.order_panel.rowconfigure(1, weight=3)
-        self.order_panel.rowconfigure(4, weight=2)
-        ttk.Label(self.order_panel, text="Blocks (reading order)").grid(
-            row=0, column=0, sticky="w")
-        self.lst_blocks = tk.Listbox(self.order_panel, width=34, exportselection=False)
-        self.lst_blocks.grid(row=1, column=0, sticky="ns")
-        sb_blocks = ttk.Scrollbar(self.order_panel, orient="vertical",
-                                  command=self.lst_blocks.yview)
-        sb_blocks.grid(row=1, column=1, sticky="ns")
-        self.lst_blocks.configure(yscrollcommand=sb_blocks.set)
-        self.lst_blocks.bind("<<ListboxSelect>>", self._on_order_block_selected)
-        blk_btns = ttk.Frame(self.order_panel)
-        blk_btns.grid(row=2, column=0, sticky="ew", pady=(4, 8))
-        ttk.Button(blk_btns, text="▲ Up",
-                   command=lambda: self._move_selected(self.lst_blocks, -1)).pack(side="left")
-        ttk.Button(blk_btns, text="▼ Down",
-                   command=lambda: self._move_selected(self.lst_blocks, +1)).pack(
-            side="left", padx=(6, 0))
-        ttk.Label(self.order_panel, text="Lines in selected block").grid(
-            row=3, column=0, sticky="w")
-        self.lst_lines = tk.Listbox(self.order_panel, width=34, exportselection=False)
-        self.lst_lines.grid(row=4, column=0, sticky="ns")
-        sb_lines = ttk.Scrollbar(self.order_panel, orient="vertical",
-                                 command=self.lst_lines.yview)
-        sb_lines.grid(row=4, column=1, sticky="ns")
-        self.lst_lines.configure(yscrollcommand=sb_lines.set)
-        ln_btns = ttk.Frame(self.order_panel)
-        ln_btns.grid(row=5, column=0, sticky="ew", pady=(4, 0))
-        ttk.Button(ln_btns, text="▲ Up",
-                   command=lambda: self._move_selected(self.lst_lines, -1)).pack(side="left")
-        ttk.Button(ln_btns, text="▼ Down",
-                   command=lambda: self._move_selected(self.lst_lines, +1)).pack(
-            side="left", padx=(6, 0))
-        for lst in (self.lst_blocks, self.lst_lines):
-            lst.bind("<Control-Up>",
-                     lambda _e, l=lst: self._move_selected(l, -1) or "break")
-            lst.bind("<Control-Down>",
-                     lambda _e, l=lst: self._move_selected(l, +1) or "break")
-        self.order_panel.grid_remove()
+        panel = self.order_panel = ttk.Frame(area)
+        panel.grid(row=0, column=2, rowspan=2, sticky="ns", padx=(8, 0))
+        panel.rowconfigure(4, weight=1)
+        ttk.Label(panel, text="Reading order", font=("Segoe UI", 10, "bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(panel, textvariable=self.var_order_hint, foreground="#555",
+                  wraplength=300, justify="left").grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(2, 6))
+        btns = ttk.Frame(panel)
+        btns.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        for label, tip, command in (
+            ("▲ Earlier", "Move the selection one word earlier (Ctrl+Up)",
+             lambda: self._order_nudge(-1)),
+            ("▼ Later", "Move the selection one word later (Ctrl+Down)",
+             lambda: self._order_nudge(+1)),
+            ("⤒ Page start", "Make the selection the first words on the page",
+             self._order_to_start),
+            ("Clear", "Clear the selection (Esc)",
+             lambda: self._set_order_selection([], None)),
+        ):
+            b = ttk.Button(btns, text=label, command=command)
+            b.pack(side="left", padx=(0, 4))
+            Tooltip(b, tip)
+            self._order_buttons.append(b)
+        ttk.Label(panel, text="Transcript — as it will be saved").grid(
+            row=3, column=0, columnspan=2, sticky="w")
+        self.txt_order = tk.Text(panel, width=42, wrap="word", cursor="arrow",
+                                 font=("Segoe UI", 10), state="disabled",
+                                 padx=6, pady=4)
+        self.txt_order.grid(row=4, column=0, sticky="ns")
+        self.txt_order.tag_configure("chosen", background="#cfe0ff",
+                                     foreground="#0b3d91")
+        sb = ttk.Scrollbar(panel, orient="vertical", command=self.txt_order.yview)
+        sb.grid(row=4, column=1, sticky="ns")
+        self.txt_order.configure(yscrollcommand=sb.set)
+        t = self.txt_order
+        t.bind("<Button-1>", lambda e: self._on_order_text_click(e, shift=False))
+        t.bind("<Shift-Button-1>", lambda e: self._on_order_text_click(e, shift=True))
+        t.bind("<Control-Button-1>", lambda e: self._on_order_text_toggle(e))
+        for seq in ("<B1-Motion>", "<Double-Button-1>", "<Triple-Button-1>"):
+            t.bind(seq, lambda _e: "break")
+        t.bind("<Escape>", lambda _e: self._on_canvas_escape())
+        t.bind("<Control-Up>", lambda _e: self._order_nudge(-1) or "break")
+        t.bind("<Control-Down>", lambda _e: self._order_nudge(+1) or "break")
+        panel.grid_remove()
 
     def _build_editor(self, ws: tk.Frame) -> None:
         editor = ttk.LabelFrame(ws, text="Selected word", padding=6)
@@ -769,7 +791,8 @@ class ReviewFrame(ttk.Frame):
         self._selected = None
         self._undo.clear()
         self._cancel_pending_add()
-        self._order_block = None
+        self._order_sel = []
+        self._order_anchor = None
         if self.var_reorder_mode.get():
             self._refresh_order_panel()
         self.canvas.delete("all")
@@ -856,7 +879,7 @@ class ReviewFrame(ttk.Frame):
 
         self._rect_by_word.clear()
         if self.var_reorder_mode.get():
-            # Structure view: block/line outlines instead of word boxes.
+            # Order view: every word, the selection, and the reading path.
             self._draw_order_overlays()
             self._drag_item = None
             return
@@ -928,20 +951,9 @@ class ReviewFrame(ttk.Frame):
         if self._page is None:
             return
         if self.var_reorder_mode.get():
-            # Reorder mode: a click picks the block under the cursor.
-            x = self.canvas.canvasx(event.x) / self._scale
-            y = self.canvas.canvasy(event.y) / self._scale
-            blk = self._block_at(x, y)
-            if blk is not None:
-                for i, cand in enumerate(self._order_blocks):
-                    if cand is blk:
-                        self.lst_blocks.selection_clear(0, "end")
-                        self.lst_blocks.selection_set(i)
-                        self.lst_blocks.see(i)
-                        break
-                self._order_block = blk
-                self._refresh_order_panel()
-                self._render()
+            # Reorder mode: a click selects words or places the selection; a
+            # drag boxes words. Release decides which it was.
+            self._order_press(event, "plain")
             return
         if self.var_add_mode.get():
             # Add mode: the click starts a rubber-band drag, not a selection.
@@ -991,122 +1003,263 @@ class ReviewFrame(ttk.Frame):
         self.order_panel.grid()
         self._refresh_order_panel()
         self._render()
-        if self._page is not None:
-            self.var_status.set(
-                "Reading order: select a block (click it on the page or in the "
-                "list), then Move Up/Down or Ctrl+Up/Ctrl+Down. Ctrl+Z undoes.")
+        self.canvas.focus_set()
 
     def _teardown_reorder(self) -> None:
-        self._order_block = None
+        self._order_sel = []
+        self._order_anchor = None
         self.order_panel.grid_remove()
         self._render()
 
+    def _order_hint(self) -> str:
+        if not self._order_sel:
+            return ("Select the words that are out of place: click one (on the "
+                    "scan or in the transcript below), Shift+click to extend to "
+                    "a run, Ctrl+click to add or remove a word, or drag a box "
+                    "around a whole column or caption on the scan.")
+        n = len(self._order_sel)
+        return (f"{n} word(s) selected. Now click the word they should come "
+                "after (“Page start” puts them first). Ctrl+Up/Ctrl+Down nudge "
+                "one word; Esc clears; Ctrl+Z undoes a move.")
+
     def _refresh_order_panel(self) -> None:
-        """Rebuild both listboxes from the tree, keeping the block selection
-        (by element identity) when it survived the change."""
-        self.lst_blocks.delete(0, "end")
-        self.lst_lines.delete(0, "end")
-        if self._page is None:
-            self._order_blocks = []
-            self._order_lines = []
-            self._order_block = None
-            return
-        self._order_blocks = self._page.flow_children()
-        if self._order_block is not None and not any(
-                b is self._order_block for b in self._order_blocks):
-            self._order_block = None
-        for i, el in enumerate(self._order_blocks):
-            self.lst_blocks.insert("end", f"{i + 1}. {self._page.text_preview(el)}")
-            if el is self._order_block:
-                self.lst_blocks.selection_set(i)
-                self.lst_blocks.see(i)
-        self._order_lines = (
-            self._page.flow_children(self._order_block)
-            if self._order_block is not None else [])
-        for i, el in enumerate(self._order_lines):
-            self.lst_lines.insert("end", f"{i + 1}. {self._page.text_preview(el)}")
+        """Re-render the transcript (exactly what a save will write), mark
+        the selection in it, and refresh the hint and buttons."""
+        page = self._page
+        words = {id(w.elem): w for w in page.words} if page is not None else {}
+        # Words deleted or cleared since they were selected drop out.
+        self._order_sel = [w for w in self._order_sel if id(w.elem) in words]
+        if self._order_anchor is not None and id(self._order_anchor.elem) not in words:
+            self._order_anchor = self._order_sel[0] if self._order_sel else None
+        self.var_order_hint.set(self._order_hint())
+        state = "normal" if self._order_sel else "disabled"
+        for b in self._order_buttons:
+            b.configure(state=state)
 
-    def _on_order_block_selected(self, _event: object) -> None:
-        sel = self.lst_blocks.curselection()
-        if not sel or sel[0] >= len(self._order_blocks):
+        txt = self.txt_order
+        txt.configure(state="normal")
+        txt.delete("1.0", "end")
+        self._order_spans = []
+        if page is not None:
+            text, spans = transcript_spans(page.root)
+            txt.insert("1.0", text or "(no words on this page)")
+            self._order_spans = [(a, b, words[id(el)]) for el, a, b in spans
+                                 if id(el) in words]
+            chosen = {id(w) for w in self._order_sel}
+            first = None
+            prev_end = None  # end of the previous word, when it was chosen too
+            for a, b, w in self._order_spans:
+                if id(w) in chosen:
+                    start = prev_end if prev_end is not None else a
+                    txt.tag_add("chosen", f"1.0+{start}c", f"1.0+{b}c")
+                    prev_end = b
+                    if first is None:
+                        first = a
+                else:
+                    prev_end = None
+            if first is not None:
+                txt.see(f"1.0+{first}c")
+        txt.configure(state="disabled")
+
+    def _order_word_in_text(self, event: tk.Event) -> Optional[Word]:
+        """The word under a click in the transcript panel, if any."""
+        return self._order_word_at(f"@{event.x},{event.y}")
+
+    def _order_word_at(self, index: str) -> Optional[Word]:
+        """The word at a transcript-panel text index (a click lands between
+        characters, so a word's end counts as on it)."""
+        if not self._order_spans:
+            return None
+        offset = self.txt_order.count("1.0", index, "chars")
+        offset = offset[0] if offset else 0
+        i = bisect.bisect_right([a for a, _b, _w in self._order_spans], offset) - 1
+        if i < 0:
+            return None
+        a, b, word = self._order_spans[i]
+        return word if a <= offset <= b else None
+
+    def _on_order_text_click(self, event: tk.Event, shift: bool) -> str:
+        self._order_pick(self._order_word_in_text(event), shift)
+        return "break"  # no text selection / insert cursor in the panel
+
+    def _on_order_text_toggle(self, event: tk.Event) -> str:
+        self._order_toggle(self._order_word_in_text(event))
+        return "break"
+
+    def _order_pick(self, word: Optional[Word], shift: bool) -> None:
+        """One click in reading-order mode, on the scan or in the transcript.
+
+        Nothing selected: the word becomes the selection. Shift: the
+        selection becomes every word from the first one picked to this one.
+        A selection and a plain click elsewhere: the selection moves to read
+        right after the clicked word. A plain click inside the selection
+        starts over from that word."""
+        if self._page is None:
             return
-        self._order_block = self._order_blocks[sel[0]]
+        if word is None:
+            if not shift and self._order_sel:
+                self._set_order_selection([], None)
+            return
+        if shift and self._order_anchor is not None:
+            i = self._page.doc_index(self._order_anchor)
+            j = self._page.doc_index(word)
+            if i is not None and j is not None:
+                lo, hi = sorted((i, j))
+                self._set_order_selection(self._page.words[lo:hi + 1], self._order_anchor)
+                return
+        if not self._order_sel or shift or any(w is word for w in self._order_sel):
+            self._set_order_selection([word], word)
+            return
+        self._order_apply(lambda: self._page.move_words(self._order_sel, word),
+                          f"after “{word.content}”")
+
+    def _order_toggle(self, word: Optional[Word]) -> None:
+        """Ctrl+click: add a word to the selection, or take it out."""
+        if word is None or self._page is None:
+            return
+        if any(w is word for w in self._order_sel):
+            rest = [w for w in self._order_sel if w is not word]
+            anchor = self._order_anchor if self._order_anchor is not word else None
+            self._set_order_selection(rest, anchor or (rest[0] if rest else None))
+        else:
+            self._set_order_selection(self._order_sel + [word], word)
+
+    def _order_box_select(self, box: tuple[float, float, float, float], add: bool) -> None:
+        """Select the words whose centers fall inside an image-px box — a
+        column or a caption in one drag, where Tesseract's lines interleave
+        it with the text beside it. ``add`` keeps the current selection."""
+        x, y, bw, bh = box
+        hits = [w for w in self._page.words
+                if x <= w.box_px[0] + w.box_px[2] / 2 <= x + bw
+                and y <= w.box_px[1] + w.box_px[3] / 2 <= y + bh]
+        if add:
+            have = {id(w) for w in self._order_sel}
+            hits = self._order_sel + [w for w in hits if id(w) not in have]
+        if not hits:
+            self.var_status.set("No words inside that box.")
+            return
+        self._set_order_selection(hits, self._order_anchor if add and self._order_anchor
+                                  else hits[0])
+
+    def _set_order_selection(self, words: list[Word], anchor: Optional[Word]) -> None:
+        # Kept in reading order, which is the order a move carries them in.
+        pos = {id(w): i for i, w in enumerate(self._page.words)} if self._page else {}
+        self._order_sel = sorted(words, key=lambda w: pos.get(id(w), 1 << 30))
+        self._order_anchor = anchor
         self._refresh_order_panel()
         self._render()
 
-    def _move_selected(self, listbox: tk.Listbox, delta: int) -> None:
-        if self._page is None:
+    def _order_nudge(self, delta: int) -> None:
+        if self.var_reorder_mode.get() and self._order_sel:
+            self._order_apply(lambda: self._page.nudge_words(self._order_sel, delta),
+                              "one word earlier" if delta < 0 else "one word later")
+
+    def _order_to_start(self) -> None:
+        if self._order_sel:
+            self._order_apply(lambda: self._page.move_words(self._order_sel, None),
+                              "to the start of the page")
+
+    def _order_apply(self, do_move: Callable[[], Optional[WordMove]], where: str) -> None:
+        """Run one move of the selection; keep the selection so it can be
+        nudged again."""
+        if self._page is None or not self._order_sel:
             return
-        elems = self._order_blocks if listbox is self.lst_blocks else self._order_lines
-        sel = listbox.curselection()
-        if not sel or sel[0] >= len(elems):
+        try:
+            move = do_move()
+        except ValueError as e:
+            self.var_status.set(str(e))
+            self.bell()
             return
-        el = elems[sel[0]]
-        if not self._page.move_element(el, delta):
-            self.var_status.set("Already first." if delta < 0 else "Already last.")
+        if move is None:
+            self.var_status.set("Nothing to move — the words are already read there.")
             return
-        self._undo.append(_MoveEntry(el, delta))
+        self._undo.append(_MoveEntry(move))
         self.btn_save.configure(state="normal")
-        if listbox is self.lst_blocks:
-            self._order_block = el
         self._refresh_order_panel()
-        # Keep the moved entry selected in its (re-numbered) list.
-        elems = self._order_blocks if listbox is self.lst_blocks else self._order_lines
-        for i, cand in enumerate(elems):
-            if cand is el:
-                listbox.selection_clear(0, "end")
-                listbox.selection_set(i)
-                listbox.see(i)
-                break
         self._render()
-        self._update_status()
+        self._update_status(f"Moved {len(self._order_sel)} word(s) {where}. "
+                            "Ctrl+Z undoes.")
 
-    def _block_at(self, x: float, y: float) -> Optional[object]:
-        """Smallest listed block whose box contains the image-px point."""
-        hits = []
-        for el in self._order_blocks:
-            b = self._page.box_px_of(el)
-            if b is not None and b[0] <= x <= b[0] + b[2] and b[1] <= y <= b[1] + b[3]:
-                hits.append((b[2] * b[3], el))
-        return min(hits, key=lambda t: t[0])[1] if hits else None
+    def _on_canvas_modified_click(self, event: tk.Event, mode: str) -> None:
+        """Shift/Ctrl+press on the scan: a modified pick or an additive box
+        in reading-order mode; an ordinary click anywhere else."""
+        if not self.var_reorder_mode.get():
+            self._on_canvas_click(event)
+            return
+        self.canvas.focus_set()
+        if self._page is not None:
+            self._order_press(event, mode)
+
+    def _order_press(self, event: tk.Event, mode: str) -> None:
+        self._order_press_at = (self.canvas.canvasx(event.x),
+                                self.canvas.canvasy(event.y), mode)
+        self._order_rect = None
+
+    def _order_drag(self, event: tk.Event) -> None:
+        x0, y0, _mode = self._order_press_at
+        x1, y1 = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        if self._order_rect is None:
+            if abs(x1 - x0) < 5 and abs(y1 - y0) < 5:
+                return  # still a click: hands wobble
+            self._order_rect = self.canvas.create_rectangle(
+                x0, y0, x1, y1, outline=_COLOR_EDITED, width=2, dash=(4, 2),
+                tags=(_OVERLAY,))
+        else:
+            self.canvas.coords(self._order_rect, x0, y0, x1, y1)
+
+    def _order_release(self, event: tk.Event) -> None:
+        x0, y0, mode = self._order_press_at
+        self._order_press_at = None
+        if self._page is None:
+            return
+        x1, y1 = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        if self._order_rect is not None:
+            self.canvas.delete(self._order_rect)
+            self._order_rect = None
+            s = self._scale
+            self._order_box_select((min(x0, x1) / s, min(y0, y1) / s,
+                                    abs(x1 - x0) / s, abs(y1 - y0) / s),
+                                   add=mode != "plain")
+            return
+        word = self._page.word_at(x0 / self._scale, y0 / self._scale)
+        if mode == "ctrl":
+            self._order_toggle(word)
+        else:
+            self._order_pick(word, shift=mode == "shift")
+
+    def _on_canvas_escape(self) -> None:
+        if self.var_reorder_mode.get() and self._order_sel:
+            self._set_order_selection([], None)
+        else:
+            self._on_escape()
 
     def _draw_order_overlays(self) -> None:
-        """Numbered outlines for blocks (and the selected block's lines) —
-        redrawn from state inside _render, like the pending add-word box."""
+        """Every word outlined, the selection heavy, and the reading path:
+        a thin line from word to word through each line, and an arrow from
+        the end of one line to the start of the next — so a wrong order is
+        visible at a glance. Redrawn from state inside _render."""
         s = self._scale
-        for i, el in enumerate(self._order_blocks):
-            b = self._page.box_px_of(el)
-            if b is None:
-                continue
-            x, y, bw, bh = (v * s for v in b)
-            selected = el is self._order_block
+        chosen = {id(w) for w in self._order_sel}
+        prev = None
+        for word in self._page.words:
+            x, y, bw, bh = (v * s for v in word.box_px)
+            center = (x + bw / 2, y + bh / 2)
+            if prev is not None:
+                same_line = prev[0].elem.getparent() is word.elem.getparent()
+                self.canvas.create_line(
+                    *prev[1], *center, fill=_COLOR_ORDER,
+                    width=1 if same_line else 2,
+                    dash=() if same_line else (6, 3),
+                    arrow="none" if same_line else "last",
+                    tags=(_OVERLAY,))
+            prev = (word, center)
+        for word in self._page.words:
+            x, y, bw, bh = (v * s for v in word.box_px)
+            selected = id(word) in chosen
             self.canvas.create_rectangle(
-                x, y, x + bw, y + bh, outline=_COLOR_ORDER,
-                width=3 if selected else 2, tags=(_OVERLAY,))
-            self._draw_order_badge(x, y, str(i + 1), large=True)
-            if selected:
-                for j, ln in enumerate(self._order_lines):
-                    lb = self._page.box_px_of(ln)
-                    if lb is None:
-                        continue
-                    lx, ly, lw, lh = (v * s for v in lb)
-                    self.canvas.create_rectangle(
-                        lx, ly, lx + lw, ly + lh, outline=_COLOR_ORDER,
-                        width=1, dash=(4, 2), tags=(_OVERLAY,))
-                    self._draw_order_badge(lx, ly, str(j + 1), large=False)
-
-    def _draw_order_badge(self, x: float, y: float, label: str, *, large: bool) -> None:
-        font = ("Segoe UI", 11 if large else 8, "bold")
-        pad = 4 if large else 2
-        # Size the badge to its text so two-digit numbers fit.
-        probe = self.canvas.create_text(0, 0, text=label, font=font, anchor="nw")
-        x0, y0, x1, y1 = self.canvas.bbox(probe)
-        self.canvas.delete(probe)
-        w, h = (x1 - x0) + 2 * pad, (y1 - y0) + 2 * pad
-        self.canvas.create_rectangle(x, y, x + w, y + h, fill=_COLOR_ORDER,
-                                     outline=_COLOR_ORDER, tags=(_OVERLAY,))
-        self.canvas.create_text(x + w / 2, y + h / 2, text=label,
-                                fill="white", font=font, tags=(_OVERLAY,))
+                x, y, x + bw, y + bh,
+                outline=_COLOR_EDITED if selected else _COLOR_ORDER,
+                width=3 if selected else 1, tags=(_OVERLAY,))
 
     def _cancel_pending_add(self) -> None:
         self._drag_start = None
@@ -1118,6 +1271,9 @@ class ReviewFrame(ttk.Frame):
             self._update_editor()
 
     def _on_canvas_drag(self, event: tk.Event) -> None:
+        if self._order_press_at is not None:
+            self._order_drag(event)
+            return
         if self._drag_start is None:
             return
         x0, y0 = self._drag_start
@@ -1130,6 +1286,9 @@ class ReviewFrame(ttk.Frame):
             self.canvas.coords(self._drag_item, x0, y0, x1, y1)
 
     def _on_canvas_release(self, event: tk.Event) -> None:
+        if self._order_press_at is not None:
+            self._order_release(event)
+            return
         if self._drag_start is None:
             return
         x0, y0 = self._drag_start
@@ -1325,7 +1484,8 @@ class ReviewFrame(ttk.Frame):
         self._undo.clear()
         self._selected = None
         self._cancel_pending_add()
-        self._order_block = None
+        self._order_sel = []
+        self._order_anchor = None
         if self.var_reorder_mode.get():
             self._refresh_order_panel()
         self.btn_save.configure(state="normal")
@@ -1340,7 +1500,7 @@ class ReviewFrame(ttk.Frame):
             return
         entry = self._undo.pop()
         if isinstance(entry, _MoveEntry):
-            self._page.undo_move(entry.el, entry.delta)
+            self._page.undo_move_words(entry.move)
             self._maybe_disable_save()
             if self.var_reorder_mode.get():
                 self._refresh_order_panel()

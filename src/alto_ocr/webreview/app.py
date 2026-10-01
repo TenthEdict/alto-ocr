@@ -240,6 +240,31 @@ def create_app(config: ReviewServerConfig) -> FastAPI:
                                      low_wc=config.low_wc),
         }
 
+    @app.post("/api/objects/{ref_id}/pages/{stem}/preview")
+    async def api_preview(ref_id: str, stem: str, request: Request) -> dict:
+        """Apply a batch to a throwaway load and report the reading order and
+        transcript it produces. Writes nothing, so it is open in read-only
+        mode too. The browser's reading-order view comes from here, so the
+        order it shows is the order ``remediate.move_words`` will save."""
+        obj = _object(ref_id)
+        try:
+            body = await request.json()
+        except ValueError as e:
+            raise HTTPException(400, f"Body is not JSON: {e}") from e
+        if not isinstance(body, dict):
+            raise HTTPException(400, "Body must be a JSON object.")
+        try:
+            operations = ops.parse_operations(body.get("ops", []))
+        except ops.OperationError as e:
+            raise HTTPException(400, str(e)) from e
+        page, _alto_path = _load_page(obj, stem)
+        load_words = list(page.words)
+        try:
+            report = ops.apply_operations(page, operations)
+        except ValueError as e:  # OperationError included
+            raise HTTPException(400, str(e)) from e
+        return {**ops.order_payload(page, load_words), "report": report.to_json()}
+
     # ---------- pixels -------------------------------------------------
 
     @app.get("/api/objects/{ref_id}/pages/{stem}/image")
