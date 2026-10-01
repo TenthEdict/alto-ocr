@@ -1172,7 +1172,24 @@ async function route() {
   }
 }
 
+/* The header's Auto / Light / Dark switch. index.html sets the attribute
+ * before the first paint; this keeps it current. */
+function wireTheme() {
+  const select = document.getElementById('theme');
+  const media = window.matchMedia('(prefers-color-scheme: dark)');
+  const saved = prefs.get('theme', 'auto');
+  select.value = ['auto', 'light', 'dark'].includes(saved) ? saved : 'auto';
+  const apply = () => {
+    const dark = select.value === 'dark' || (select.value === 'auto' && media.matches);
+    document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+  };
+  select.addEventListener('change', () => { prefs.set('theme', select.value); apply(); });
+  media.addEventListener('change', apply);
+  apply();
+}
+
 (async function main() {
+  wireTheme();
   try {
     CONFIG = await api('api/config');
     document.getElementById('version').textContent = 'v' + CONFIG.version

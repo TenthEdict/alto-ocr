@@ -166,6 +166,9 @@ Contents
   - METS checksums: on by default; turning off speeds up very large
     objects.
 
+  Dark mode: View > Theme > Dark. "Match Windows" follows the light/dark
+  app mode in Windows' colour settings instead. The choice is remembered.
+
 
 7. Correcting transcripts (Review tab)
 --------------------------------------
