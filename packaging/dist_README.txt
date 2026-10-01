@@ -205,11 +205,20 @@ Contents
 
   Page-level tools:
     - "Reading order (r)": fix transcripts whose words are right but
-      ordered wrong (wrong column sequence, captions read out of
-      place). A side panel lists the page's blocks — and the selected
-      block's lines — in reading order; select one (click it on the
-      page or in the list) and move it Up/Down (or Ctrl+Up/Ctrl+Down).
-      Word boxes are untouched; only the transcript order changes.
+      in the wrong order — two columns read straight across, a caption
+      or margin note read into the middle of a paragraph. The scan
+      shows the order as a line running from word to word (arrows mark
+      each line break), and a side panel shows the transcript exactly
+      as it will be saved.
+        1. Select the words that are out of place: click a word, Shift+
+           click to extend to a run of words, Ctrl+click to add or drop
+           a single word — or drag a box around a whole column or
+           caption on the scan. (You can click in the side panel's
+           transcript too.)
+        2. Click the word they should come after. "Page start" puts
+           them first instead; Ctrl+Up / Ctrl+Down nudge them one word.
+      Ctrl+Z undoes a move; Esc clears the selection. Word boxes are
+      untouched; only the transcript order changes.
     - "Clear page...": removes ALL words on the page in one step. Use it
       when the whole page is hallucinated OCR — covers, photographs,
       or blank pages where the engine read texture or noise as
@@ -237,6 +246,7 @@ Contents
     Esc .............. deselect / cancel an add-word box
     a ................ add-word mode on/off
     r ................ reading-order mode on/off
+    Ctrl+Up/Down ..... reading order: nudge the selected words
     Ctrl+Z ........... undo (edits, confirms, deletes, adds, moves)
     Ctrl+S ........... save page
     Ctrl+PgUp/PgDn ... previous / next page

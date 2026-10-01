@@ -12,9 +12,10 @@ ALTO cannot store (control characters), page clearing (clear_words:
 bulk rejection of hallucinated pages, PC drop, empty triage status),
 word insertion (add_word: line/block/PrintSpace placement, SP rebuild,
 fresh institution IDs, bbox expansion, undo_add), undo via revert_word,
-reading-order moves (move_element/undo_move/flow_children: pure sibling
-relocation with geometry/IDs/SPs untouched, ComposedBlocks as atomic
-units, the separate provenance count), save round-trip (tab
+word-level reading-order moves (move_words/nudge_words/undo_move_words:
+in-line runs, multi-line runs keeping their line breaks, target-line
+splits, re-fitted containers, untouched word boxes, byte-exact undo, the
+separate provenance count), transcript_spans, save round-trip (tab
 serialization, PC recompute, review provenance with cumulative counts,
 Text/ regeneration), the canonical ALTO→text rendering, stub detection,
 and the source-image index.
@@ -41,6 +42,7 @@ from src.alto_ocr.remediate import (  # noqa: E402
     StubPageError,
     alto_to_text,
     has_review_provenance,
+    transcript_spans,
     index_source_images,
 )
 from src.alto_ocr.triage import scan_alto_file  # noqa: E402
@@ -241,9 +243,8 @@ class SettleTests(_PageFixture):
         word = self.page.words[1]  # "cf" @ 0.40
         self.page.edit_word(word, "of")
         self.page.revert_word(word, "cf", 0.40)
-        block = self.page.flow_children()[1]
-        self.page.move_element(block, -1)
-        self.page.undo_move(block, -1)
+        lone = self.page.words[3]
+        self.page.undo_move_words(self.page.move_words([lone], None))
         self.assertFalse(self.page.settle())
 
     def test_partial_undo_stays_dirty(self) -> None:
@@ -367,7 +368,7 @@ class VerifyTests(_PageFixture):
         reopened = ReviewPage(self.alto, _IMG_SIZE)
         reopened.verify_word(reopened.words[2])
         reopened.edit_word(reopened.words[0], "Boards")
-        reopened.move_element(reopened.flow_children()[1], -1)
+        reopened.move_words([reopened.words[3]], None)
         reopened.save()
         body = self.alto.read_text(encoding="utf-8")
         self.assertIn("human review: 1 word(s) corrected; 2 word(s) confirmed; "
@@ -661,89 +662,186 @@ _ALTO_CB = """<?xml version="1.0" encoding="UTF-8"?>
 """
 
 
-def _geometry_snapshot(root: etree._Element) -> list[tuple]:
-    """(ID, HPOS, VPOS, WIDTH, HEIGHT) of every ID-carrying element —
-    a move must leave all of it byte-identical."""
+def _string_geometry(root: etree._Element) -> list[tuple]:
+    """(ID, HPOS, VPOS, WIDTH, HEIGHT, CONTENT, WC) of every String — a
+    reading-order move must leave every word's box and text untouched."""
     return sorted(
-        (el.get("ID"), el.get("HPOS"), el.get("VPOS"),
-         el.get("WIDTH"), el.get("HEIGHT"))
-        for el in root.iter() if el.get("ID") is not None
+        (el.get("ID"), el.get("HPOS"), el.get("VPOS"), el.get("WIDTH"),
+         el.get("HEIGHT"), el.get("CONTENT"), el.get("WC"))
+        for el in root.iter("{*}String")
     )
 
 
-class MoveTests(_PageFixture):
-    def test_move_block_swaps_transcript_order(self) -> None:
-        tb2 = self.page.flow_children()[1]
-        self.assertEqual(tb2.get("ID"), "P1_TB00002")
-        self.assertTrue(self.page.move_element(tb2, -1))
-        self.assertEqual(alto_to_text(self.page.root),
-                         "Lone\n\nBoard cf\n1927\n")
-        # self.words re-sorted into the new document order.
+def _box(el: etree._Element) -> tuple[str, str, str, str]:
+    return (el.get("HPOS"), el.get("VPOS"), el.get("WIDTH"), el.get("HEIGHT"))
+
+
+class MoveWordsTests(_PageFixture):
+    """Word-level reading order (move_words / nudge_words). The fixture is
+    TB1[TL1: Board cf | TL2: 1927]  TB2[TL3: Lone]."""
+
+    def _w(self, content: str):
+        return next(w for w in self.page.words if w.content == content)
+
+    def _text(self) -> str:
+        return alto_to_text(self.page.root)
+
+    def test_single_word_goes_in_line_after_target(self) -> None:
+        strings = _string_geometry(self.page.root)
+        move = self.page.move_words([self._w("Lone")], self._w("Board"))
+        self.assertIsNotNone(move)
+        self.assertEqual(self._text(), "Board Lone cf\n1927\n")
         self.assertEqual([w.content for w in self.page.words],
-                         ["Lone", "Board", "cf", "1927"])
+                         ["Board", "Lone", "cf", "1927"])
+        # Emptied TextLine and TextBlock cascade away; PrintSpace stays.
+        self.assertIsNone(self.page.root.find(".//{*}TextBlock[@ID='P1_TB00002']"))
+        self.assertIsNotNone(self.page.root.find(".//{*}PrintSpace"))
+        # The line that gained a word is re-fitted around all three; the
+        # line whose words did not change keeps its box; the block covers both.
+        tl1 = self.page.root.find(".//{*}TextLine[@ID='P1_TL00001']")
+        self.assertEqual(_box(tl1), ("100", "100", "370", "460"))
+        tl2 = self.page.root.find(".//{*}TextLine[@ID='P1_TL00002']")
+        self.assertEqual(_box(tl2), ("100", "200", "400", "80"))
+        tb1 = self.page.root.find(".//{*}TextBlock[@ID='P1_TB00001']")
+        self.assertEqual(_box(tb1), ("100", "100", "400", "460"))
+        self.assertEqual(len(tl1.findall("{*}SP")), 2)
+        self.assertEqual(_string_geometry(self.page.root), strings)
         self.assertTrue(self.page.dirty)
         self.assertEqual(self.page.session_moves, 1)
         self.assertEqual(self.page.session_edits, 0)
 
-    def test_move_line_within_block(self) -> None:
-        tb1 = self.page.flow_children()[0]
-        lines = self.page.flow_children(tb1)
-        self.assertTrue(self.page.move_element(lines[1], -1))  # "1927" up
-        self.assertEqual(alto_to_text(self.page.root),
-                         "1927\nBoard cf\n\nLone\n")
-        self.assertEqual([tl.get("ID") for tl in tb1.findall("{*}TextLine")],
-                         ["P1_TL00002", "P1_TL00001"])
-        self.assertEqual([w.content for w in self.page.words],
-                         ["1927", "Board", "cf", "Lone"])
+    def test_page_start_reorders_within_a_line_without_refitting(self) -> None:
+        tl1 = self.page.root.find(".//{*}TextLine[@ID='P1_TL00001']")
+        box = _box(tl1)
+        self.assertIsNotNone(self.page.move_words([self._w("cf")], None))
+        self.assertEqual(self._text(), "cf Board\n1927\n\nLone\n")
+        self.assertEqual(_box(tl1), box)  # same words, only their order changed
+        sp = tl1.find("{*}SP")
+        self.assertEqual(sp.getprevious().get("CONTENT"), "cf")
 
-    def test_move_at_boundary_is_noop(self) -> None:
+    def test_multi_line_run_keeps_its_line_breaks(self) -> None:
+        self.page.move_words([self._w("cf"), self._w("1927")], self._w("Lone"))
+        self.assertEqual(self._text(), "Board\n\nLone\ncf\n1927\n")
+        tb2 = self.page.root.find(".//{*}TextBlock[@ID='P1_TB00002']")
+        ids = [tl.get("ID") for tl in tb2.findall("{*}TextLine")]
+        # "1927" was a whole line: it moved as that line, ID and all; "cf"
+        # was half a line and gets a fresh one.
+        self.assertEqual(ids, ["P1_TL00003", "P1_TL00004", "P1_TL00002"])
+        tl1 = self.page.root.find(".//{*}TextLine[@ID='P1_TL00001']")
+        self.assertEqual(_box(tl1), ("100", "100", "200", "60"))  # Board alone
+        self.assertEqual(tl1.findall("{*}SP"), [])
+        tb1 = self.page.root.find(".//{*}TextBlock[@ID='P1_TB00001']")
+        self.assertEqual(_box(tb1), ("100", "100", "200", "60"))
+
+    def test_multi_line_run_mid_line_splits_the_target_line(self) -> None:
+        self.page.move_words([self._w("1927"), self._w("Lone")], self._w("Board"))
+        self.assertEqual(self._text(), "Board\n1927\nLone\ncf\n")
+        tb1 = self.page.root.find(".//{*}TextBlock[@ID='P1_TB00001']")
+        self.assertEqual([tl.get("ID") for tl in tb1.findall("{*}TextLine")],
+                         ["P1_TL00001", "P1_TL00002", "P1_TL00003", "P1_TL00004"])
+        self.assertIsNone(self.page.root.find(".//{*}TextBlock[@ID='P1_TB00002']"))
+
+    def test_non_contiguous_run_moves_as_lines(self) -> None:
+        # A column: words that are not next to each other in reading order
+        # because Tesseract's lines run across both columns.
+        self.page.move_words([self._w("cf"), self._w("Lone")], self._w("1927"))
+        self.assertEqual(self._text(), "Board\n1927\ncf\nLone\n")
+        tb1 = self.page.root.find(".//{*}TextBlock[@ID='P1_TB00001']")
+        self.assertEqual([tl.get("ID") for tl in tb1.findall("{*}TextLine")],
+                         ["P1_TL00001", "P1_TL00002", "P1_TL00004", "P1_TL00003"])
+
+    def test_nudge_steps_one_word(self) -> None:
+        self.assertIsNotNone(self.page.nudge_words([self._w("1927")], -1))
+        self.assertEqual(self._text(), "Board 1927 cf\n\nLone\n")
+        self.assertIsNotNone(self.page.nudge_words([self._w("1927")], +1))
+        self.assertEqual(self._text(), "Board cf 1927\n\nLone\n")
+
+    def test_nudge_to_the_page_start(self) -> None:
+        self.assertIsNotNone(self.page.nudge_words([self._w("cf")], -1))
+        self.assertEqual(self._text(), "cf Board\n1927\n\nLone\n")
+
+    def test_nudge_at_page_edges_is_noop(self) -> None:
         before = etree.tostring(self.page.root)
-        blocks = self.page.flow_children()
-        self.assertFalse(self.page.move_element(blocks[0], -1))
-        self.assertFalse(self.page.move_element(blocks[-1], +1))
-        self.assertFalse(self.page.move_element(blocks[0], 0))
+        self.assertIsNone(self.page.nudge_words([self._w("Board")], -1))
+        self.assertIsNone(self.page.nudge_words([self._w("Lone")], +1))
+        self.assertIsNone(self.page.nudge_words([self._w("cf")], 0))
+        self.assertEqual(etree.tostring(self.page.root), before)
+        self.assertFalse(self.page.dirty)
+
+    def test_already_in_place_is_noop(self) -> None:
+        before = etree.tostring(self.page.root)
+        self.assertIsNone(self.page.move_words([self._w("cf")], self._w("Board")))
+        self.assertIsNone(self.page.move_words([self._w("Board")], None))
+        self.assertIsNone(self.page.move_words([], self._w("Board")))
+        self.assertEqual(etree.tostring(self.page.root), before)
         self.assertFalse(self.page.dirty)
         self.assertEqual(self.page.session_moves, 0)
-        self.assertEqual(etree.tostring(self.page.root), before)
 
-    def test_move_preserves_geometry_ids_and_sps(self) -> None:
-        before = _geometry_snapshot(self.page.root)
-        self.page.move_element(self.page.flow_children()[1], -1)
-        self.assertEqual(_geometry_snapshot(self.page.root), before)
-        self.assertEqual(len(self.page.root.findall(".//{*}SP")), 1)
+    def test_target_inside_the_run_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            self.page.move_words([self._w("Board"), self._w("cf")], self._w("cf"))
 
-    def test_undo_move_restores_order_and_count(self) -> None:
-        tb2 = self.page.flow_children()[1]
-        self.page.move_element(tb2, -1)
-        self.assertTrue(self.page.undo_move(tb2, -1))
-        self.assertEqual(alto_to_text(self.page.root),
-                         "Board cf\n1927\n\nLone\n")
+    def test_undo_is_byte_exact_in_reverse_order(self) -> None:
+        original = etree.tostring(self.page.root)
+        moves = [
+            self.page.move_words([self._w("Lone")], self._w("Board")),
+            self.page.move_words([self._w("cf"), self._w("1927")], None),
+            self.page.nudge_words([self._w("Board")], +1),
+        ]
+        self.assertEqual(self.page.session_moves, 3)
+        for move in reversed(moves):
+            self.page.undo_move_words(move)
+        self.assertEqual(etree.tostring(self.page.root), original)
         self.assertEqual([w.content for w in self.page.words],
                          ["Board", "cf", "1927", "Lone"])
         self.assertEqual(self.page.session_moves, 0)
-        self.assertTrue(self.page.dirty)  # like revert_word: reload is the full reset
+        self.assertFalse(self.page.settle())
 
-    def test_flow_children_levels(self) -> None:
-        blocks = self.page.flow_children()
-        self.assertEqual([b.get("ID") for b in blocks],
-                         ["P1_TB00001", "P1_TB00002"])
-        lines = self.page.flow_children(blocks[0])
-        self.assertEqual([tl.get("ID") for tl in lines],
-                         ["P1_TL00001", "P1_TL00002"])
-        # No PrintSpace (skeleton edge case) -> no flow, not an error.
-        ps = self.page.page.find("{*}PrintSpace")
-        self.page.page.remove(ps)
-        self.assertEqual(self.page.flow_children(), [])
+    def test_words_stay_usable_across_move_and_undo(self) -> None:
+        cf = self._w("cf")
+        move = self.page.move_words([cf], self._w("Lone"))
+        self.page.edit_word(cf, "of")
+        self.assertEqual(self._text(), "Board\n1927\n\nLone of\n")
+        self.page.revert_word(cf, "cf", 0.40)
+        self.page.undo_move_words(move)
+        self.assertEqual(self._text(), "Board cf\n1927\n\nLone\n")
 
-    def test_box_px_of_and_text_preview(self) -> None:
-        tb1 = self.page.flow_children()[0]
-        x, y, w, h = self.page.box_px_of(tb1)
-        self.assertAlmostEqual(x, 100 * _SX, places=3)
-        self.assertAlmostEqual(y, 100 * _SY, places=3)
-        self.assertAlmostEqual(w, 800 * _SX, places=3)
-        self.assertAlmostEqual(h, 200 * _SY, places=3)
-        self.assertEqual(self.page.text_preview(tb1), "Board cf 1927")
-        self.assertEqual(self.page.text_preview(tb1, limit=8), "Board cf…")
+    def test_save_records_moves_and_writes_new_order(self) -> None:
+        self.page.edit_word(self._w("cf"), "of")
+        self.page.move_words([self._w("Lone")], None)
+        txt_path = self.page.save()
+        body = self.alto.read_text(encoding="utf-8")
+        self.assertIn("human review: 1 word(s) corrected; "
+                      "1 reading-order change(s)", body)
+        self.assertEqual(txt_path.read_text(encoding="utf-8"),
+                         "Lone Board of\n1927\n")
+        # A later session accumulates the count — the "(\d+) word" parse
+        # survives the appended clause.
+        reopened = ReviewPage(self.alto, _IMG_SIZE)
+        reopened.nudge_words([reopened.words[0]], +1)
+        reopened.save()
+        body = self.alto.read_text(encoding="utf-8")
+        self.assertIn("human review: 1 word(s) corrected; "
+                      "2 reading-order change(s)", body)
+        self.assertEqual(body.count('<Processing ID="review">'), 1)
+
+    def test_moves_only_session_gets_provenance(self) -> None:
+        self.page.move_words([self._w("Lone")], None)
+        self.page.save()
+        body = self.alto.read_text(encoding="utf-8")
+        self.assertIn("human review: 0 word(s) corrected; "
+                      "1 reading-order change(s)", body)
+        # A reordered page is protected from re-OCR like any reviewed page.
+        self.assertTrue(has_review_provenance(self.alto))
+        # PC is order-independent: mean(0.96, 0.40, 0.85) -> 0.74 as loaded.
+        self.assertIn('PC="0.74"', body)
+
+    def test_no_moves_keeps_legacy_wording(self) -> None:
+        self.page.edit_word(self.page.words[1], "of")
+        self.page.save()
+        body = self.alto.read_text(encoding="utf-8")
+        self.assertIn("human review: 1 word(s) corrected", body)
+        self.assertNotIn("reading-order", body)
 
 
 class MoveComposedBlockTests(unittest.TestCase):
@@ -756,68 +854,28 @@ class MoveComposedBlockTests(unittest.TestCase):
         self.alto.write_text(_ALTO_CB, encoding="utf-8")
         self.page = ReviewPage(self.alto, _IMG_SIZE)
 
-    def test_composedblock_moves_as_unit(self) -> None:
-        flow = self.page.flow_children()
-        self.assertEqual([f.get("ID") for f in flow],
-                         ["P1_CB00001", "P1_TB00003"])
-        self.assertTrue(self.page.move_element(flow[0], +1))
-        self.assertEqual(alto_to_text(self.page.root),
-                         "Gamma\n\nAlpha\n\nBeta\n")
-        self.assertEqual([w.content for w in self.page.words],
-                         ["Gamma", "Alpha", "Beta"])
-
-    def test_blocks_reorder_inside_composedblock(self) -> None:
-        cb = self.page.flow_children()[0]
-        inner = self.page.flow_children(cb)
-        self.assertEqual([b.get("ID") for b in inner],
-                         ["P1_TB00001", "P1_TB00002"])
-        self.assertTrue(self.page.move_element(inner[1], -1))
-        self.assertEqual(alto_to_text(self.page.root),
-                         "Beta\n\nAlpha\n\nGamma\n")
+    def test_emptied_block_inside_composedblock_cascades_and_refits(self) -> None:
+        original = etree.tostring(self.page.root)
+        beta = next(w for w in self.page.words if w.content == "Beta")
+        gamma = next(w for w in self.page.words if w.content == "Gamma")
+        move = self.page.move_words([beta], gamma)
+        self.assertEqual(alto_to_text(self.page.root), "Alpha\n\nGamma Beta\n")
+        cb = self.page.root.find(".//{*}ComposedBlock")
+        self.assertEqual([tb.get("ID") for tb in cb.findall("{*}TextBlock")],
+                         ["P1_TB00001"])
+        self.assertEqual(_box(cb), ("100", "100", "800", "100"))
+        self.page.undo_move_words(move)
+        self.assertEqual(etree.tostring(self.page.root), original)
 
 
-class MoveSaveTests(_PageFixture):
-    def test_save_after_moves_stamps_both_counts(self) -> None:
-        by_content = {w.content: w for w in self.page.words}
-        self.page.edit_word(by_content["cf"], "of")
-        tb2 = self.page.flow_children()[1]
-        self.page.move_element(tb2, -1)
-        self.page.move_element(tb2, +1)  # two moves, back where it started
-        txt_path = self.page.save()
-        body = self.alto.read_text(encoding="utf-8")
-        self.assertIn("human review: 1 word(s) corrected; "
-                      "2 reading-order change(s)", body)
-        self.assertEqual(txt_path.read_text(encoding="utf-8"),
-                         "Board of\n1927\n\nLone\n")
-        # A later session accumulates both counts — the "(\d+) word" parse
-        # survives the appended clause.
-        reopened = ReviewPage(self.alto, _IMG_SIZE)
-        reopened.move_element(reopened.flow_children()[1], -1)
-        reopened.save()
-        body = self.alto.read_text(encoding="utf-8")
-        self.assertIn("human review: 1 word(s) corrected; "
-                      "3 reading-order change(s)", body)
-        self.assertEqual(body.count('<Processing ID="review">'), 1)
-
-    def test_moves_only_session_gets_provenance(self) -> None:
-        self.page.move_element(self.page.flow_children()[1], -1)
-        txt_path = self.page.save()
-        body = self.alto.read_text(encoding="utf-8")
-        self.assertIn("human review: 0 word(s) corrected; "
-                      "1 reading-order change(s)", body)
-        # A reordered page is protected from re-OCR like any reviewed page.
-        self.assertTrue(has_review_provenance(self.alto))
-        # PC is order-independent: mean(0.96, 0.40, 0.85) -> 0.74 as loaded.
-        self.assertIn('PC="0.74"', body)
-        self.assertEqual(txt_path.read_text(encoding="utf-8"),
-                         "Lone\n\nBoard cf\n1927\n")
-
-    def test_no_moves_keeps_legacy_wording(self) -> None:
-        self.page.edit_word(self.page.words[1], "of")
-        self.page.save()
-        body = self.alto.read_text(encoding="utf-8")
-        self.assertIn("human review: 1 word(s) corrected", body)
-        self.assertNotIn("reading-order", body)
+class TranscriptSpansTests(unittest.TestCase):
+    def test_spans_index_the_rendered_text(self) -> None:
+        root = etree.fromstring(_ALTO.encode())
+        text, spans = transcript_spans(root)
+        self.assertEqual(text, alto_to_text(root))
+        self.assertEqual([(s.get("CONTENT"), text[a:b]) for s, a, b in spans],
+                         [("Board", "Board"), ("cf", "cf"),
+                          ("1927", "1927"), ("Lone", "Lone")])
 
 
 class AltoToTextTests(unittest.TestCase):
