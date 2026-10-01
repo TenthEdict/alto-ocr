@@ -180,8 +180,8 @@ Contents
       (red = low, green = high). The list keeps its order while you
       work; re-tick "Worst first" to re-rank it.
     - "Flag below" chooses which words need review, as a percentage
-      (default 50%). Tick "All words" to show boxes for every word,
-      not just the flagged ones.
+      (default 50%). "All words" (on by default) draws a box around
+      every word; untick it to see only the flagged ones.
 
   Correcting words:
     - Click a word — or press n / p (or "Next ▶" / "◀ Prev") to step

@@ -286,7 +286,7 @@ class ReviewFrame(ttk.Frame):
         except (TypeError, ValueError):
             saved_threshold = DEFAULT_LOW_WC
         self.var_threshold = tk.StringVar(value=threshold_text(saved_threshold))
-        self.var_show_all = tk.BooleanVar(value=False)
+        self.var_show_all = tk.BooleanVar(value=True)
         self.var_add_mode = tk.BooleanVar(value=False)
         self.var_reorder_mode = tk.BooleanVar(value=False)
         self.var_zoom = tk.StringVar(value="Fit")
