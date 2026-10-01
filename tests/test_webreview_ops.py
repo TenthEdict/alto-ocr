@@ -5,8 +5,9 @@ indexes, duplicate word targets, empty edit text, malformed add boxes,
 clear combined with per-word ops), index-to-Word resolution *before* any
 mutation runs, per-op application and counting, the already-verified case
 being reported without inflating provenance, batch atomicity (a failing op
-leaves the file on disk untouched), the load-to-post concurrency token, and
-the JSON payload's coordinate frame.
+leaves the file on disk untouched), reading-order moves (move/nudge validation, batch order, no-op
+reporting, a deleted target refused, order_payload), the load-to-post
+concurrency token, and the JSON payload's coordinate frame.
 
 Run from the repo root:
 
@@ -320,6 +321,85 @@ class PagePayloadTests(_PageCase):
                                    alto_path=self.alto_path, low_wc=0.5)
         self.assertIn(0, payload["flagged"])
         self.assertIsNone(payload["words"][0]["wc"])
+
+
+class ReadingOrderOpsTests(_PageCase):
+    """move/nudge ride in the batch in order; the fixture's one line reads
+    "Board cf rnlnutes" (indices 0, 1, 2)."""
+
+    def apply(self, batch: list) -> tuple[ReviewPage, ops.ApplyReport, list]:
+        page = self.load()
+        load_words = list(page.words)
+        report = ops.apply_operations(page, ops.parse_operations(batch))
+        return page, report, load_words
+
+    def test_parse_validates_move_and_nudge(self) -> None:
+        bad = [
+            [{"op": "move", "indices": [], "after": 0}],
+            [{"op": "move", "indices": [1, 1], "after": 0}],
+            [{"op": "move", "indices": [True], "after": 0}],
+            [{"op": "move", "indices": [1], "after": -1}],
+            [{"op": "move", "indices": [1], "after": 1}],
+            [{"op": "move", "indices": [1]}, {"op": "clear"}],
+            [{"op": "nudge", "indices": [1], "delta": 2}],
+            [{"op": "nudge", "indices": [1], "delta": True}],
+        ]
+        for batch in bad:
+            with self.subTest(batch=batch), self.assertRaises(ops.OperationError):
+                ops.parse_operations(batch)
+        parsed = ops.parse_operations([
+            {"op": "move", "indices": [2], "after": None},
+            {"op": "nudge", "indices": [0], "delta": 1},
+            {"op": "edit", "index": 2, "text": "minutes"},  # same word: allowed
+        ])
+        self.assertEqual([(o.op, o.indices, o.after, o.delta) for o in parsed[:2]],
+                         [("move", (2,), None, 0), ("nudge", (0,), None, 1)])
+
+    def test_move_and_nudge_apply_in_batch_order(self) -> None:
+        page, report, _ = self.apply([
+            {"op": "move", "indices": [2], "after": None},
+            {"op": "nudge", "indices": [2], "delta": 1},
+        ])
+        self.assertEqual([w.content for w in page.words], ["Board", "rnlnutes", "cf"])
+        self.assertEqual(report.moved, 2)
+        self.assertTrue(report.changed)
+        self.assertIn("2 reading-order change(s)", report.summary())
+
+    def test_a_move_that_changes_nothing_is_reported_not_counted(self) -> None:
+        _, report, _ = self.apply([
+            {"op": "edit", "index": 0, "text": "Boards"},
+            {"op": "move", "indices": [1], "after": 0},  # already right after
+            {"op": "nudge", "indices": [0], "delta": -1},  # already first
+        ])
+        self.assertEqual(report.moved, 0)
+        self.assertEqual(report.noops, [1, 2])
+
+    def test_placing_after_a_deleted_word_is_refused(self) -> None:
+        with self.assertRaises(ops.OperationError):
+            self.apply([{"op": "delete", "index": 0},
+                        {"op": "move", "indices": [2], "after": 0}])
+
+    def test_moves_save_with_provenance(self) -> None:
+        page, _report, _ = self.apply([{"op": "move", "indices": [2], "after": None}])
+        txt = page.save()
+        self.assertEqual(txt.read_text(encoding="utf-8"), "rnlnutes Board cf\n")
+        self.assertIn("1 reading-order change(s)",
+                      self.alto_path.read_text(encoding="utf-8"))
+
+    def test_order_payload_reports_the_order_a_save_writes(self) -> None:
+        page, _report, load_words = self.apply([
+            {"op": "move", "indices": [0], "after": 2},
+            {"op": "add", "text": "of", "box": [700, 100, 90, 60]},
+        ])
+        payload = ops.order_payload(page, load_words)
+        self.assertEqual(payload["transcript"], "cf rnlnutes Board of\n")
+        order = payload["order"]
+        # Load-time indices survive the move; the added word has none.
+        self.assertEqual([o["i"] for o in order], [1, 2, 0, None])
+        self.assertEqual([payload["transcript"][o["start"]:o["end"]] for o in order],
+                         ["cf", "rnlnutes", "Board", "of"])
+        self.assertEqual({o["line"] for o in order}, {0})
+        self.assertEqual(order[2]["box"], [round(v, 2) for v in load_words[0].box_px])
 
 
 if __name__ == "__main__":

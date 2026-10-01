@@ -75,15 +75,25 @@
 
     <div class="canvas-wrap">
       <div class="toolbar">
+        <button id="page-prev" class="btn" title="Previous page in the list (Alt+Page Up)">◀ Page</button>
+        <button id="page-next" class="btn" title="Next page in the list (Alt+Page Down)">Page ▶</button>
+        <span class="sep"></span>
+        <button id="zoom-out" class="btn" title="Zoom out (Ctrl+scroll)">−</button>
+        <select id="zoom" title="Zoom — or Ctrl+scroll on the scan"></select>
+        <button id="zoom-in" class="btn" title="Zoom in (Ctrl+scroll)">+</button>
+        <span class="sep"></span>
+        <label class="check" title="Words the OCR was less confident about than this are flagged for review">
+          Flag below <select id="threshold"></select></label>
+        <label class="check" title="Outline every word, not only the flagged ones">
+          <input type="checkbox" id="show-all"> All words</label>
+      </div>
+      <div class="toolbar">
         <button id="prev-flag" class="btn" title="Previous flagged word (p)">‹ Prev</button>
         <button id="next-flag" class="btn" title="Next flagged word (n)">Next ›</button>
+        <button id="undo" class="btn" title="Undo the last change on this page (Ctrl+Z)" disabled>Undo</button>
         <span class="sep"></span>
-        <button id="zoom-out" class="btn" title="Zoom out">−</button>
-        <span id="zoom-label" class="muted mono">fit</span>
-        <button id="zoom-in" class="btn" title="Zoom in">+</button>
-        <button id="zoom-fit" class="btn">Fit</button>
-        <span class="sep"></span>
-        <button id="add-mode" class="btn toggle" title="Add a missed word (a)">+ Add word</button>
+        <button id="add-mode" class="btn toggle" title="Add a word the OCR missed (a)">+ Add word</button>
+        <button id="order-mode" class="btn toggle" title="Fix the order the words are read in (r)">Reading order</button>
         <button id="clear-page" class="btn danger">Clear page</button>
         <span class="spacer"></span>
         <span id="pending" class="pending"></span>
@@ -105,7 +115,7 @@
             <span id="ed-pos" class="muted mono"></span>
           </div>
           <input id="ed-text" type="text" autocomplete="off" spellcheck="false">
-          <div class="symbols">
+          <div id="symbols" class="symbols">
             <div class="symbol-tabs" id="symbol-tabs"></div>
             <div class="glyphs" id="glyphs"></div>
           </div>
@@ -113,8 +123,10 @@
         <div class="editor-actions">
           <button id="ed-commit" class="btn primary" title="Enter">Correct &amp; next</button>
           <button id="ed-confirm" class="btn" title="The OCR is right">Confirm</button>
-          <button id="ed-delete" class="btn danger" title="Hallucinated word">Delete</button>
+          <button id="ed-delete" class="btn danger" title="Remove a word the OCR made up (Ctrl+Z puts it back)">Delete</button>
           <button id="ed-cancel" class="btn ghost" title="Esc">Close</button>
+          <label class="check" title="Show the keyboard of characters a US keyboard lacks">
+            <input type="checkbox" id="symbols-on"> Symbols</label>
         </div>
       </div>
 
@@ -133,6 +145,19 @@
 
       <p id="page-status" class="status"></p>
     </div>
+
+    <aside id="order-panel" class="orderpanel" hidden>
+      <h2>Reading order</h2>
+      <p id="order-hint" class="muted"></p>
+      <div class="row">
+        <button id="order-earlier" class="btn" title="One word earlier (Ctrl+↑)">▲ Earlier</button>
+        <button id="order-later" class="btn" title="One word later (Ctrl+↓)">▼ Later</button>
+        <button id="order-start" class="btn" title="Make the selection the first words on the page">⤒ Page start</button>
+        <button id="order-clear" class="btn ghost" title="Clear the selection (Esc)">Clear</button>
+      </div>
+      <div class="muted small">Transcript — as it will be saved</div>
+      <div id="order-text" class="ordertext"></div>
+    </aside>
   </section>
 </template>
 
