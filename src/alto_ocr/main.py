@@ -887,7 +887,7 @@ def doctor(
 
     # Python deps are the only hard requirement.
     dep_failed = False
-    for dep in ("cv2", "PIL", "numpy", "lxml", "typer", "rich"):
+    for dep in ("cv2", "PIL", "numpy", "lxml", "pypdfium2", "typer", "rich"):
         try:
             __import__(dep)
             console.print(f"[green]OK[/green] {dep}")

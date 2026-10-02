@@ -1,3 +1,3 @@
 """alto_ocr — TIF page scans → METS/ALTO XML + plain-text transcripts."""
 
-__version__ = "0.10.1"
+__version__ = "0.10.2"
