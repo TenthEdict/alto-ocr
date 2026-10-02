@@ -18,9 +18,11 @@ be restarted at any moment without a corrector losing saved work.
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
+from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
@@ -56,6 +58,17 @@ def create_app(config: ReviewServerConfig) -> FastAPI:
     index = ObjectIndex(config)
     stats = StatsCache(low_wc=config.low_wc)
 
+    # One lock per ALTO file, held from the concurrency-token check to the
+    # write. Saves now run on FastAPI's worker threads, so two posts for the
+    # same page could otherwise both pass check_token before either writes,
+    # and the second would silently overwrite the first.
+    page_locks: dict[Path, threading.Lock] = {}
+    page_locks_guard = threading.Lock()
+
+    def _page_lock(alto_path: Path) -> threading.Lock:
+        with page_locks_guard:
+            return page_locks.setdefault(alto_path, threading.Lock())
+
     # ---------- helpers ------------------------------------------------
 
     def _object(ref_id: str) -> ReviewObject:
@@ -83,7 +96,8 @@ def create_app(config: ReviewServerConfig) -> FastAPI:
             wc = imaging.working_copy(image, config.cache_dir, max_px=config.working_px)
         except OSError as e:
             raise HTTPException(500, f"Could not read the scan {image.name}: {e}") from e
-        imaging.prune_cache(config.cache_dir, max_bytes=CACHE_MAX_BYTES)
+        if wc.fresh:  # a cache hit cannot have grown the cache
+            imaging.prune_cache(config.cache_dir, max_bytes=CACHE_MAX_BYTES)
         return wc
 
     def _load_page(obj: ReviewObject, stem: str) -> tuple[ReviewPage, Path]:
@@ -182,15 +196,17 @@ def create_app(config: ReviewServerConfig) -> FastAPI:
         return ops.page_payload(page, stem=stem, alto_path=alto_path,
                                 low_wc=config.low_wc)
 
+    # The two POST handlers below are plain ``def`` on purpose: FastAPI runs
+    # those on a worker thread, while an ``async def`` runs on the event
+    # loop -- and these decode scans, parse ALTO and write over SMB, so as
+    # coroutines one corrector's save would freeze every other corrector's
+    # requests. A body that is not JSON at all is FastAPI's 422.
+
     @app.post("/api/objects/{ref_id}/pages/{stem}")
-    async def api_save(ref_id: str, stem: str, request: Request) -> dict:
+    def api_save(ref_id: str, stem: str, body: Any = Body(None)) -> dict:
         if config.read_only:
             raise HTTPException(403, "This review server is running read-only.")
         obj = _object(ref_id)
-        try:
-            body = await request.json()
-        except ValueError as e:
-            raise HTTPException(400, f"Body is not JSON: {e}") from e
         if not isinstance(body, dict):
             raise HTTPException(400, "Body must be a JSON object.")
 
@@ -201,6 +217,11 @@ def create_app(config: ReviewServerConfig) -> FastAPI:
             raise HTTPException(400, str(e)) from e
 
         alto_path = _alto(obj, stem)
+        with _page_lock(alto_path):
+            return _save_locked(obj, stem, alto_path, body, operations, force)
+
+    def _save_locked(obj: ReviewObject, stem: str, alto_path: Path, body: dict,
+                     operations: list[ops.Operation], force: bool) -> dict:
         if not force:
             try:
                 ops.check_token(alto_path, body.get("token"))
@@ -241,16 +262,13 @@ def create_app(config: ReviewServerConfig) -> FastAPI:
         }
 
     @app.post("/api/objects/{ref_id}/pages/{stem}/preview")
-    async def api_preview(ref_id: str, stem: str, request: Request) -> dict:
+    def api_preview(ref_id: str, stem: str, body: Any = Body(None)) -> dict:
         """Apply a batch to a throwaway load and report the reading order and
         transcript it produces. Writes nothing, so it is open in read-only
-        mode too. The browser's reading-order view comes from here, so the
-        order it shows is the order ``remediate.move_words`` will save."""
+        mode too (and needs no page lock). The browser's reading-order view
+        comes from here, so the order it shows is the order
+        ``remediate.move_words`` will save."""
         obj = _object(ref_id)
-        try:
-            body = await request.json()
-        except ValueError as e:
-            raise HTTPException(400, f"Body is not JSON: {e}") from e
         if not isinstance(body, dict):
             raise HTTPException(400, "Body must be a JSON object.")
         try:
