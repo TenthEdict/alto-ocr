@@ -376,6 +376,22 @@ def process_ref_id(
             dpi=effective_preprocess.min_dpi,
         )
 
+        # The old METS fingerprints the ALTO this loop is about to replace,
+        # and is only rebuilt once every page is done. A run that dies part
+        # way (Ctrl+C, crash, GUI closed mid-object) would leave pages that
+        # no longer match it — which the drift guard above then reads as
+        # human edits, refusing the next run and, via repackage, stamping
+        # engine output as reviewed. Removing it now means an interrupted
+        # run leaves no stale fingerprint; the guard has already done its
+        # job by this point. (A --no-mets re-run removes it too: it would
+        # be stale for the same reason.)
+        stale_mets = out_dir / f"{inputs.ref_id}.mets.xml"
+        try:
+            stale_mets.unlink()
+            logger.debug("[%s] removed previous METS before re-run", inputs.ref_id)
+        except FileNotFoundError:
+            pass
+
         for idx, page in enumerate(pages, start=1):
             src_tif = page.real_path
             stem = page.stem
