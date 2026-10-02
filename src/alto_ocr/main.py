@@ -271,6 +271,10 @@ GLMOCRNumPredictOpt = typer.Option(
 LangOpt = typer.Option("eng", "--ocr-lang", help="Tesseract language code, e.g. 'eng', 'fra', 'eng+lat'.")
 PsmOpt = typer.Option(3, "--psm", help="Tesseract page segmentation mode (3=auto, 4=column, 6=block).")
 OemOpt = typer.Option(3, "--oem", help="Tesseract OCR engine mode (3=default LSTM).")
+TesseractTimeoutOpt = typer.Option(
+    OCROptions().timeout_s, "--tesseract-timeout", min=1,
+    help="Per-page Tesseract time limit in seconds. A page that exceeds it gets a "
+         "failure stub and the run moves on.")
 MinDpiOpt = typer.Option(300, "--min-dpi", help="Upscale low-DPI scans to at least this DPI before OCR.")
 NoDeskewOpt = typer.Option(False, "--no-deskew", help="Skip deskew stage.")
 NoDenoiseOpt = typer.Option(False, "--no-denoise", help="Skip bilateral denoise stage.")
@@ -325,6 +329,7 @@ def process(
     ocr_lang: str = LangOpt,
     psm: int = PsmOpt,
     oem: int = OemOpt,
+    tesseract_timeout: int = TesseractTimeoutOpt,
     min_dpi: int = MinDpiOpt,
     no_deskew: bool = NoDeskewOpt,
     no_denoise: bool = NoDenoiseOpt,
@@ -356,7 +361,8 @@ def process(
         raise typer.Exit(code=1)
     inputs = found
 
-    options = OCROptions(language=ocr_lang, psm=psm, oem=oem)
+    options = OCROptions(language=ocr_lang, psm=psm, oem=oem,
+                         timeout_s=tesseract_timeout)
     engine_obj = _build_engine(
         engine,
         tesseract_path=tesseract_path,
@@ -477,6 +483,7 @@ def batch(
     ocr_lang: str = LangOpt,
     psm: int = PsmOpt,
     oem: int = OemOpt,
+    tesseract_timeout: int = TesseractTimeoutOpt,
     min_dpi: int = MinDpiOpt,
     no_deskew: bool = NoDeskewOpt,
     no_denoise: bool = NoDenoiseOpt,
@@ -503,7 +510,8 @@ def batch(
     for sk in skipped:
         console.print(f"[red]SKIPPED {sk.ref_id}:[/red] {sk.reason}")
 
-    options = OCROptions(language=ocr_lang, psm=psm, oem=oem)
+    options = OCROptions(language=ocr_lang, psm=psm, oem=oem,
+                         timeout_s=tesseract_timeout)
     engine_obj = _build_engine(
         engine,
         tesseract_path=tesseract_path,

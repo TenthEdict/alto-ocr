@@ -104,6 +104,7 @@ def parse_advanced(raw: Mapping[str, object]) -> dict:
     min_dpi = whole_number("min_dpi", "Min DPI")
     psm = whole_number("psm", "PSM")
     oem = whole_number("oem", "OEM")
+    tess_timeout = whole_number("tesseract_timeout", "Tesseract timeout")
     glmocr_timeout = whole_number("glmocr_timeout", "GLMOCR timeout")
     if min_dpi <= 0:
         raise SettingsError("Min DPI must be positive.")
@@ -111,6 +112,8 @@ def parse_advanced(raw: Mapping[str, object]) -> dict:
         raise SettingsError("PSM must be between 0 and 13.")
     if not 0 <= oem <= 3:
         raise SettingsError("OEM must be between 0 and 3.")
+    if tess_timeout <= 0:
+        raise SettingsError("Tesseract timeout must be positive.")
     if glmocr_timeout <= 0:
         raise SettingsError("GLMOCR timeout must be positive.")
 
@@ -139,7 +142,7 @@ def parse_advanced(raw: Mapping[str, object]) -> dict:
         debug_preprocessed_dir=Path(debug_str).expanduser() if debug_str else None,
         ocr_options=OCROptions(
             language=str(raw.get("ocr_lang", "") or "").strip() or "eng",
-            psm=psm, oem=oem),
+            psm=psm, oem=oem, timeout_s=tess_timeout),
         glmocr_endpoint=str(raw.get("glmocr_endpoint", "") or "").strip() or None,
         glmocr_model=(str(raw.get("glmocr_model", "") or "").strip()
                       or GLMOCRConfig().model),
@@ -167,6 +170,7 @@ def advanced_settings(adv: Mapping[str, object]) -> dict:
         "ocr_lang": oo.language,
         "psm": oo.psm,
         "oem": oo.oem,
+        "tesseract_timeout": oo.timeout_s,
         "glmocr_endpoint": adv["glmocr_endpoint"] or "",
         "glmocr_model": adv["glmocr_model"],
         "glmocr_timeout": adv["glmocr_timeout"],
@@ -288,6 +292,8 @@ class AltoOcrApp:
         self.var_ocr_lang = tk.StringVar(value=str(s.get("ocr_lang", oo.language)))
         self.var_psm = tk.StringVar(value=str(s.get("psm", oo.psm)))
         self.var_oem = tk.StringVar(value=str(s.get("oem", oo.oem)))
+        self.var_tess_timeout = tk.StringVar(
+            value=str(s.get("tesseract_timeout", oo.timeout_s)))
         self.var_glmocr_endpoint = tk.StringVar(value=str(s.get("glmocr_endpoint", "")))
         self.var_glmocr_model = tk.StringVar(value=str(s.get("glmocr_model", gc.model)))
         self.var_glmocr_timeout = tk.StringVar(value=str(s.get("glmocr_timeout", gc.timeout_s)))
@@ -555,6 +561,9 @@ class AltoOcrApp:
              ttk.Spinbox(tess, from_=0, to=3, increment=1,
                          textvariable=self.var_oem, width=6),
              "3=default LSTM (recommended)."),
+            ("Timeout per page (s):",
+             ttk.Entry(tess, textvariable=self.var_tess_timeout, width=8),
+             "A page taking longer is recorded as failed and the run moves on."),
         ), start=2):
             ttk.Label(tess, text=label).grid(row=row, column=0, sticky="w",
                                              padx=(0, 8), pady=(4, 0))
@@ -642,6 +651,7 @@ class AltoOcrApp:
             "ocr_lang": self.var_ocr_lang.get(),
             "psm": self.var_psm.get(),
             "oem": self.var_oem.get(),
+            "tesseract_timeout": self.var_tess_timeout.get(),
             "glmocr_endpoint": self.var_glmocr_endpoint.get(),
             "glmocr_model": self.var_glmocr_model.get(),
             "glmocr_timeout": self.var_glmocr_timeout.get(),
@@ -662,6 +672,7 @@ class AltoOcrApp:
         self.var_ocr_lang.set(oo.language)
         self.var_psm.set(str(oo.psm))
         self.var_oem.set(str(oo.oem))
+        self.var_tess_timeout.set(str(oo.timeout_s))
         self.var_glmocr_endpoint.set("")
         self.var_glmocr_model.set(gc.model)
         self.var_glmocr_timeout.set(str(gc.timeout_s))
