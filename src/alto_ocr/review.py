@@ -110,7 +110,7 @@ from .remediate import (
     repackage_object,
     transcript_spans,
 )
-from .triage import DEFAULT_LOW_WC, STATUS_RANK, scan_alto_file
+from .triage import DEFAULT_LOW_WC, STATUS_RANK, scan_alto_file_safe
 from .walker import natural_chunks, natural_key
 from .widgets import Detachable, SymbolKeyboard, Tooltip
 
@@ -682,7 +682,7 @@ class ReviewFrame(ttk.Frame):
         self._pages = []
         missing = 0
         for xml in sorted(alto_dir.glob("*.xml"), key=natural_key):
-            info = scan_alto_file(xml)
+            info = scan_alto_file_safe(xml)
             self._pages.append((xml.stem, info.pc, info.status))
             if xml.stem not in self._img_index:
                 missing += 1
@@ -1650,7 +1650,7 @@ class ReviewFrame(ttk.Frame):
         self.btn_save.configure(state="disabled")
         # Refresh this page's PC in the list (save recomputed it) — in its
         # row, without re-ranking the list under the corrector.
-        info = scan_alto_file(self._page.alto_path)
+        info = scan_alto_file_safe(self._page.alto_path)
         self._pages = [
             (stem, info.pc if stem == self._stem else pc,
              info.status if stem == self._stem else status)

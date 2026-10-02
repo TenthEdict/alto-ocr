@@ -371,6 +371,16 @@ class ReviewTabTests(ReviewFixture):
         self.assertIn("Transcript Folder:", found)
         self.assertNotIn("Output object:", found)
 
+    def test_corrupt_alto_lists_as_failed_instead_of_crashing(self) -> None:
+        # Truncated ALTO is realistic: Tesseract writes its own ALTO
+        # non-atomically, so a crash mid-write leaves half a file.
+        (self.obj / "ALTO" / "p4.xml").write_text("<alto><Layout", encoding="utf-8")
+        self.rv.load_object()
+        self.assertEqual(self.rv._sorted_stems[0], "p4")  # failed sorts first
+        self.assertEqual(self.rv.lst_pages.get(0),
+                         self.rv._page_label("p4", None, "failed"))
+        self.assertEqual(len(self.rv._sorted_stems), 4, "the other pages still list")
+
     def test_page_list_and_labels_show_percentages(self) -> None:
         self.assertEqual(self.rv._sorted_stems, ["p3", "p1", "p2"])  # worst first
         self.assertEqual(self.rv.lst_pages.get(0), "p3   30%")

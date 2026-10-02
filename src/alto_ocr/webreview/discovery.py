@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..remediate import has_review_provenance, index_source_images, iter_object_dirs
-from ..triage import DEFAULT_LOW_WC, STATUS_RANK, scan_alto_file
+from ..triage import DEFAULT_LOW_WC, STATUS_RANK, scan_alto_file_safe
 from ..walker import IMAGE_SUFFIXES, JUNK_NAMES, natural_chunks
 from .config import ReviewServerConfig
 
@@ -346,17 +346,13 @@ def scan_object(obj: ReviewObject, image_index: dict[str, Path], *,
     for alto_path in sorted(obj.alto_dir.glob("*.xml")):
         stem = alto_path.stem
         has_image = stem in image_index
-        try:
-            conf = scan_alto_file(alto_path, low_wc=low_wc)
-            reviewed = has_review_provenance(alto_path)
-            state = PageState(
-                stem=stem, status=conf.status, pc=conf.pc, words=conf.words,
-                low_words=conf.low_words, reviewed=reviewed, has_image=has_image,
-            )
-        except Exception as e:                      # noqa: BLE001 -- see docstring
-            logger.warning("Could not scan %s (%s)", alto_path, e)
-            state = PageState(stem=stem, status="failed", pc=None, words=0,
-                              low_words=0, reviewed=False, has_image=has_image)
+        conf = scan_alto_file_safe(alto_path, low_wc=low_wc)
+        state = PageState(
+            stem=stem, status=conf.status, pc=conf.pc, words=conf.words,
+            low_words=conf.low_words,
+            # False for an unreadable file, which scans as failed above.
+            reviewed=has_review_provenance(alto_path), has_image=has_image,
+        )
         pages.append(state)
         stats.pages += 1
         stats.words += state.words
