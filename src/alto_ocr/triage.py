@@ -212,6 +212,24 @@ def scan_alto_file(alto_path: Path, *, low_wc: float = DEFAULT_LOW_WC) -> PageCo
     return PageConfidence(alto_path.stem, status, pc, words, scored, low, wc_sum)
 
 
+def scan_alto_file_safe(alto_path: Path, *,
+                        low_wc: float = DEFAULT_LOW_WC) -> PageConfidence:
+    """``scan_alto_file`` that classifies an unreadable file as ``failed``
+    instead of raising.
+
+    Every caller that lists pages — the triage report, the Tk Review tab,
+    the browser review's discovery — goes through this, so one corrupt ALTO
+    (truncated by a crash: Tesseract writes its ALTO non-atomically) shows
+    up as a ``failed`` page at the top of the queue rather than taking the
+    whole object down with it.
+    """
+    try:
+        return scan_alto_file(alto_path, low_wc=low_wc)
+    except Exception as e:  # noqa: BLE001 - one bad file must not kill the listing
+        logger.warning("could not parse %s (%s); counting as failed", alto_path, e)
+        return PageConfidence(alto_path.stem, "failed", None, 0, 0, 0, 0.0)
+
+
 def scan_object(
     object_dir: Path,
     *,
@@ -229,12 +247,7 @@ def scan_object(
         return None
     obj = ObjectConfidence(ref_id=object_dir.name, review_pc=review_pc)
     for alto_path in sorted(alto_dir.glob("*.xml"), key=natural_key):
-        try:
-            obj.pages.append(scan_alto_file(alto_path, low_wc=low_wc))
-        except Exception as e:  # noqa: BLE001 - one bad file must not kill the report
-            logger.warning("triage: could not parse %s (%s); counting as failed",
-                           alto_path, e)
-            obj.pages.append(PageConfidence(alto_path.stem, "failed", None, 0, 0, 0, 0.0))
+        obj.pages.append(scan_alto_file_safe(alto_path, low_wc=low_wc))
     return obj
 
 

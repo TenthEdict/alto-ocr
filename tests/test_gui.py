@@ -82,7 +82,8 @@ class PureHelperTests(unittest.TestCase):
     def _raw(self, **over):
         raw = {"tesseract_path": "", "min_dpi": "300", "do_denoise": True,
                "do_clahe": True, "do_binarize": False, "debug_preprocessed": "",
-               "ocr_lang": "eng", "psm": "3", "oem": "3", "glmocr_endpoint": "",
+               "ocr_lang": "eng", "psm": "3", "oem": "3", "tesseract_timeout": "600",
+               "glmocr_endpoint": "",
                "glmocr_model": "", "glmocr_timeout": "120", "with_checksums": True}
         raw.update(over)
         return raw
@@ -91,6 +92,7 @@ class PureHelperTests(unittest.TestCase):
         adv = gui.parse_advanced(self._raw(psm="1", ocr_lang="  "))
         self.assertIsNone(adv["tesseract_path"])
         self.assertEqual(adv["ocr_options"].psm, 1)
+        self.assertEqual(adv["ocr_options"].timeout_s, 600)
         self.assertEqual(adv["ocr_options"].language, "eng")  # blank → default
         self.assertTrue(adv["glmocr_model"])                   # blank → default
         # The two frame-changing stages are never on, whatever was saved.
@@ -105,6 +107,8 @@ class PureHelperTests(unittest.TestCase):
                               ({"psm": "14"}, "PSM"),
                               ({"oem": "x"}, "OEM"),
                               ({"glmocr_timeout": "-5"}, "GLMOCR timeout"),
+                              ({"tesseract_timeout": "0"}, "Tesseract timeout"),
+                              ({"tesseract_timeout": "1.5"}, "Tesseract timeout"),
                               ({"tesseract_path": "C:/no/such/tesseract.exe"}, "Tesseract")):
             with self.subTest(over=over):
                 with self.assertRaisesRegex(gui.SettingsError, message):
@@ -124,6 +128,7 @@ class PureHelperTests(unittest.TestCase):
         self.assertIsNone(saved["do_deskew"])
         self.assertIsNone(saved["do_border_crop"])
         self.assertEqual(saved["psm"], 3)
+        self.assertEqual(saved["tesseract_timeout"], 600)
 
     def test_confidence_percentages(self) -> None:
         self.assertEqual(review.pct(0.87), "87%")
@@ -365,6 +370,16 @@ class ReviewTabTests(ReviewFixture):
         found = list(labels(self.rv))
         self.assertIn("Transcript Folder:", found)
         self.assertNotIn("Output object:", found)
+
+    def test_corrupt_alto_lists_as_failed_instead_of_crashing(self) -> None:
+        # Truncated ALTO is realistic: Tesseract writes its own ALTO
+        # non-atomically, so a crash mid-write leaves half a file.
+        (self.obj / "ALTO" / "p4.xml").write_text("<alto><Layout", encoding="utf-8")
+        self.rv.load_object()
+        self.assertEqual(self.rv._sorted_stems[0], "p4")  # failed sorts first
+        self.assertEqual(self.rv.lst_pages.get(0),
+                         self.rv._page_label("p4", None, "failed"))
+        self.assertEqual(len(self.rv._sorted_stems), 4, "the other pages still list")
 
     def test_page_list_and_labels_show_percentages(self) -> None:
         self.assertEqual(self.rv._sorted_stems, ["p3", "p1", "p2"])  # worst first

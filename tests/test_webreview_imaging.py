@@ -61,6 +61,9 @@ class WorkingCopyTests(unittest.TestCase):
         second = imaging.working_copy(self.scan, self.cache, max_px=600)
         self.assertEqual(second.path, first.path)
         self.assertEqual(second.path.stat().st_mtime_ns, stamp)
+        # Only a fresh render grows the cache, so only it triggers a prune.
+        self.assertTrue(first.fresh)
+        self.assertFalse(second.fresh)
 
     def test_replacing_the_scan_invalidates_the_render(self) -> None:
         """A rescan of a damaged page must not serve the old pixels under the

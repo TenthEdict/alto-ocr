@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.alto_ocr.pipeline import ALTO_FAILURE_STUB, PageResult, RefIdResult  # noqa: E402
 from src.alto_ocr.triage import (  # noqa: E402
     scan_alto_file,
+    scan_alto_file_safe,
     scan_object,
     scan_output_root,
     worst_pages,
@@ -109,6 +110,14 @@ class ScanAltoFileTests(unittest.TestCase):
         self.assertEqual(scan_alto_file(a / "page004.xml").status, "failed")
         b = self.root / "RefB" / "ALTO"
         self.assertEqual(scan_alto_file(b / "page001.xml").status, "unscored")
+
+    def test_safe_scan_classifies_unreadable_alto_as_failed(self) -> None:
+        bad = self.root / "RefA" / "ALTO" / "truncated.xml"
+        bad.write_text("<alto><Layout", encoding="utf-8")
+        p = scan_alto_file_safe(bad)
+        self.assertEqual((p.stem, p.status, p.pc, p.words), ("truncated", "failed", None, 0))
+        good = self.root / "RefA" / "ALTO" / "page002.xml"
+        self.assertEqual(scan_alto_file_safe(good), scan_alto_file(good))
 
     def test_scored_page_facts(self) -> None:
         p = scan_alto_file(self.root / "RefA" / "ALTO" / "page002.xml")

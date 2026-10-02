@@ -21,9 +21,11 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src.alto_ocr.webreview import discovery  # noqa: E402
 from src.alto_ocr.webreview.config import ReviewServerConfig  # noqa: E402
 from src.alto_ocr.webreview.discovery import (  # noqa: E402
     ObjectIndex,
@@ -224,7 +226,7 @@ class GoobiLayoutTests(unittest.TestCase):
         """A miss forces a rescan: a corrector following a link to an object
         created seconds ago must not get a 404."""
         index = ObjectIndex(ReviewServerConfig(goobi_metadata_root=self.root),
-                            ttl_seconds=9999)
+                            ttl_seconds=9999, miss_floor_seconds=0)
         self.assertEqual(len(index.objects()), 1)
         other = self.root / "1235" / "ocr" / "alto_ocr" / "MSP00084_1" / "ALTO"
         other.mkdir(parents=True)
@@ -266,6 +268,28 @@ class StandaloneLayoutTests(unittest.TestCase):
         index = ObjectIndex(ReviewServerConfig(
             goobi_metadata_root=meta, output_root=self.out, source_root=self.src))
         self.assertEqual(index.get("OBJ_A").process_id, "77")
+
+    def test_repeated_misses_do_not_rewalk_the_share(self) -> None:
+        """A stale bookmark retried in a loop must not re-walk the output
+        and metadata roots on every request: misses refresh at most once per
+        floor."""
+        clock = [100.0]
+        index = ObjectIndex(ReviewServerConfig(output_root=self.out, source_root=self.src),
+                            ttl_seconds=9999, miss_floor_seconds=2.0)
+        with mock.patch.object(discovery.time, "monotonic",
+                               side_effect=lambda: clock[0]):
+            index.objects()                      # initial walk at t=100
+            with mock.patch.object(index, "refresh",
+                                   wraps=index.refresh) as refresh:
+                clock[0] = 103.0
+                self.assertIsNone(index.get("NO_SUCH_OBJECT"))   # walks
+                clock[0] = 104.0
+                self.assertIsNone(index.get("NO_SUCH_OBJECT"))   # within floor
+                self.assertIsNone(index.get("NO_SUCH_OBJECT"))
+                self.assertEqual(refresh.call_count, 1)
+                clock[0] = 106.0
+                self.assertIsNone(index.get("NO_SUCH_OBJECT"))   # floor passed
+                self.assertEqual(refresh.call_count, 2)
 
 
 class ScanTests(unittest.TestCase):

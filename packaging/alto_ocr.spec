@@ -30,26 +30,19 @@ SRC_ROOT = PROJECT_ROOT / "src"
 block_cipher = None
 
 # Both analyses share the same import paths and hidden-import set; only
-# the entry script differs. The collect_submodules calls are belt-and-
-# suspenders for libs that PyInstaller's static analysis sometimes misses
-# (lxml in particular has a lot of dynamic dispatch).
+# the entry script differs. PyInstaller's bytecode scan follows every
+# static import, function-level ones included, so the alto_ocr modules need
+# no listing here: hiddenimports is for what the scan genuinely cannot see.
+# (It used to enumerate the package by hand and had fallen a whole
+# remediation phase behind -- a list nobody needs is a list that rots.)
 common_kwargs = dict(
     pathex=[str(SRC_ROOT), str(PROJECT_ROOT / "packaging")],
     binaries=[],
     datas=[],
     hiddenimports=[
-        "alto_ocr",
-        "alto_ocr.main",
-        "alto_ocr.gui",
-        "alto_ocr.pipeline",
-        "alto_ocr.ocr",
-        "alto_ocr.glmocr",
-        "alto_ocr.line_detect",
-        "alto_ocr.preprocess",
-        "alto_ocr.mets",
-        "alto_ocr.walker",
-        # PIL plugins for TIFF I/O — usually auto-detected, listed
-        # explicitly so a wheel rebuild can't silently drop them.
+        # Pillow registers format plugins lazily, by name, on first open --
+        # invisible to the scan. TIFF is the input; PNG/JPEG are the
+        # review tab's scans and the preprocess debug dumps.
         "PIL.TiffImagePlugin",
         "PIL.PngImagePlugin",
         "PIL.JpegImagePlugin",
@@ -66,6 +59,16 @@ common_kwargs = dict(
         "IPython",
         "jupyter",
         "pytest",
+        # The browser review server (serve-review) is a separate deployment
+        # with its own requirements-web.txt; the desktop bundle must not
+        # grow a web stack. main.py imports it lazily and reports a clean
+        # "needs its own dependencies" if it is absent -- but the bytecode
+        # scan would otherwise follow that import into fastapi/uvicorn on
+        # any build machine that happens to have them installed.
+        "alto_ocr.webreview",
+        "fastapi",
+        "starlette",
+        "uvicorn",
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

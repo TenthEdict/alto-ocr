@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..remediate import has_review_provenance, index_source_images, iter_object_dirs
-from ..triage import DEFAULT_LOW_WC, STATUS_RANK, scan_alto_file
+from ..triage import DEFAULT_LOW_WC, STATUS_RANK, scan_alto_file_safe
 from ..walker import IMAGE_SUFFIXES, JUNK_NAMES, natural_chunks
 from .config import ReviewServerConfig
 
@@ -259,9 +259,11 @@ class ObjectIndex:
     and far above the cost of the walk.
     """
 
-    def __init__(self, config: ReviewServerConfig, *, ttl_seconds: float = 20.0) -> None:
+    def __init__(self, config: ReviewServerConfig, *, ttl_seconds: float = 20.0,
+                 miss_floor_seconds: float = 2.0) -> None:
         self.config = config
         self.ttl_seconds = ttl_seconds
+        self.miss_floor_seconds = miss_floor_seconds
         self._objects: dict[str, ReviewObject] = {}
         self._loaded_at = 0.0
         self._image_indexes: dict[str, tuple[float, dict[str, Path]]] = {}
@@ -290,10 +292,17 @@ class ObjectIndex:
         return sorted(self._objects.values(), key=lambda o: natural_chunks(o.ref_id))
 
     def get(self, ref_id: str) -> ReviewObject | None:
-        """Look up a Ref ID that came from a URL. Never joins it to a path."""
+        """Look up a Ref ID that came from a URL. Never joins it to a path.
+
+        A miss re-walks the roots (the object may be new since the last
+        refresh), but not more often than ``miss_floor_seconds``: a stale
+        bookmark or a browser retrying a dead link would otherwise re-walk
+        the whole Goobi metadata share on every request.
+        """
         self.objects()
         obj = self._objects.get(ref_id)
-        if obj is None:
+        if obj is None and (
+                time.monotonic() - self._loaded_at) >= self.miss_floor_seconds:
             self.refresh()          # newly created object, or a stale index
             obj = self._objects.get(ref_id)
         return obj
@@ -346,17 +355,13 @@ def scan_object(obj: ReviewObject, image_index: dict[str, Path], *,
     for alto_path in sorted(obj.alto_dir.glob("*.xml")):
         stem = alto_path.stem
         has_image = stem in image_index
-        try:
-            conf = scan_alto_file(alto_path, low_wc=low_wc)
-            reviewed = has_review_provenance(alto_path)
-            state = PageState(
-                stem=stem, status=conf.status, pc=conf.pc, words=conf.words,
-                low_words=conf.low_words, reviewed=reviewed, has_image=has_image,
-            )
-        except Exception as e:                      # noqa: BLE001 -- see docstring
-            logger.warning("Could not scan %s (%s)", alto_path, e)
-            state = PageState(stem=stem, status="failed", pc=None, words=0,
-                              low_words=0, reviewed=False, has_image=has_image)
+        conf = scan_alto_file_safe(alto_path, low_wc=low_wc)
+        state = PageState(
+            stem=stem, status=conf.status, pc=conf.pc, words=conf.words,
+            low_words=conf.low_words,
+            # False for an unreadable file, which scans as failed above.
+            reviewed=has_review_provenance(alto_path), has_image=has_image,
+        )
         pages.append(state)
         stats.pages += 1
         stats.words += state.words

@@ -167,6 +167,11 @@ class OCROptions:
     language: str = "eng"
     psm: int = 3  # fully automatic page segmentation
     oem: int = 3  # default LSTM engine
+    # Per-page wall-clock limit. A pathological page (gigapixel scan, a
+    # layout analysis that never converges) would otherwise hang the batch
+    # with nothing for per-page isolation to catch; on timeout the page
+    # gets a failure stub and the run moves on.
+    timeout_s: int = 600
 
 
 def _run_tesseract(
@@ -193,11 +198,19 @@ def _run_tesseract(
     ]
 
     logger.debug("tesseract: %s", " ".join(cmd))
-    proc = subprocess.run(
-        cmd, capture_output=True, text=True,
-        encoding="utf-8", errors="replace",
-        creationflags=_NO_WINDOW_FLAGS,
-    )
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+            creationflags=_NO_WINDOW_FLAGS,
+            timeout=options.timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        # subprocess.run has already killed the child; the RuntimeError
+        # routes the page to the pipeline's failure stub.
+        raise RuntimeError(
+            f"Tesseract timed out after {options.timeout_s}s on {image_path.name}"
+        ) from None
     if proc.returncode != 0:
         # Tesseract logs warnings to stderr even on success; only escalate on failure.
         raise RuntimeError(
