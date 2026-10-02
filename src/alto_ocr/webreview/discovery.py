@@ -259,9 +259,11 @@ class ObjectIndex:
     and far above the cost of the walk.
     """
 
-    def __init__(self, config: ReviewServerConfig, *, ttl_seconds: float = 20.0) -> None:
+    def __init__(self, config: ReviewServerConfig, *, ttl_seconds: float = 20.0,
+                 miss_floor_seconds: float = 2.0) -> None:
         self.config = config
         self.ttl_seconds = ttl_seconds
+        self.miss_floor_seconds = miss_floor_seconds
         self._objects: dict[str, ReviewObject] = {}
         self._loaded_at = 0.0
         self._image_indexes: dict[str, tuple[float, dict[str, Path]]] = {}
@@ -290,10 +292,17 @@ class ObjectIndex:
         return sorted(self._objects.values(), key=lambda o: natural_chunks(o.ref_id))
 
     def get(self, ref_id: str) -> ReviewObject | None:
-        """Look up a Ref ID that came from a URL. Never joins it to a path."""
+        """Look up a Ref ID that came from a URL. Never joins it to a path.
+
+        A miss re-walks the roots (the object may be new since the last
+        refresh), but not more often than ``miss_floor_seconds``: a stale
+        bookmark or a browser retrying a dead link would otherwise re-walk
+        the whole Goobi metadata share on every request.
+        """
         self.objects()
         obj = self._objects.get(ref_id)
-        if obj is None:
+        if obj is None and (
+                time.monotonic() - self._loaded_at) >= self.miss_floor_seconds:
             self.refresh()          # newly created object, or a stale index
             obj = self._objects.get(ref_id)
         return obj

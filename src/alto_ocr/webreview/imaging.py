@@ -25,7 +25,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
 
@@ -56,6 +56,9 @@ class WorkingCopy:
     path: Path
     source_size: tuple[int, int]
     working_size: tuple[int, int]
+    # True when this call rendered the JPEG rather than finding it cached:
+    # the only time the cache grew, so the only time it needs pruning.
+    fresh: bool = field(default=False, compare=False)
 
     @property
     def scale(self) -> float:
@@ -135,7 +138,7 @@ def working_copy(image_path: Path, cache_dir: Path, *, max_px: int) -> WorkingCo
         meta,
         f"{source_size[0]} {source_size[1]} {working_size[0]} {working_size[1]}".encode("utf-8"),
     )
-    return WorkingCopy(cached, source_size, working_size)
+    return WorkingCopy(cached, source_size, working_size, fresh=True)
 
 
 def render_page(wc: WorkingCopy, *, width: int | None) -> bytes:
@@ -204,13 +207,23 @@ def prune_cache(cache_dir: Path, *, max_bytes: int) -> int:
     eviction costs one re-decode and nothing else.
 
     Called after writes rather than on a timer, so the server has no
-    background thread to shut down cleanly. Returns bytes freed.
+    background thread to shut down cleanly. Returns bytes freed. One
+    ``scandir`` pass: on Windows the directory listing already carries the
+    stat, so a cache of thousands of renders costs no per-file syscall.
     """
+    entries: list[tuple[float, int, Path]] = []
     try:
-        entries = [
-            (p.stat().st_atime, p.stat().st_size, p)
-            for p in cache_dir.glob("*.jpg") if p.is_file()
-        ]
+        with os.scandir(cache_dir) as it:
+            for entry in it:
+                if not entry.name.lower().endswith(".jpg"):
+                    continue
+                try:
+                    if not entry.is_file():
+                        continue
+                    st = entry.stat()
+                except OSError:
+                    continue
+                entries.append((st.st_atime, st.st_size, Path(entry.path)))
     except OSError:
         return 0
     total = sum(size for _atime, size, _p in entries)
