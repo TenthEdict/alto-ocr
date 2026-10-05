@@ -346,6 +346,7 @@ async function renderPage(refId, stem) {
     if (WORD_OPS.has(op.op)) {
       say(`Undone: ${op.op === 'delete' ? 'deletion of' : op.op === 'verify' ? 'confirmation of' : 'correction of'} “${page.words[op.index].text}”.`);
       if (mode === null) select(page.words[op.index]);
+      else if (mode === 'order' && selected && selected.i === op.index) fillEditor(selected);
     } else {
       say(op.op === 'add' ? `Undone: added word “${op.text}”.` : 'Undone: reading-order move.');
     }
@@ -458,41 +459,80 @@ async function renderPage(refId, stem) {
     }
   };
 
+  /* Where the reading-path link from box a to box b runs -- between the
+   * words, never through them, so the path does not strike out the text
+   * being read. Along a line: edge to facing edge at mid-height. Across a
+   * line break: corner to facing corner, keeping the diagonal between the
+   * lines and the arrowhead at the corner of the word that comes next.
+   * Mirrors review.order_link (the Tk tab), which tests the cases. */
+  const orderLink = (a, b, sameLine) => {
+    const [ax, ay, aw, ah] = a, [bx, by, bw, bh] = b;
+    if (sameLine) {
+      if (bx >= ax + aw) return [ax + aw, ay + ah / 2, bx, by + bh / 2];
+      if (bx + bw <= ax) return [ax, ay + ah / 2, bx + bw, by + bh / 2];
+      return [ax + aw / 2, ay + ah / 2, bx + bw / 2, by + bh / 2];
+    }
+    if (by + bh / 2 >= ay + ah / 2) return [ax + aw, ay + ah, bx, by];
+    return [ax + aw, ay, bx, by + bh];
+  };
+
   /* Reading-order view: every word outlined, the selection heavy, and the
-   * reading path -- a thin line from word to word along each line and an
-   * arrow from the end of one line to the start of the next -- so a page
-   * read in the wrong order shows at a glance. */
+   * reading path -- a link between neighbouring words along each line and
+   * an arrow from the end of one line to the start of the next -- so a
+   * page read in the wrong order shows at a glance. Path weights are screen
+   * pixels, thinned when the words are small on screen (zoomed far out) so
+   * the path does not bury them; the Tk tab uses the same numbers. */
   const drawOrder = () => {
     if (!order) return;
-    const size = Math.max(page.imageWidth / 130, 8);
-    const marker = svgEl('marker', {
-      id: 'order-arrow', viewBox: '0 0 10 10', refX: 10, refY: 5, orient: 'auto',
-      markerUnits: 'userSpaceOnUse', markerWidth: size, markerHeight: size,
-    });
-    marker.append(svgEl('path', { d: 'M0,0 L10,5 L0,10 z', class: 'oarrow' }));
-    const defs = svgEl('defs', {});
-    defs.append(marker);
-    overlay.append(defs);
+    const s = scale();
     const placed = order.order.filter(o => o.box);
-    let prev = null;
-    for (const o of placed) {
-      const [x2, y2] = center(o.box);
-      if (prev) {
-        const [x1, y1] = center(prev.box);
-        const brk = prev.line !== o.line;
-        overlay.append(svgEl('line', {
-          x1, y1, x2, y2, class: 'opath' + (brk ? ' brk' : ''),
-          'marker-end': brk ? 'url(#order-arrow)' : null,
-        }));
-      }
-      prev = o;
+    const heights = placed.map(o => o.box[3] * s).sort((a, b) => a - b);
+    const k = heights.length
+      ? Math.max(0.45, Math.min(1, heights[heights.length >> 1] / 28)) : 1;
+    // Arrowheads in screen px (Tk's arrowshape: length, half-width),
+    // converted to the overlay's image-pixel units.
+    const defs = svgEl('defs', {});
+    for (const [id, len, half, cls] of [['order-arrow-case', 17, 8, 'oarrow case'],
+                                        ['order-arrow', 15, 7, 'oarrow']]) {
+      const marker = svgEl('marker', {
+        id, viewBox: '0 0 10 10', refX: 10, refY: 5, orient: 'auto',
+        markerUnits: 'userSpaceOnUse',
+        markerWidth: Math.max(2, len * k) / s, markerHeight: Math.max(4, 2 * half * k) / s,
+      });
+      marker.append(svgEl('path', { d: 'M0,0 L10,5 L0,10 z', class: cls }));
+      defs.append(marker);
     }
+    overlay.append(defs);
     const chosen = new Set(orderSel);
     for (const o of placed) {
+      if (o.i !== null && chosen.has(o.i)) continue;   // drawn last, over the path
       const [x, y, bw, bh] = o.box;
-      const cls = o.i === null ? ' added' : chosen.has(o.i) ? ' chosen' : '';
       overlay.append(svgEl('rect', {
-        x, y, width: Math.max(bw, 1), height: Math.max(bh, 1), class: 'obox' + cls,
+        x, y, width: Math.max(bw, 1), height: Math.max(bh, 1),
+        class: 'obox' + (o.i === null ? ' added' : ''),
+      }));
+    }
+    const links = [];
+    for (let n = 1; n < placed.length; n++) {
+      const brk = placed[n - 1].line !== placed[n].line;
+      links.push([orderLink(placed[n - 1].box, placed[n].box, !brk), brk]);
+    }
+    // All casings first: a casing drawn later would cut through the link
+    // before it where the two meet.
+    for (const [cls, width, arrow] of [['ocase', 5, 'order-arrow-case'], ['opath', 3, 'order-arrow']]) {
+      const w = Math.max(1, width * k);
+      for (const [[x1, y1, x2, y2], brk] of links) {
+        overlay.append(svgEl('line', {
+          x1, y1, x2, y2, class: cls + (brk ? ' brk' : ''), 'stroke-width': w,
+          'marker-end': brk ? `url(#${arrow})` : null,
+        }));
+      }
+    }
+    for (const o of placed) {
+      if (o.i === null || !chosen.has(o.i)) continue;
+      const [x, y, bw, bh] = o.box;
+      overlay.append(svgEl('rect', {
+        x, y, width: Math.max(bw, 1), height: Math.max(bh, 1), class: 'obox chosen',
       }));
     }
     if (press && press.dragging) {
@@ -507,9 +547,9 @@ async function renderPage(refId, stem) {
   /* ---- editor ---- */
   const editor = $('editor'), edText = $('ed-text');
 
-  const select = (w) => {
+  /* Put a word in the editor bar without moving focus or the view. */
+  const fillEditor = (w) => {
     selected = w;
-    if (!w) { editor.hidden = true; drawOverlay(); return; }
     $('addbar').hidden = true;
     editor.hidden = false;
     const wc = w.wc;
@@ -519,7 +559,14 @@ async function renderPage(refId, stem) {
     $('ed-pos').textContent = `word ${w.i + 1} of ${page.words.length} · ${unresolved().length} flagged left`;
     edText.value = wordText(w.i);
     const [x, y, bw, bh] = w.box;
-    $('snippet').src = `${pageUrl(refId, stem)}/crop?x=${x}&y=${y}&w=${bw}&h=${bh}&zoom=2.5`;
+    const src = `${pageUrl(refId, stem)}/crop?x=${x}&y=${y}&w=${bw}&h=${bh}&zoom=2.5`;
+    if ($('snippet').getAttribute('src') !== src) $('snippet').src = src;
+  };
+
+  const select = (w) => {
+    selected = w;
+    if (!w) { editor.hidden = true; drawOverlay(); return; }
+    fillEditor(w);
     drawOverlay();
     scrollToBox(w.box);
     edText.focus();
@@ -565,6 +612,25 @@ async function renderPage(refId, stem) {
     if (!selected) return;
     const text = edText.value.trim();
     if (!text) { deleteSelected(); return; }
+    if (mode === 'order') {
+      // Fixed in passing while ordering (a word can be placed right and
+      // still be spelled wrong, whatever its confidence): the word stays
+      // selected -- it may still need moving -- and the keys go back to the
+      // reading-order shortcuts. Enter on an unchanged word the OCR was
+      // already sure of records nothing, as in the Tk tab.
+      const w = selected;
+      edText.blur();
+      const unchanged = text === wordText(w.i);
+      if (!(unchanged && (!flagged(w) || wordOp(w.i)))) {
+        if (text === w.text) {
+          if (record({ op: 'verify', index: w.i })) say(`Confirmed “${text}”.`);
+        } else if (record({ op: 'edit', index: w.i, text })) {
+          say(`Queued “${w.text}” → “${text}”.`);
+        }
+      }
+      fillEditor(w);
+      return;
+    }
     if (text === selected.text) {
       // Unchanged text means "the OCR was right, the confidence was just
       // low" -- the same claim as an edit, recorded as a confirmation so
@@ -584,7 +650,8 @@ async function renderPage(refId, stem) {
     if (!selected) return;
     const w = selected;
     if (!record({ op: 'delete', index: w.i })) return;
-    step(1);
+    if (mode === 'order') { setOrderSel([], null); edText.blur(); }
+    else step(1);
     say(`Deleted “${w.text}” (Ctrl+Z puts it back).`);
   };
 
@@ -595,11 +662,25 @@ async function renderPage(refId, stem) {
     commitEdit(true);
   });
   $('ed-delete').addEventListener('click', deleteSelected);
-  $('ed-cancel').addEventListener('click', () => select(null));
+  $('ed-cancel').addEventListener('click', () => {
+    if (mode === 'order') setOrderSel([], null); else select(null);
+  });
   edText.addEventListener('keydown', (ev) => {
     if (ev.key === 'Enter') { ev.preventDefault(); commitEdit(true); }
-    else if (ev.key === 'Escape') { ev.preventDefault(); select(null); }
+    else if (ev.key === 'Escape') {
+      ev.preventDefault();
+      // Reading order: abandon the typing, keep the selection.
+      if (mode === 'order' && selected) { fillEditor(selected); edText.blur(); }
+      else select(null);
+    }
   });
+  /* Reading order: start typing over the one selected word. */
+  const editOrderWord = () => {
+    if (mode !== 'order' || !selected) return;
+    edText.focus();
+    edText.select();
+  };
+  $('order-edit').addEventListener('click', editOrderWord);
 
   /* Symbol keyboard: rows of keys under category tabs, in the layout the
    * server sends (symbols.py -- the Tk GUI renders the same one, so the two
@@ -651,6 +732,9 @@ async function renderPage(refId, stem) {
     $('addbar').hidden = true;
     selected = null;
     editor.hidden = true;
+    // Reading order keeps the word in hand after a correction; elsewhere
+    // Enter moves on to the next flagged word.
+    $('ed-commit').textContent = mode === 'order' ? 'Apply' : 'Correct & next';
     orderSel = []; orderAnchor = null; order = null;
     if (mode === 'add') say('Drag a box around the word the OCR missed.');
     if (mode === 'order') { paintOrderPanel(); refreshOrder(); }
@@ -712,8 +796,11 @@ async function renderPage(refId, stem) {
     const n = orderSel.length;
     $('order-hint').textContent = n
       ? `${n} word(s) selected. Now click the word they should come after — on the scan or in the transcript. “Page start” puts them first; Ctrl+↑/Ctrl+↓ nudge them one word; Esc clears; Ctrl+Z undoes a move.`
-      : 'Select the words that are out of place: click one (on the scan or in the transcript below), Shift+click to extend to a run, Ctrl+click to add or drop a word, or drag a box around a whole column or caption on the scan.';
+      : 'Select the words that are out of place: click one (on the scan or in the transcript below), Shift+click to extend to a run, Ctrl+click to add or drop a word, or drag a box around a whole column or caption on the scan. A single selected word can also be corrected in the editor below.';
+    if (n === 1) $('order-hint').textContent += ' To fix its text, press Enter or F2 (or ✎ Edit word).';
     for (const id of ['order-earlier', 'order-later', 'order-start', 'order-clear']) $(id).disabled = !n;
+    $('order-edit').disabled = n !== 1;
+    syncOrderEditor();
     const box = $('order-text');
     if (!order) { box.textContent = 'Loading…'; return; }
     const text = order.transcript;
@@ -739,6 +826,20 @@ async function renderPage(refId, stem) {
     }
     box.append(document.createTextNode(text.slice(at)));
     if (first) first.scrollIntoView({ block: 'nearest' });
+  };
+
+  /* Reading order: the editor bar holds the selected word when exactly one
+   * is selected, so a word that is in the right place but spelled wrong is
+   * fixed without leaving the mode. Focus stays put (Enter/F2 or a click
+   * moves it to the editor); text being typed is left alone. */
+  const syncOrderEditor = () => {
+    const w = orderSel.length === 1 && page ? page.words[orderSel[0]] : null;
+    if (!w) {
+      if (selected) { selected = null; editor.hidden = true; }
+      return;
+    }
+    if (w === selected && document.activeElement === edText) return;
+    fillEditor(w);
   };
 
   const orderPos = () => {
@@ -975,7 +1076,8 @@ async function renderPage(refId, stem) {
     threshold = Number(thresholdSelect.value) / 100;
     prefs.set('threshold', threshold);
     drawOverlay();
-    if (selected) select(selected);
+    if (selected && mode === 'order') fillEditor(selected);
+    else if (selected) select(selected);
     say(`${unresolved().length} word(s) flagged below ${pct(threshold)}.`);
   });
   const showAllBox = $('show-all');
@@ -1068,6 +1170,12 @@ async function renderPage(refId, stem) {
       return;
     }
     if (mod || ev.altKey) return;
+    if (mode === 'order' && (ev.key === 'Enter' || ev.key === 'F2') && selected
+        && !(target instanceof HTMLButtonElement)) {
+      ev.preventDefault();
+      editOrderWord();
+      return;
+    }
     if (ev.key === 'n') { ev.preventDefault(); step(1); }
     else if (ev.key === 'p') { ev.preventDefault(); step(-1); }
     else if (ev.key === 'a') { ev.preventDefault(); setMode('add'); }

@@ -137,7 +137,25 @@ THRESHOLD_CHOICES: tuple[str, ...] = tuple(f"{p}%" for p in range(0, 101, 5))
 # on disk, but the corrector should still see what they touched).
 _COLOR_EDITED = "#1f6feb"
 _COLOR_UNSCORED = "#c026d3"  # no WC (GLMOCR output): needs eyes everywhere
-_COLOR_ORDER = "#7c3aed"     # reading-order mode: word outlines + reading path
+# Reading-order mode. The path has to read at a glance on a page of black
+# type, so it is a saturated colour, drawn heavy on a thin white casing; the
+# word boxes recede to a thin neutral grey so path and boxes never blur
+# together (they were one purple, the path 1–2 px, until 2026-10-05). The
+# selection stays _COLOR_EDITED blue. Widths are screen pixels at any zoom.
+# Line breaks are told apart by their arrowheads, not by dashes: Tk on
+# Windows draws every dash pattern as fine dots whatever the line width.
+_COLOR_ORDER_BOX = "#64748b"
+_COLOR_ORDER_PATH = "#db2777"
+_COLOR_ORDER_CASING = "#ffffff"
+# Full weight once words are this tall on screen; zoomed out further the
+# path thins (to no less than _ORDER_MIN_WEIGHT of it) so it doesn't bury
+# type that small. Arrowshape is Tk's (length, wing length, half-width).
+_ORDER_FULL_WEIGHT_PX = 28
+_ORDER_MIN_WEIGHT = 0.45
+_ORDER_PATH_WIDTH = 3
+_ORDER_CASING_WIDTH = 5
+_ORDER_ARROW = (15, 18, 7)
+_ORDER_CASING_ARROW = (17, 21, 8)
 
 # Canvas items redrawn on every render carry this tag; the scan image does
 # not, so a re-render that keeps the zoom reuses it.
@@ -217,6 +235,35 @@ def _wc_color(wc: float | None) -> str:
     if wc < 0.90:
         return "#b58900"
     return "#2da44e"
+
+
+Box = tuple[float, float, float, float]
+
+
+def order_link(a: Box, b: Box, same_line: bool) -> tuple[float, float, float, float]:
+    """Where to draw the reading-path link from word ``a`` to word ``b``
+    (``x, y, w, h`` boxes): ``(x1, y1, x2, y2)``.
+
+    Links run between the words, not through them, so the path never
+    strikes out the text the corrector is reading. Along a line: edge to
+    facing edge at mid-height — the gap between two words. Across a line
+    break: from the corner of the line's last word to the corner of the
+    next line's first word that faces it (bottom → top going down, top →
+    bottom going up), which keeps the diagonal in the space between the
+    lines and puts the arrowhead at the corner of the word that comes
+    next. Overlapping words on one line fall back to centre to centre.
+    """
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    if same_line:
+        if bx >= ax + aw:
+            return (ax + aw, ay + ah / 2, bx, by + bh / 2)
+        if bx + bw <= ax:
+            return (ax, ay + ah / 2, bx + bw, by + bh / 2)
+        return (ax + aw / 2, ay + ah / 2, bx + bw / 2, by + bh / 2)
+    if by + bh / 2 >= ay + ah / 2:
+        return (ax + aw, ay + ah, bx, by)
+    return (ax + aw, ay, bx, by + bh)
 
 
 def repackage_summary(results: list[RepackageResult]) -> str:
@@ -483,6 +530,8 @@ class ReviewFrame(ttk.Frame):
         c.bind("<Escape>", lambda _e: self._on_canvas_escape())
         c.bind("<Control-Up>", lambda _e: self._order_nudge(-1) or "break")
         c.bind("<Control-Down>", lambda _e: self._order_nudge(+1) or "break")
+        c.bind("<Return>", lambda _e: self._order_edit_word())
+        c.bind("<F2>", lambda _e: self._order_edit_word())
 
     def _build_order_panel(self, area: ttk.Frame) -> None:
         # Reading-order side panel: hidden until the mode is toggled on.
@@ -510,6 +559,13 @@ class ReviewFrame(ttk.Frame):
             b.pack(side="left", padx=(0, 4))
             Tooltip(b, tip)
             self._order_buttons.append(b)
+        # Fixing a word's text without leaving the mode: a single selected
+        # word sits in the editor bar below, ready for typing.
+        self.btn_order_edit = ttk.Button(btns, text="✎ Edit word",
+                                         command=self._order_edit_word)
+        self.btn_order_edit.pack(side="left", padx=(0, 4))
+        Tooltip(self.btn_order_edit,
+                "Correct the selected word's text in the editor below (Enter or F2)")
         ttk.Label(panel, text="Transcript — as it will be saved").grid(
             row=3, column=0, columnspan=2, sticky="w")
         self.txt_order = tk.Text(panel, width=42, wrap="word", cursor="arrow",
@@ -531,6 +587,8 @@ class ReviewFrame(ttk.Frame):
         t.bind("<Escape>", lambda _e: self._on_canvas_escape())
         t.bind("<Control-Up>", lambda _e: self._order_nudge(-1) or "break")
         t.bind("<Control-Down>", lambda _e: self._order_nudge(+1) or "break")
+        for seq in ("<Return>", "<F2>"):
+            t.bind(seq, lambda _e: self._order_edit_word() or "break")
         panel.grid_remove()
 
     def _build_editor(self, ws: tk.Frame) -> None:
@@ -1012,6 +1070,9 @@ class ReviewFrame(ttk.Frame):
         self._order_sel = []
         self._order_anchor = None
         self.order_panel.grid_remove()
+        # The editor bar was following the reading-order selection.
+        self._selected = None
+        self._update_editor()
         self._render()
 
     def _order_hint(self) -> str:
@@ -1019,11 +1080,15 @@ class ReviewFrame(ttk.Frame):
             return ("Select the words that are out of place: click one (on the "
                     "scan or in the transcript below), Shift+click to extend to "
                     "a run, Ctrl+click to add or remove a word, or drag a box "
-                    "around a whole column or caption on the scan.")
+                    "around a whole column or caption on the scan. A single "
+                    "selected word can also be corrected in the editor below.")
         n = len(self._order_sel)
-        return (f"{n} word(s) selected. Now click the word they should come "
+        hint = (f"{n} word(s) selected. Now click the word they should come "
                 "after (“Page start” puts them first). Ctrl+Up/Ctrl+Down nudge "
                 "one word; Esc clears; Ctrl+Z undoes a move.")
+        if n == 1:
+            hint += " To fix its text, press Enter or F2 (or ✎ Edit word)."
+        return hint
 
     def _refresh_order_panel(self) -> None:
         """Re-render the transcript (exactly what a save will write), mark
@@ -1038,6 +1103,9 @@ class ReviewFrame(ttk.Frame):
         state = "normal" if self._order_sel else "disabled"
         for b in self._order_buttons:
             b.configure(state=state)
+        self.btn_order_edit.configure(
+            state="normal" if len(self._order_sel) == 1 else "disabled")
+        self._sync_order_editor()
 
         txt = self.txt_order
         txt.configure(state="normal")
@@ -1063,6 +1131,25 @@ class ReviewFrame(ttk.Frame):
             if first is not None:
                 txt.see(f"1.0+{first}c")
         txt.configure(state="disabled")
+
+    def _sync_order_editor(self) -> None:
+        """Reading-order mode: the editor bar holds the selected word when
+        exactly one is selected — so a word read correctly enough to place
+        but spelled wrong (confidence is no guarantee: a 96% word can still
+        be wrong) is fixed on the spot instead of in another mode. Leaves
+        focus alone; Enter/F2 or a click puts the caret in the editor."""
+        word = self._order_sel[0] if len(self._order_sel) == 1 else None
+        if word is not self._selected:
+            self._selected = word
+            self._update_editor()
+
+    def _order_edit_word(self) -> None:
+        """Enter/F2/✎ Edit word: start typing over the selected word."""
+        if self._selected is None or self._pending_box is not None:
+            return
+        self.ent_edit.focus_set()
+        self.ent_edit.selection_range(0, "end")
+        self.ent_edit.icursor("end")
 
     def _order_word_in_text(self, event: tk.Event) -> Optional[Word]:
         """The word under a click in the transcript panel, if any."""
@@ -1238,31 +1325,52 @@ class ReviewFrame(ttk.Frame):
 
     def _draw_order_overlays(self) -> None:
         """Every word outlined, the selection heavy, and the reading path:
-        a thin line from word to word through each line, and an arrow from
+        a link between each pair of words along a line, and an arrow from
         the end of one line to the start of the next — so a wrong order is
-        visible at a glance. Redrawn from state inside _render."""
+        visible at a glance. Redrawn from state inside _render.
+
+        Boxes go down first and the path over them, each link on a white
+        casing so it stays legible where it does cross type (order_link
+        keeps it off the words wherever the order is right)."""
         s = self._scale
         chosen = {id(w) for w in self._order_sel}
+        for word in self._page.words:
+            if id(word) in chosen:
+                continue  # drawn last, over the path
+            x, y, bw, bh = (v * s for v in word.box_px)
+            self.canvas.create_rectangle(
+                x, y, x + bw, y + bh, outline=_COLOR_ORDER_BOX, width=1,
+                tags=(_OVERLAY,))
+        heights = sorted(w.box_px[3] * s for w in self._page.words)
+        k = (max(_ORDER_MIN_WEIGHT,
+                 min(1.0, heights[len(heights) // 2] / _ORDER_FULL_WEIGHT_PX))
+             if heights else 1.0)
+        links = []
         prev = None
         for word in self._page.words:
-            x, y, bw, bh = (v * s for v in word.box_px)
-            center = (x + bw / 2, y + bh / 2)
+            box = tuple(v * s for v in word.box_px)
             if prev is not None:
                 same_line = prev[0].elem.getparent() is word.elem.getparent()
+                links.append((order_link(prev[1], box, same_line), same_line))
+            prev = (word, box)
+        # All casings, then all paths: a casing drawn later would cut
+        # through the link before it where the two meet.
+        for color, width, arrow in (
+            (_COLOR_ORDER_CASING, _ORDER_CASING_WIDTH, _ORDER_CASING_ARROW),
+            (_COLOR_ORDER_PATH, _ORDER_PATH_WIDTH, _ORDER_ARROW),
+        ):
+            width = max(1.0, width * k)
+            arrow = tuple(max(2.0, v * k) for v in arrow)
+            for coords, same_line in links:
                 self.canvas.create_line(
-                    *prev[1], *center, fill=_COLOR_ORDER,
-                    width=1 if same_line else 2,
-                    dash=() if same_line else (6, 3),
-                    arrow="none" if same_line else "last",
+                    *coords, fill=color, width=width, capstyle="round",
+                    arrow="none" if same_line else "last", arrowshape=arrow,
                     tags=(_OVERLAY,))
-            prev = (word, center)
-        for word in self._page.words:
+        for word in self._order_sel:
             x, y, bw, bh = (v * s for v in word.box_px)
-            selected = id(word) in chosen
             self.canvas.create_rectangle(
-                x, y, x + bw, y + bh,
-                outline=_COLOR_EDITED if selected else _COLOR_ORDER,
-                width=3 if selected else 1, tags=(_OVERLAY,))
+                x, y, x + bw, y + bh, outline=_COLOR_EDITED, width=3,
+                tags=(_OVERLAY,))
 
     def _cancel_pending_add(self) -> None:
         self._drag_start = None
@@ -1333,6 +1441,10 @@ class ReviewFrame(ttk.Frame):
     def _on_escape(self) -> None:
         if self._pending_box is not None:
             self._cancel_pending_add()
+            self.canvas.focus_set()
+        elif self.var_reorder_mode.get():
+            # Abandon the typing, keep the selection.
+            self._update_editor()
             self.canvas.focus_set()
         else:
             self._select_word(None)
@@ -1432,6 +1544,16 @@ class ReviewFrame(ttk.Frame):
             if self._page.verify_word(word):
                 self._undo.append(_VerifyEntry(word, old_wc))
                 self._mark_touched(word)
+        if self.var_reorder_mode.get():
+            # Fixed in passing while ordering: the word stays selected (it
+            # may still need moving), the transcript panel shows the new
+            # text, and the keys go back to the reading-order bindings.
+            self._update_editor()
+            self._refresh_order_panel()
+            self._render()
+            self.canvas.focus_set()
+            self._update_status(f"“{word.content}” set.")
+            return
         self._update_status()
         if advance:
             self._goto_flagged(+1)
@@ -1461,6 +1583,11 @@ class ReviewFrame(ttk.Frame):
         self._undo.append(_DeleteEntry(word, removal, added))
         self._selected = None
         self.btn_save.configure(state="normal")
+        if self.var_reorder_mode.get():
+            self._set_order_selection([], None)  # refreshes the panel + scan
+            self.canvas.focus_set()
+            self._update_status(f"Deleted “{word.content}” (Ctrl+Z puts it back).")
+            return
         self._render()
         self._select_word(nxt)
         self._update_status(f"Deleted “{word.content}” (Ctrl+Z puts it back).")
@@ -1530,7 +1657,7 @@ class ReviewFrame(ttk.Frame):
             if self.var_reorder_mode.get():  # its containers are back too
                 self._refresh_order_panel()
             self._render()
-            self._select_word(entry.word)
+            self._show_word(entry.word)
             self._update_status(f"Restored “{entry.word.content}”.")
             return
         if isinstance(entry, _VerifyEntry):  # un-confirm: engine WC back
@@ -1541,8 +1668,18 @@ class ReviewFrame(ttk.Frame):
         if item is not None:
             self.canvas.itemconfigure(item, outline=_wc_color(entry.word.wc))
         self._maybe_disable_save()
-        self._select_word(entry.word)
+        self._show_word(entry.word)
         self._update_status()
+
+    def _show_word(self, word: Word) -> None:
+        """Put an undone word back in front of the corrector: in the editor
+        normally; as the reading-order selection (which the editor follows)
+        while ordering, so the undo does not pull focus out of the mode."""
+        if self.var_reorder_mode.get():
+            self._set_order_selection([word], word)
+            self._update_editor()  # same word, new text: refill the editor
+        else:
+            self._select_word(word)
 
     def _maybe_disable_save(self) -> None:
         """After an undo: a page back exactly as it was loaded (or last

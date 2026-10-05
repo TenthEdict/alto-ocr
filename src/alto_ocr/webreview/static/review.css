@@ -181,22 +181,28 @@ input[type=text]:focus, input[type=search]:focus {
 .drawbox { fill: color-mix(in srgb, var(--ok) 16%, transparent); stroke: var(--ok);
            stroke-width: 2; stroke-dasharray: 5 3; vector-effect: non-scaling-stroke; }
 
-/* Reading-order mode: words outlined, the selection heavy, and the reading
-   path from word to word (dashed with an arrow at each line break). The
-   overlay takes no clicks here -- the stage hit-tests, so a press can turn
-   into a box drag. */
-:root { --order: #7c3aed; }
-:root[data-theme="dark"] { --order: #a78bfa; }
+/* Reading-order mode: words outlined thin and grey, the selection heavy,
+   and the reading path in a saturated pink on a white casing -- links in
+   the gaps between words, an arrow at each line break -- the same colours
+   and geometry as the Tk Review tab. They sit on the scan, which is paper
+   in both themes, so they do not change with the theme. Stroke widths are
+   set per draw (they thin when zoomed far out). The overlay takes no clicks
+   here -- the stage hit-tests, so a press can turn into a box drag. */
+:root { --order: #db2777; --order-box: #64748b; --order-casing: #ffffff; }
 .stage.ordering { cursor: default; }
 .stage.ordering svg { pointer-events: none; }
-.obox { fill: transparent; stroke: color-mix(in srgb, var(--order) 70%, transparent);
-        stroke-width: 1; vector-effect: non-scaling-stroke; }
-.obox.chosen { stroke: var(--done); stroke-width: 2;
+.obox { fill: transparent; stroke: var(--order-box); stroke-width: 1;
+        vector-effect: non-scaling-stroke; }
+.obox.chosen { stroke: var(--done); stroke-width: 3;
                fill: color-mix(in srgb, var(--done) 14%, transparent); }
 .obox.added { stroke: var(--ok); stroke-dasharray: 4 3; }
-.opath { stroke: var(--order); stroke-width: 1; opacity: .75; vector-effect: non-scaling-stroke; }
-.opath.brk { stroke-width: 2; stroke-dasharray: 6 4; }
+.opath, .ocase { fill: none; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.opath { stroke: var(--order); }
+.ocase { stroke: var(--order-casing); }
+/* A round cap would poke past the arrowhead's point. */
+.opath.brk, .ocase.brk { stroke-linecap: butt; }
 .oarrow { fill: var(--order); }
+.oarrow.case { fill: var(--order-casing); }
 
 .orderpanel {
   width: 340px; flex: 0 0 340px; display: flex; flex-direction: column; gap: 8px;

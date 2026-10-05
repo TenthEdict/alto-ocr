@@ -574,6 +574,98 @@ class ReadingOrderTests(ReviewFixture):
         self.assertIn("No words", self.rv.var_status.get())
         self.assertEqual(len(self.rv._order_sel), 2)
 
+    def test_one_selected_word_sits_in_the_editor(self) -> None:
+        self.assertEqual(str(self.rv.btn_order_edit.cget("state")), "disabled")
+        self.rv._order_pick(self.words["Trustees"], shift=False)
+        self.assertIs(self.rv._selected, self.words["Trustees"])
+        self.assertEqual(self.rv.var_edit.get(), "Trustees")
+        self.assertEqual(str(self.rv.btn_order_edit.cget("state")), "normal")
+        self.assertIn("Enter or F2", self.rv.var_order_hint.get())
+        # Two words: nothing to edit; none: the editor empties.
+        self.rv._order_toggle(self.words["Board"])
+        self.assertIsNone(self.rv._selected)
+        self.assertEqual(str(self.rv.btn_order_edit.cget("state")), "disabled")
+        self.rv._on_canvas_escape()
+        self.assertEqual(self.rv.var_edit.get(), "")
+
+    def test_edit_in_reading_order_mode_stays_in_the_mode(self) -> None:
+        # The corrector's case: a high-confidence word that is still wrong.
+        word = self.words["Board"]
+        self.rv._order_pick(word, shift=False)
+        self.rv.var_edit.set("Boord")
+        self.rv._apply_edit(advance=True)
+        self.assertEqual(word.content, "Boord")
+        self.assertTrue(self.rv.var_reorder_mode.get())
+        self.assertEqual(self.rv._order_sel, [word])  # still there to move
+        self.assertIs(self.rv._selected, word)
+        self.assertEqual(self.transcript(), "Boord cf\nTrustees\n")
+        self.assertEqual(str(self.rv.btn_save.cget("state")), "normal")
+        # It can still be moved, and both undo cleanly, newest first.
+        self.rv._order_pick(self.words["Trustees"], shift=False)
+        self.assertEqual(self.transcript(), "cf\nTrustees Boord\n")
+        self.rv._undo_edit()
+        self.rv._undo_edit()
+        self.assertEqual(self.transcript(), "Board cf\nTrustees\n")
+        self.assertEqual(self.rv._order_sel, [word])  # undo re-selects it
+        self.assertEqual(self.rv.var_edit.get(), "Board")
+        self.assertTrue(self.rv.var_reorder_mode.get())
+
+    def test_escape_in_the_editor_abandons_typing_but_keeps_selection(self) -> None:
+        word = self.words["cf"]
+        self.rv._order_pick(word, shift=False)
+        self.rv.var_edit.set("of")
+        self.rv._on_escape()
+        self.assertEqual(self.rv.var_edit.get(), "cf")
+        self.assertEqual(word.content, "cf")
+        self.assertEqual(self.rv._order_sel, [word])
+
+    def test_delete_from_reading_order_mode(self) -> None:
+        self.rv._order_pick(self.words["cf"], shift=False)
+        self.rv._delete_word()
+        self.assertEqual(self.transcript(), "Board\nTrustees\n")
+        self.assertEqual(self.rv._order_sel, [])
+        self.assertIsNone(self.rv._selected)
+        self.rv._undo_edit()
+        self.assertEqual(self.transcript(), "Board cf\nTrustees\n")
+        self.assertEqual([w.content for w in self.rv._order_sel], ["cf"])
+
+    def test_leaving_the_mode_empties_the_editor(self) -> None:
+        self.rv._order_pick(self.words["cf"], shift=False)
+        self.rv._toggle_reorder_mode()
+        self.assertIsNone(self.rv._selected)
+        self.assertEqual(self.rv.var_edit.get(), "")
+
+    def test_path_is_drawn_over_neutral_boxes(self) -> None:
+        self.rv._order_pick(self.words["cf"], shift=False)
+        c = self.rv.canvas
+        items = c.find_withtag(review._OVERLAY)
+        kinds = [(c.type(i), c.itemcget(i, "outline" if c.type(i) == "rectangle"
+                                       else "fill")) for i in items]
+        boxes = [k for k in kinds if k[0] == "rectangle"]
+        lines = [k for k in kinds if k[0] == "line"]
+        self.assertEqual(sorted(color for _t, color in boxes),
+                         sorted([review._COLOR_ORDER_BOX] * 2 + [review._COLOR_EDITED]))
+        # Two links (Board→cf, cf→Trustees), each a casing and a path.
+        self.assertEqual([color for _t, color in lines],
+                         [review._COLOR_ORDER_CASING] * 2 + [review._COLOR_ORDER_PATH] * 2)
+        # The selection is on top, the boxes under the path.
+        self.assertEqual(kinds[-1], ("rectangle", review._COLOR_EDITED))
+        self.assertEqual(kinds[0][0], "rectangle")
+        self.assertNotEqual(review._COLOR_ORDER_BOX, review._COLOR_ORDER_PATH)
+
+    def test_links_run_between_words_not_through_them(self) -> None:
+        link = review.order_link
+        a, b = (100, 100, 50, 20), (170, 102, 40, 20)
+        # Along a line: the gap between the two, at mid-height.
+        self.assertEqual(link(a, b, True), (150, 110, 170, 112))
+        self.assertEqual(link(b, a, True), (170, 112, 150, 110))  # backwards
+        # Next line down: bottom-right corner to the next word's top-left.
+        self.assertEqual(link(b, (100, 140, 60, 20), False), (210, 122, 100, 140))
+        # A jump back up (wrong order, or the next column): top to bottom.
+        self.assertEqual(link((100, 140, 60, 20), b, False), (160, 140, 170, 122))
+        # Overlapping boxes on one line: centre to centre.
+        self.assertEqual(link(a, (120, 100, 50, 20), True), (125, 110, 145, 110))
+
     def test_add_word_mode_turns_reading_order_off(self) -> None:
         self.rv._order_pick(self.words["Board"], shift=False)
         self.rv._toggle_add_mode()
