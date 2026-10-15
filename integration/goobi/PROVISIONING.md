@@ -268,7 +268,12 @@ Three files set it up, all in `integration/goobi/`:
 | --- | --- |
 | `alto-ocr-review.service` | runs it as `tomcat` (it edits Goobi's own folders), bound to `127.0.0.1:8081` |
 | `apache-ocr-review.conf` | proxies it at `/ocr-review/` under Goobi's own access control |
-| `goobi_processProperties.xml` | puts the clickable link on the correction task |
+| `config/goobi_processProperties.xml` | puts the clickable link on the correction task |
+
+`install.sh --review` installs the first two (the unit enabled but not
+started, the Apache conf installed but not enabled until its auth is filled
+in), and `install.sh --config --review-url <url>` installs the third with the
+real URL in place of the placeholder. By hand:
 
 ```
 sudo install -m 644 alto-ocr-review.service /etc/systemd/system/
@@ -353,7 +358,7 @@ install seeds `prozesse` 1 and 4 and `schritte` up to 28, so a template built
 later (here: process 6, steps 36/38/45) cannot collide.
 
 ```sh
-integration/goobi/export_template.sh OCR_Processing > OCR_Processing.sql
+integration/goobi/export_template.sh Capture_To_Ingest_v1     > integration/goobi/templates/Capture_To_Ingest_v1.sql
 # on the target, after running the pre-flight queries in the file's header:
 mysql goobi < OCR_Processing.sql && systemctl restart tomcat10
 ```
@@ -376,7 +381,22 @@ see the AD decision in §3 — rather than migrated from a test host.
 For one template, rebuilding by hand in the UI is comparable effort and
 carries no ID risk at all. The dump's real value is as a versioned artifact:
 a workflow definition that can be reviewed in a diff and restored after a
-mistake.
+mistake. Commit each one to `templates/` under the template's exact title;
+`drift_check.sh` re-exports every committed template and diffs it, so an
+edit made in the web interface shows as drift until its new export is
+committed. `templates/` was empty when the kit was built: the only template,
+`Capture_To_Ingest_v1`, lived on the WSL host, which is no longer reachable
+(see `templates/README.md` for the two ways back).
+
+**The rest of the host's configuration** follows the same rule: the kit is
+the source of truth and the server is built from it. `config/` holds every
+Goobi config file this institution changes (installed by `install.sh
+--config`), `config/goobi_config.overrides.properties` the individual keys
+changed in Goobi's main properties file, and `plugins.txt` the plugins, each
+with the config file it needs. `drift_check.sh --stock <stock config dir>`
+lists what a running host has changed from stock Goobi that the kit does not
+hold yet, which is how to harvest a host configured by hand before the kit
+existed. Details in README.md, *Keeping a server and this repo in sync*.
 
 ## 8. Mounts must exist before Tomcat starts
 
@@ -433,7 +453,8 @@ See `README.md` in this directory. Host requirements it adds:
 - `python3-tk` from apt if correctors will run the review GUI on this host.
   tkinter is not a pip package and is absent from a stock venv; without it the
   GUI cannot start at all. Under WSL, WSLg supplies the display (`DISPLAY=:0`).
-- `install.sh` in this directory places the wrapper and its registration.
+- `install.sh` in this directory places the wrapper and its registration
+  (and, with `--config` / `--review`, the rest of the kit; see README.md).
 
 **Deploy a pinned checkout, never a development working tree.** The wrapper
 executes `<app-dir>/src` directly, so whatever the working tree currently

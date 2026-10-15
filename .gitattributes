@@ -1,0 +1,6 @@
+# The Goobi integration runs on a Linux host. Keep its files LF even in a
+# Windows checkout, so a copy taken from a Windows machine still runs: a
+# CRLF shebang fails as "/bin/sh^M: bad interpreter", and a CRLF unit file
+# or Goobi config line carries a stray \r into every value.
+*.sh text eol=lf
+integration/goobi/** text eol=lf

@@ -1,0 +1,32 @@
+# Goobi plugins this workflow uses. Read by drift_check.sh; install.sh does
+# not download plugins (fetch them by hand, see below).
+#
+# Columns, whitespace-separated, "-" for none or not yet known:
+#   status   required = drift_check.sh fails without a matching jar
+#            planned  = reported for information only
+#   repo     intranda GitHub repository (github.com/intranda/<repo>)
+#   jar      case-insensitive glob matched against jar file names anywhere
+#            under /opt/digiverso/goobi/plugins/
+#   title    the plugin name a task's "Step plugin" field holds
+#   config   its config file in /opt/digiverso/goobi/config/; capture a
+#            changed one into config/ next to this file
+#
+# Versions: install the plugin release built for the Goobi version in
+# GOOBI_VERSION. intranda releases plugins alongside Goobi, so a plugin from
+# another release line can fail to load with no error that names the cause.
+#
+# Fetch each release's -base.jar into plugins/step/ (or plugins/import/ for
+# import plugins) and its -gui.jar, when it has one, into plugins/GUI/, then
+# restart Tomcat. A truncated download fails as "EOFException ... read:198"
+# (PROVISIONING.md section 1): re-fetch, do not debug.
+#
+# Jar names below are globs rather than exact names because intranda's
+# naming has varied between releases; tighten them once the new host is
+# built. The delay plugin's title is as recorded in schritte.stepPlugin on
+# the old host (2 Sep 2026); its config file name was not captured there.
+
+# status   repo                           jar              title                    config
+required   goobi-plugin-step-file-upload  *file*upload*    intranda_step_fileUpload plugin_intranda_step_fileUpload.xml
+required   goobi-plugin-step-imageqa      *imageqa*        intranda_step_imageQA    plugin_intranda_step_imageQA.xml
+required   goobi-plugin-step-delay        *delay*          intranda_delay_30_days   -
+planned    goobi-plugin-import-excel      *import*excel*   intranda_import_excel    plugin_intranda_import_excel.xml

@@ -4,14 +4,29 @@ Runs the ALTO-OCR pipeline as an automatic script step inside
 [Goobi workflow](https://docs.goobi.io/en/home). Verified against **Goobi
 workflow 26.06.1** on Ubuntu 24.04 / Tomcat 10 / OpenJDK 17.
 
+This folder is the **provisioning kit** for a Goobi host: everything this
+institution adds to a stock Goobi lives here, and `install.sh` applies it to a
+fresh server from a checkout of this repo. `drift_check.sh` then keeps the
+server and the repo honest with each other.
+
 | file | installs to |
 |---|---|
+| `GOOBI_VERSION` | — (the Goobi release the kit is verified against) |
 | `run_alto_ocr.sh` | `/opt/digiverso/goobi/scripts/run_alto_ocr.sh` |
-| `goobi_scripts.xml` | `/opt/digiverso/goobi/config/goobi_scripts.xml` |
-| `install.sh` | — (puts the other two in place) |
-| `PROVISIONING.md` | — (host build notes: what Goobi's own installer gets wrong) |
 | `import_images.sh` | `/opt/digiverso/goobi/scripts/import_images.sh` |
+| `config/goobi_scripts.xml` | `/opt/digiverso/goobi/config/goobi_scripts.xml` |
+| `config/goobi_processProperties.xml` | `/opt/digiverso/goobi/config/` — the task link, URL filled in at install |
+| `config/goobi_config.overrides.properties` | keys set in `/opt/digiverso/goobi/config/goobi_config.properties` |
+| `config/<anything else>` | `/opt/digiverso/goobi/config/` as is (captured plugin configs go here) |
+| `alto-ocr-review.service` | `/etc/systemd/system/` — app path filled in at install |
+| `apache-ocr-review.conf` | `/etc/apache2/conf-available/` |
+| `plugins.txt` | — (the plugins the workflow needs; fetched by hand) |
+| `templates/*.sql` | — (process templates as SQL; imported by hand) |
+| `install.sh` | — (applies all of the above) |
+| `drift_check.sh` | — (reports where a host and the kit disagree) |
+| `lib.sh` | — (shared by the two scripts above) |
 | `export_template.sh` | — (dumps a process template as re-importable SQL) |
+| `PROVISIONING.md` | — (host build notes: what Goobi's own installer gets wrong) |
 
 > Adding a script here: this repo has `core.fileMode false`, so `chmod +x`
 > is invisible to git. Set the bit in the index explicitly, or the committed
@@ -30,23 +45,104 @@ section below.
 
 ## Install
 
+On the Goobi host, from a checkout of this repo at a tag or merge commit (the
+wrapper runs the checkout's `src/` directly, so the checkout *is* production;
+see PROVISIONING.md section 10):
+
 ```sh
-sudo integration/goobi/install.sh            # app dir defaults to this repo
-sudo integration/goobi/install.sh --app-dir /srv/alto-ocr
-sudo systemctl restart tomcat10              # goobi_scripts.xml is read at startup
+sudo integration/goobi/install.sh                       # the OCR bridge only
+sudo integration/goobi/install.sh --all \
+    --review-url https://<goobi-host>/ocr-review/       # bridge + config + review server
+sudo integration/goobi/install.sh --app-dir /srv/alto-ocr ...   # app not in this checkout
 ```
 
-`install.sh` **replaces** `goobi_scripts.xml` rather than merging into it —
-Goobi's sample entries (Tiff-Header, Copy images, Compression) are dropped on
-purpose. Merge by hand on a host that has its own entries.
+| flag | adds |
+|---|---|
+| (none) | the two scripts and `goobi_scripts.xml` |
+| `--config` | the rest of `config/`, the task link rendered with `--review-url`, and the keys in `goobi_config.overrides.properties` |
+| `--review` | the review server's systemd unit (enabled, **not** started) and Apache conf (installed, **not** enabled) |
+| `--all` | `--config` and `--review` |
+
+It is idempotent: a file that already matches is left alone, and one that
+differs is copied to `<file>.bak-<UTC time>` before it is replaced, so
+re-running after a `git pull` installs exactly what changed. It never
+restarts Tomcat or Apache, never starts the review service, and never touches
+the database; it prints those as next steps instead. Two of them are
+deliberate gates:
+
+- **The Apache conf is not enabled for you.** The review server rewrites
+  ALTO and authenticates nobody, so its `Auth*` lines must be filled in to
+  match Goobi's before `a2enconf apache-ocr-review`.
+- **Templates are not imported for you.** A template import with a missing
+  dependency succeeds and then fails at process creation (PROVISIONING.md
+  section 7); see `templates/README.md`.
+
+`goobi_scripts.xml` is **replaced** rather than merged: Goobi's sample entries
+(Tiff-Header, Copy images, Compression) are dropped on purpose, and the backup
+keeps a host's own entries for merging by hand. Keys in
+`goobi_config.overrides.properties` are set in place, and a key set several
+times is collapsed to one line, which also clears the duplicated-file problem
+in PROVISIONING.md section 2 for those keys.
 
 Requires the pipeline's venv at `<app-dir>/venv`, Tesseract on `PATH`, and
-`--ref-id` support in the CLI (v0.8.15+). The venv must be readable *and
-executable by the `tomcat` user* — verify with `sudo -u tomcat`, not as
-yourself.
+`--ref-id` support in the CLI (v0.8.15+); `--review` also needs
+`requirements-web.txt` in that venv, and refuses to enable a unit whose first
+start would crash. The venv must be readable *and executable by the `tomcat`
+user*. Verify that with `sudo -u tomcat`, not as yourself.
+
+Plugins are fetched by hand: `plugins.txt` names each one, its intranda
+repository and the config file it needs. Install releases built for the
+version in `GOOBI_VERSION`.
 
 Building the Goobi host itself is a separate problem with its own set of
 undocumented traps: see [PROVISIONING.md](PROVISIONING.md).
+
+## Keeping a server and this repo in sync
+
+The rule: **change the kit first, then the server.** A setting changed only
+in Goobi's web interface or a config file on the server is drift, and the
+next fresh install silently loses it.
+
+```sh
+integration/goobi/drift_check.sh            # everything; exit 1 on drift
+integration/goobi/drift_check.sh --no-db    # skip re-exporting templates
+integration/goobi/drift_check.sh -q         # only the problems
+```
+
+It renders every managed file exactly as `install.sh` would and compares, so
+the two cannot disagree. It checks the deployed Goobi version against
+`GOOBI_VERSION`, the scripts and `config/` files, each override key, the
+review unit and Apache conf (with the `Auth*` lines set aside, since filling
+them in is the expected local change; a conf with no active `Require` line is
+reported as open), installed plugin jars against `plugins.txt` in both
+directions, and each `templates/*.sql` against a fresh export. It changes
+nothing on the host.
+
+For each item it reports, either commit the server's version into the kit,
+or re-run `install.sh` to put the kit's back. Run it after any change made
+through the web interface (a template edited, a task added), and before and
+after a Goobi upgrade.
+
+**Harvesting a server that predates the kit.** Point `--stock` at the stock
+config of the same Goobi release (`install/config` in a clone of
+`intranda/goobi-workflow` at the `GOOBI_VERSION` tag):
+
+```sh
+git clone --depth 1 --branch v$(cat integration/goobi/GOOBI_VERSION) \
+    https://github.com/intranda/goobi-workflow.git /tmp/goobi-src
+integration/goobi/drift_check.sh --stock /tmp/goobi-src/install/config
+```
+
+It then also lists every config file that differs from stock or is not in
+stock (plugin configs), and every `goobi_config.properties` line changed from
+stock, that `config/` does not yet hold. Those are the customizations nobody
+has captured; copy each one into `config/` (or the key into the overrides
+file) and commit.
+
+The Goobi source itself does not belong in this repo. It is only ever needed
+as a reference for what Goobi does, and a shallow clone at the pinned tag
+answers that without vendoring a few thousand files that would drift from
+upstream.
 
 ## Task configuration in Goobi
 
@@ -188,7 +284,10 @@ Deploy with the three files beside this README:
 |---|---|
 | `alto-ocr-review.service` | `/etc/systemd/system/` — runs as `tomcat`, binds localhost |
 | `apache-ocr-review.conf` | `/etc/apache2/conf-available/` — proxies `/ocr-review/` |
-| `goobi_processProperties.xml` | merge into `/opt/digiverso/goobi/config/` — the task link |
+| `config/goobi_processProperties.xml` | `/opt/digiverso/goobi/config/` — the task link |
+
+`install.sh --review` and `--config --review-url URL` put all three in
+place; the manual steps are kept here for reference.
 
 **Read this before exposing it.** The server rewrites ALTO and authenticates
 nobody. It binds to `127.0.0.1` so Apache is the only route in; fill in the
