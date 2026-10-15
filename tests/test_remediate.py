@@ -403,6 +403,119 @@ class VerifyTests(_PageFixture):
         self.assertNotIn("confirmed", body)
 
 
+class NetCountTests(_PageFixture):
+    """Provenance counts each word's net effect, not each action
+    (2026-10-15): the archive's record of how many words a human changed
+    must not grow because a corrector changed their mind."""
+
+    def _saved_step(self) -> str:
+        self.page.save()
+        body = self.alto.read_text(encoding="utf-8")
+        start = body.index("human review:")
+        return body[start:body.index("<", start)]
+
+    def test_word_edited_twice_counts_once(self) -> None:
+        cf = self.page.words[1]
+        self.page.edit_word(cf, "of")
+        self.page.edit_word(cf, "or")
+        self.assertEqual(self.page.session_edits, 1)
+        self.assertEqual(self._saved_step(), "human review: 1 word(s) corrected")
+
+    def test_edited_then_deleted_counts_once(self) -> None:
+        cf = self.page.words[1]
+        self.page.edit_word(cf, "of")
+        self.page.delete_word(cf)
+        self.assertEqual(self.page.session_edits, 1)
+
+    def test_edit_back_to_the_original_text_is_a_confirmation(self) -> None:
+        # The words are unchanged, but a human vouched for them: WC 1.00.
+        cf = self.page.words[1]
+        self.page.edit_word(cf, "of")
+        self.page.edit_word(cf, "cf")
+        self.assertEqual((self.page.session_edits, self.page.session_verifies), (0, 1))
+
+    def test_verified_then_edited_is_one_correction(self) -> None:
+        cf = self.page.words[1]
+        self.page.verify_word(cf)
+        self.page.edit_word(cf, "of")
+        self.assertEqual((self.page.session_edits, self.page.session_verifies), (1, 0))
+
+    def test_verified_then_deleted_is_one_correction(self) -> None:
+        cf = self.page.words[1]
+        self.page.verify_word(cf)
+        self.page.delete_word(cf)
+        self.assertEqual((self.page.session_edits, self.page.session_verifies), (1, 0))
+
+    def test_added_then_edited_counts_once(self) -> None:
+        word = self.page.add_word(_px_box(500, 105, 100, 55), "and")
+        self.page.edit_word(word, "an")
+        self.assertEqual(self.page.session_edits, 1)
+
+    def test_added_then_deleted_counts_nothing(self) -> None:
+        # Deleted the ordinary way rather than through undo_add.
+        word = self.page.add_word(_px_box(500, 105, 100, 55), "and")
+        self.page.delete_word(word)
+        self.assertEqual((self.page.session_edits, self.page.session_verifies), (0, 0))
+
+    def test_multi_word_delete_counts_each_word_once(self) -> None:
+        board, cf = self.page.words[0], self.page.words[1]
+        self.page.edit_word(cf, "of")
+        for word in (board, cf):
+            self.page.delete_word(word)
+        self.assertEqual(self.page.session_edits, 2)
+
+    def test_clear_page_after_edits_counts_each_word_once(self) -> None:
+        self.page.edit_word(self.page.words[1], "of")
+        self.page.verify_word(self.page.words[3])
+        self.assertEqual(self.page.clear_words(), 4)
+        self.assertEqual((self.page.session_edits, self.page.session_verifies), (4, 0))
+
+    def test_clear_page_nets_out_words_added_this_session(self) -> None:
+        self.page.add_word(_px_box(500, 105, 100, 55), "and")
+        self.assertEqual(self.page.clear_words(), 5)
+        self.assertEqual(self.page.session_edits, 4)  # the 4 that were on the file
+
+    def test_undo_mixed_with_redo_nets_out(self) -> None:
+        cf = self.page.words[1]
+        self.page.edit_word(cf, "of")
+        self.page.revert_word(cf, "cf", 0.40)
+        removal = self.page.delete_word(cf)
+        self.page.undo_delete(cf, removal)
+        self.assertEqual((self.page.session_edits, self.page.session_verifies), (0, 0))
+
+    def test_engine_wc_spelled_differently_survives_an_undo(self) -> None:
+        # "0.4" in the file, rewritten as "0.40" by unverify: not a change.
+        cf = self.page.words[1]
+        cf.elem.set("WC", "0.4")
+        self.page.verify_word(cf)
+        self.page.unverify_word(cf, 0.4)
+        self.assertEqual(self.page.session_verifies, 0)
+
+    def test_undo_past_a_save_counts_against_the_saved_file(self) -> None:
+        cf = self.page.words[1]
+        self.page.edit_word(cf, "of")
+        self.page.save()
+        self.page.revert_word(cf, "cf", 0.40)  # the GUI's undo stack outlives a save
+        self.assertEqual(self.page.session_edits, 1)
+        self.assertEqual(self._saved_step(), "human review: 2 word(s) corrected")
+
+    def test_save_starts_a_fresh_baseline(self) -> None:
+        cf = self.page.words[1]
+        self.page.edit_word(cf, "of")
+        self.page.save()
+        self.assertEqual(self.page.session_edits, 0)
+        self.page.edit_word(cf, "or")
+        self.assertEqual(self._saved_step(), "human review: 2 word(s) corrected")
+
+    def test_reading_order_moves_still_count_per_move(self) -> None:
+        lone = self.page.words[3]
+        self.page.move_words([lone], None)
+        self.page.move_words([lone], self.page.words[-1])
+        self.page.move_words([lone], None)
+        self.assertEqual(self.page.session_moves, 3)
+        self.assertEqual(self.page.session_edits, 0)
+
+
 class StepFromTests(_PageFixture):
     """Next/previous-word stepping (the GUI's Enter / n / p). Threshold 0.99
     flags all four fixture words, so a corrected word in the *middle* of the
