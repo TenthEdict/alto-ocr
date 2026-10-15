@@ -131,12 +131,20 @@ else
 fi
 
 if [ -n "$STOCK" ]; then
+    # Plugin configs are not part of stock Goobi; a plugin's own default
+    # lives in its repository, which this check cannot see. plugins.txt names
+    # them, so report them rather than calling them drift.
+    awk '!/^[ \t]*(#|$)/ && $5 != "-" { print $5 }' "$KIT_DIR/plugins.txt" > "$TMP/plugincfgs"
     # Customizations made on the host and never captured into config/.
     for live in "$GOOBI_ROOT"/config/*; do
         [ -f "$live" ] || continue
         n="$(basename -- "$live")"
-        case "$n" in *.bak-*|*~) continue ;; esac
+        case "$n" in *.bak|*.bak-*|*~) continue ;; esac
         [ -e "$CONFIG_DIR/$n" ] && continue
+        if grep -qxF "$n" "$TMP/plugincfgs"; then
+            info "config/$n: plugin config (plugins.txt); compare it with the plugin's install/ default"
+            continue
+        fi
         if [ "$n" = goobi_config.properties ]; then
             # Overridden keys are accounted for; anything else that moved
             # from stock is not.
@@ -146,7 +154,13 @@ if [ -n "$STOCK" ]; then
                 cut -d= -f1 "$TMP/overrides" | sed 's/[ \t]*$//' > "$TMP/okeys"
                 comm -13 "$TMP/stock.props" "$TMP/live.props" | while IFS= read -r l; do
                     key="$(printf '%s' "${l%%=*}" | sed 's/^[ \t]*//; s/[ \t]*$//')"
-                    grep -qxF "$key" "$TMP/okeys" || echo "$l"
+                    grep -qxF "$key" "$TMP/okeys" && continue
+                    # This output gets pasted into notes and commits: never
+                    # print a credential's value.
+                    case "$(lower "$key")" in
+                        *secret*|*password*|*passwd*|*token*) echo "$key=<redacted>" ;;
+                        *) echo "$l" ;;
+                    esac
                 done > "$TMP/uncaptured"
                 if [ -s "$TMP/uncaptured" ]; then
                     drift "goobi_config.properties: lines changed from stock and not in the overrides file:"

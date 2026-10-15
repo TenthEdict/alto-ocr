@@ -14,19 +14,25 @@ integration/goobi/export_template.sh Capture_To_Ingest_v1 \
 it, so a step added or reordered in the Goobi web interface shows up as drift
 until the new export is committed.
 
-**This folder is empty on purpose.** The only built template so far,
-`Capture_To_Ingest_v1` (10 steps; see PROVISIONING.md section 5), lived on a
-WSL host that is no longer reachable, and an SQL dump cannot be reconstructed
-by hand without risking the ID collisions `export_template.sh` guards
-against. On the new server, either:
+**`Capture_To_Ingest_v1.sql`** was harvested from the old WSL host on
+2026-10-15 (`ProzesseID 12`, steps 52-60 and 70, every step assigned to user
+group 1; a fresh install seeds processes 1 and 4 and steps up to 28, so the
+IDs are free on a new server). Its ten steps are the stage table in
+PROVISIONING.md section 5 in order: Capture, QC1, Post-Process, Import Images
+(script), QC2 (`intranda_step_imageQA`), OCR (script), Transcript Correction
+(metadata + images), Review to Upload, Review to Remove
+(`intranda_delay_30_days`, delay step), Delete Images. On the new server,
+run the pre-flight queries in its header, then
+`mysql goobi < Capture_To_Ingest_v1.sql` and restart Tomcat. Group 1 is the
+stock *Administration* group: reassign the steps to real groups in the web
+interface once users exist, then re-export.
 
-- **import** it, if the old host comes back: export there, commit the file,
-  run the pre-flight queries in its header on the new host, then
-  `mysql goobi < Capture_To_Ingest_v1.sql` and restart Tomcat; or
-- **rebuild** it in the web interface from the stage table in PROVISIONING.md
-  section 5, then export it here straight away.
+The dump was written by MariaDB 10.11.14's `mysqldump`, which opens each
+table's section with `/*M!999999\- enable the sandbox mode */`. MariaDB
+10.11.8 and later accept it; an older `mysql` client, or MySQL, stops with
+*Unknown command '\-'*. Delete those lines if the target's client is older.
 
-Either way the file committed here becomes the source of truth. Re-export
+The file committed here is the source of truth. Re-export
 and commit after every template change made in the web interface.
 
 Importing never happens automatically: `install.sh` does not touch the

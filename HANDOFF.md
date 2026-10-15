@@ -197,8 +197,8 @@ then the server.**
 | Task link to the review UI (`config/goobi_processProperties.xml`) | done; `install.sh --config --review-url URL` fills in the real URL |
 | `goobi_config.properties` keys (`config/goobi_config.overrides.properties`) | `dailyDelayJob` only (without it, delay steps never close) |
 | Review server (`alto-ocr-review.service`, `apache-ocr-review.conf`) | done; `install.sh --review` installs it, but the Apache conf stays disabled until you fill in its `Auth*` lines |
-| Plugins (`plugins.txt`) | listed (file upload, image QA, delay, planned Excel import); **jar name patterns and the delay plugin's config name are unverified** |
-| Workflow template `Capture_To_Ingest_v1` (10 steps) | **not captured**; `templates/` is empty |
+| Plugins (`plugins.txt`) | verified against the old host 2026-10-15: exact jar names recorded, file-upload/imageQA configs are the v26.06.1 defaults, the delay plugin needs no config file; Excel import still planned |
+| Workflow template `Capture_To_Ingest_v1` (10 steps) | **captured** 2026-10-15 from the old WSL host: `templates/Capture_To_Ingest_v1.sql` (import it; see `templates/README.md`) |
 | `drift_check.sh` | compares a host with the kit, read-only; `--stock` lists customizations not yet captured |
 
 **Building the new server, in order:**
@@ -212,20 +212,21 @@ then the server.**
 3. Build `venv/` there (as above), readable and executable by `tomcat`.
 4. `sudo integration/goobi/install.sh --all --review-url https://<host>/ocr-review/`
 5. Fetch the plugins in `plugins.txt` (releases for 26.06.1).
-6. Rebuild `Capture_To_Ingest_v1` in the web UI from the stage table in
-   `PROVISIONING.md` section 5, then
-   `integration/goobi/export_template.sh Capture_To_Ingest_v1 > integration/goobi/templates/Capture_To_Ingest_v1.sql`
-   and commit it.
+6. Import `templates/Capture_To_Ingest_v1.sql` (pre-flight queries in its
+   header first; see `templates/README.md`), reassign its steps from the
+   stock Administration group to real groups, then re-export with
+   `export_template.sh` and commit.
 7. Fill in the Apache `Auth*` lines, `a2enconf apache-ocr-review`, start
    `alto-ocr-review`, restart Tomcat.
 8. Run `integration/goobi/drift_check.sh` until it reports no drift; commit
    whatever it finds (captured plugin configs go into `config/`).
 
-**If the new computer is the one that still has the old WSL Goobi
-install,** harvest it first: export the template with `export_template.sh`
-and run `drift_check.sh --stock <clone of intranda/goobi-workflow at
-v26.06.1>/install/config` there. That lists every customization the kit is
-missing.
+**The old WSL Goobi install was harvested on 2026-10-15** (it turned out to
+be on the new development machine). What was captured, and what was left out
+on purpose, is in `PROVISIONING.md` section 11. In short, the template, the
+delay job's time and the plugin names were captured. The installer's stale
+defaults were left behind, notably a `goobi_mail.xml` that emails passwords
+in plain text.
 
 **Open from the 2 September demo prep (status unknown since; check):** the
 review server had never been started on the old host; the task link wasn't
