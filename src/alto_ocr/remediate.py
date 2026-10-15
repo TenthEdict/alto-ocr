@@ -372,6 +372,21 @@ class ReviewPage:
         self._restore(word, removal)
         self.session_edits = max(0, self.session_edits - 1)
 
+    def line_words(self, word: Word) -> list[Word]:
+        """Every word on ``word``'s TextLine, in reading order — a whole
+        garbage line is selected (and deleted) in one gesture."""
+        line = word.elem.getparent()
+        return [w for w in self.words if w.elem.getparent() is line]
+
+    def block_words(self, word: Word) -> list[Word]:
+        """Every word in ``word``'s TextBlock, in reading order (its line
+        alone when the word sits in no TextBlock)."""
+        block = next((a for a in word.elem.iterancestors()
+                      if etree.QName(a).localname == "TextBlock"), None)
+        if block is None:
+            return self.line_words(word)
+        return [w for w in self.words if any(a is block for a in w.elem.iterancestors())]
+
     def _remove_string(self, word: Word) -> Removal:
         """Detach a word's ``<String>`` plus a neighboring ``<SP>``, cascading
         away emptied containers. Shared by ``delete_word`` and ``undo_add``."""

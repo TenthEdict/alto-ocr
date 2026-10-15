@@ -23,8 +23,17 @@ list keeps its order while you work; re-tick "Worst first" or reload the
 object to re-rank it.
 
 Keyboard flow for correctors: **Enter** commits the edit and jumps to the
-next flagged word, **Escape** deselects, **n/p** step through flagged words
-(canvas focus), **Ctrl+Z** undoes the last change, **Ctrl+S** saves. Enter
+next flagged word, **Escape** deselects, **n/p** step through flagged words,
+**Tab/Shift+Tab** step too — from inside the editor as well, where n and p
+must type — **Delete** (or **Ctrl+D** anywhere) removes the selected
+word(s), **Ctrl+Z** undoes the last change, **Ctrl+S** saves. Shortcuts are
+routed by one tab-level dispatcher (``_on_key``, ``bind_all``), not by
+bindings on the canvas: they work wherever keyboard focus happens to sit —
+on a toolbar button just clicked, the page list, the scan — and only the
+text fields keep the plain keys for typing. Until v0.10.4 they were canvas
+bindings, and because selecting a word (which n/p themselves do) moves focus
+into the editor, the second ``n`` typed an "n" over the word instead of
+stepping; a click on any toolbar button silenced Esc the same way. Enter
 on a word left *unchanged* confirms it — the OCR was right and only the
 confidence was low — stamping ``WC="1.00"`` so it leaves the queue for good
 (``remediate.ReviewPage.verify_word``, counted apart from corrections in the
@@ -36,6 +45,21 @@ happens at once, with no confirmation prompt; Ctrl+Z puts it back exactly
 (``remediate.ReviewPage.undo_delete``). On the canvas, plain scroll pans
 vertically, **Shift+scroll** horizontally, and **Ctrl+scroll** zooms about
 the mouse cursor.
+
+**Selecting several words** works the same way in every mode: Shift+click
+extends to a run, Ctrl+click adds or drops a word, dragging a box on the
+scan selects the words whose centres fall inside it, a **double-click**
+selects the word's whole line and a **triple-click** its block. With
+several words selected the editor bar shows the count and **Delete** (the
+key, the button, Ctrl+D, or the right-click menu) removes them all in one
+step — a garbage line or a column of noise no longer has to be deleted
+word by word or by clearing the whole page — and one Ctrl+Z puts them all
+back (``remediate.ReviewPage.delete_words``). Outside reading-order mode
+only words drawn on the scan are selectable this way, so with "All words"
+off a box cannot sweep up words the corrector cannot see. A **right-click**
+on the scan opens a menu of the same actions (edit, delete, select line /
+block, and in reading-order mode the move targets) for correctors who
+would rather not memorise keys.
 
 **Clear page** (toolbar, confirm-gated) bulk-deletes every word on a page
 whose OCR is wholly hallucinated — covers and photographs where fabric or
@@ -70,7 +94,9 @@ It works on **words**: select the words out of place — click one, Shift+click
 to extend to a run, Ctrl+click to add or drop a word, or drag a box around a
 column or caption (Tesseract's lines often run across both columns, so a
 column is never a contiguous run) — then click the word they should come
-after; "Page start" puts them first, Ctrl+Up/Ctrl+Down nudge them one word. The scan shows the
+after, or **drag the selection and drop it on that word**; the right-click
+menu offers "after" and "before" the clicked word; "Page start" puts them
+first, Ctrl+Up/Ctrl+Down nudge them one word. The scan shows the
 reading path (word to word, an arrow at each line break) and a side panel
 shows the transcript exactly as a save will write it — clicks there work
 like clicks on the scan. ``remediate.ReviewPage.move_words``/``nudge_words``
@@ -137,6 +163,9 @@ THRESHOLD_CHOICES: tuple[str, ...] = tuple(f"{p}%" for p in range(0, 101, 5))
 # on disk, but the corrector should still see what they touched).
 _COLOR_EDITED = "#1f6feb"
 _COLOR_UNSCORED = "#c026d3"  # no WC (GLMOCR output): needs eyes everywhere
+# The selection, outside reading-order mode: one colour for one word or
+# fifty, distinct from every confidence colour and from edited blue.
+_COLOR_SELECTED = "#7c3aed"
 # Reading-order mode. The path has to read at a glance on a page of black
 # type, so it is a saturated colour, drawn heavy on a thin white casing; the
 # word boxes recede to a thin neutral grey so path and boxes never blur
@@ -184,9 +213,19 @@ class _AddEntry:
 
 @dataclass
 class _DeleteEntry:
-    word: Word
-    removal: Removal
-    added: bool  # the word was added this session: undo re-adds it (redo_add)
+    """One deletion gesture — a single word or a whole selection — undone
+    as one step. ``added`` marks words added this session: their undo
+    re-adds them (``redo_add``) instead of restoring an engine word."""
+
+    items: list[tuple[Word, Removal, bool]]  # (word, removal, added), deletion order
+
+    @property
+    def word(self) -> Word:
+        return self.items[0][0]
+
+    @property
+    def words(self) -> list[Word]:
+        return [w for w, _r, _a in self.items]
 
 
 @dataclass
@@ -312,20 +351,31 @@ class ReviewFrame(ttk.Frame):
         self._snippet_photo: Optional[ImageTk.PhotoImage] = None
         self._scale = 1.0
         self._rect_by_word: dict[int, int] = {}   # id(Word) -> canvas item
+        # The selection, in reading order, in every mode: the words a
+        # Delete removes, a reading-order move carries, and — when it is
+        # exactly one word — the word in the editor bar (``_selected``).
+        self._sel: list[Word] = []
+        self._anchor: Optional[Word] = None       # where Shift+click extends from
         self._selected: Optional[Word] = None
         self._undo: list[_EditEntry | _VerifyEntry | _AddEntry
                          | _DeleteEntry | _MoveEntry] = []
-        # Reading-order mode state: the words selected to move (reading
-        # order), the word a Shift+click extends from, and the transcript
-        # panel's (start, end, word) character spans.
-        self._order_sel: list[Word] = []
-        self._order_anchor: Optional[Word] = None
+        # Reading-order mode: the transcript panel's (start, end, word)
+        # character spans and its buttons.
         self._order_spans: list[tuple[int, int, Word]] = []
         self._order_buttons: list[ttk.Button] = []
-        # A press on the scan in reading-order mode: (canvas x, y, modifier)
-        # until release decides whether it was a click or a box drag.
-        self._order_press_at: Optional[tuple[float, float, str]] = None
-        self._order_rect: Optional[int] = None
+        # A press on the scan (outside add mode): (canvas x, y, modifier)
+        # until release decides whether it was a click, a box drag, or — in
+        # reading-order mode, from a selected word — a drag of the selection
+        # to drop on its new place.
+        self._press_at: Optional[tuple[float, float, str]] = None
+        self._press_word: Optional[Word] = None
+        self._drag_rect: Optional[int] = None
+        self._dropping = False
+        self._menu: Optional[tk.Menu] = None
+        # True right after a click moved words, so the double-click that
+        # click began does not also select a line.
+        self._last_click_moved = False
+        self._windowing = str(self.tk.call("tk", "windowingsystem"))
         # Add-word mode state: the drag in progress and the finalized box
         # (image-pixel space) awaiting its text.
         self._drag_start: Optional[tuple[float, float]] = None
@@ -458,10 +508,10 @@ class ReviewFrame(ttk.Frame):
         bar.grid(row=1, column=0, sticky="ew", pady=(0, 4))
         b = ttk.Button(bar, text="◀ Prev", command=lambda: self._goto_flagged(-1))
         b.pack(side="left")
-        Tooltip(b, "Previous flagged word (p)")
+        Tooltip(b, "Previous flagged word (p; Shift+Tab from the editor)")
         b = ttk.Button(bar, text="Next ▶", command=lambda: self._goto_flagged(+1))
         b.pack(side="left", padx=(4, 10))
-        Tooltip(b, "Next flagged word (n)")
+        Tooltip(b, "Next flagged word (n; Tab from the editor)")
         b = ttk.Button(bar, text="Undo", command=self._undo_edit)
         b.pack(side="left")
         Tooltip(b, "Undo the last change on this page (Ctrl+Z)")
@@ -497,11 +547,33 @@ class ReviewFrame(ttk.Frame):
         ttk.Label(ws, textvariable=self.var_status, style="Muted.TLabel").grid(
             row=4, column=0, sticky="w", pady=(4, 0))
 
-        for widget in (self.canvas, self.ent_edit, self.txt_order):
-            widget.bind("<Control-z>", lambda _e: self._undo_edit())
-            widget.bind("<Control-s>", lambda _e: self._save_page() or "break")
-            widget.bind("<Control-Prior>", lambda _e: self._goto_page(-1) or "break")
-            widget.bind("<Control-Next>", lambda _e: self._goto_page(+1) or "break")
+        # Every shortcut goes through one dispatcher, bound at the
+        # application level, so it works wherever focus is (see _on_key).
+        # Tab is the exception: Tk's own focus-traversal binding for it is
+        # more specific than <KeyPress>, so the two widgets where Tab means
+        # "next flagged word" bind it themselves.
+        self.bind_all("<KeyPress>", self._on_key, add="+")
+        for widget in (self.canvas, self.ent_edit):
+            widget.bind("<Tab>", lambda _e: self._goto_flagged(+1) or "break")
+            widget.bind("<Shift-Tab>", lambda _e: self._goto_flagged(-1) or "break")
+            if widget.tk.call("tk", "windowingsystem") == "x11":
+                widget.bind("<ISO_Left_Tab>", lambda _e: self._goto_flagged(-1) or "break")
+        # Tool buttons never take focus: a click on "Next ▶" must not put
+        # the keyboard on the button, where n/p/Esc would be lost.
+        for widget in self._tool_widgets(ws):
+            widget.configure(takefocus=False)
+
+    @staticmethod
+    def _tool_widgets(root: tk.Misc) -> list[tk.Widget]:
+        found: list[tk.Widget] = []
+        stack = [root]
+        while stack:
+            w = stack.pop()
+            for child in w.winfo_children():
+                if isinstance(child, (ttk.Button, ttk.Checkbutton, tk.Button)):
+                    found.append(child)
+                stack.append(child)
+        return found
 
     def _bind_canvas(self) -> None:
         c = self.canvas
@@ -523,15 +595,12 @@ class ReviewFrame(ttk.Frame):
                 c.bind(f"<Shift-Button-{button}>", lambda e, d=delta: self._on_wheel_h(d))
                 c.bind(f"<Control-Button-{button}>",
                        lambda e, d=delta: self._on_wheel_zoom(e, d))
-        c.bind("<Key-n>", lambda _e: self._goto_flagged(+1))
-        c.bind("<Key-p>", lambda _e: self._goto_flagged(-1))
-        c.bind("<Key-a>", lambda _e: self._toggle_add_mode())
-        c.bind("<Key-r>", lambda _e: self._toggle_reorder_mode())
-        c.bind("<Escape>", lambda _e: self._on_canvas_escape())
-        c.bind("<Control-Up>", lambda _e: self._order_nudge(-1) or "break")
-        c.bind("<Control-Down>", lambda _e: self._order_nudge(+1) or "break")
-        c.bind("<Return>", lambda _e: self._order_edit_word())
-        c.bind("<F2>", lambda _e: self._order_edit_word())
+        c.bind("<Double-Button-1>", lambda e: self._on_canvas_multi_click(e, "line"))
+        c.bind("<Triple-Button-1>", lambda e: self._on_canvas_multi_click(e, "block"))
+        # The context menu: right button (button 2 on macOS).
+        c.bind("<Button-3>", self._on_canvas_menu)
+        if c.tk.call("tk", "windowingsystem") == "aqua":
+            c.bind("<Button-2>", self._on_canvas_menu)
 
     def _build_order_panel(self, area: ttk.Frame) -> None:
         # Reading-order side panel: hidden until the mode is toggled on.
@@ -552,8 +621,7 @@ class ReviewFrame(ttk.Frame):
              lambda: self._order_nudge(+1)),
             ("⤒ Page start", "Make the selection the first words on the page",
              self._order_to_start),
-            ("Clear", "Clear the selection (Esc)",
-             lambda: self._set_order_selection([], None)),
+            ("Clear", "Clear the selection (Esc)", self._clear_selection),
         ):
             b = ttk.Button(btns, text=label, command=command)
             b.pack(side="left", padx=(0, 4))
@@ -562,7 +630,7 @@ class ReviewFrame(ttk.Frame):
         # Fixing a word's text without leaving the mode: a single selected
         # word sits in the editor bar below, ready for typing.
         self.btn_order_edit = ttk.Button(btns, text="✎ Edit word",
-                                         command=self._order_edit_word)
+                                         command=self._edit_selected_word)
         self.btn_order_edit.pack(side="left", padx=(0, 4))
         Tooltip(self.btn_order_edit,
                 "Correct the selected word's text in the editor below (Enter or F2)")
@@ -582,17 +650,13 @@ class ReviewFrame(ttk.Frame):
         t.bind("<Button-1>", lambda e: self._on_order_text_click(e, shift=False))
         t.bind("<Shift-Button-1>", lambda e: self._on_order_text_click(e, shift=True))
         t.bind("<Control-Button-1>", lambda e: self._on_order_text_toggle(e))
-        for seq in ("<B1-Motion>", "<Double-Button-1>", "<Triple-Button-1>"):
-            t.bind(seq, lambda _e: "break")
-        t.bind("<Escape>", lambda _e: self._on_canvas_escape())
-        t.bind("<Control-Up>", lambda _e: self._order_nudge(-1) or "break")
-        t.bind("<Control-Down>", lambda _e: self._order_nudge(+1) or "break")
-        for seq in ("<Return>", "<F2>"):
-            t.bind(seq, lambda _e: self._order_edit_word() or "break")
+        t.bind("<B1-Motion>", lambda _e: "break")
+        t.bind("<Double-Button-1>", lambda e: self._on_order_text_multi(e, "line"))
+        t.bind("<Triple-Button-1>", lambda e: self._on_order_text_multi(e, "block"))
         panel.grid_remove()
 
     def _build_editor(self, ws: tk.Frame) -> None:
-        editor = ttk.LabelFrame(ws, text="Selected word", padding=6)
+        editor = self.editor_frame = ttk.LabelFrame(ws, text="Selected word", padding=6)
         editor.grid(row=3, column=0, sticky="ew", pady=(6, 0))
         editor.columnconfigure(2, weight=1)
         self.lbl_snippet = ttk.Label(editor)
@@ -602,14 +666,17 @@ class ReviewFrame(ttk.Frame):
         self.ent_edit = ttk.Entry(editor, textvariable=self.var_edit, font=("Consolas", 12))
         self.ent_edit.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(0, 8))
         self.ent_edit.bind("<Return>", lambda _e: self._apply_edit(advance=True))
+        self.ent_edit.bind("<KP_Enter>", lambda _e: self._apply_edit(advance=True))
         self.ent_edit.bind("<Escape>", lambda _e: self._on_escape())
         btns = ttk.Frame(editor)
         btns.grid(row=1, column=3, sticky="e")
         ttk.Button(btns, text="Apply / Confirm (Enter)",
                    command=lambda: self._apply_edit(advance=True)).pack(side="left")
-        b = ttk.Button(btns, text="Delete word", command=self._delete_word)
-        b.pack(side="left", padx=(6, 0))
-        Tooltip(b, "Remove a word the OCR made up (Ctrl+Z puts it back)")
+        self.btn_delete = ttk.Button(btns, text="Delete word",
+                                     command=self._delete_selection)
+        self.btn_delete.pack(side="left", padx=(6, 0))
+        Tooltip(self.btn_delete, "Remove the selected word(s) the OCR made up "
+                                 "(Delete / Ctrl+D; Ctrl+Z puts them back)")
         ttk.Checkbutton(btns, text="Symbols", variable=self.var_symbols,
                         command=self._on_symbols_toggled).pack(side="left", padx=(10, 0))
 
@@ -692,6 +759,10 @@ class ReviewFrame(ttk.Frame):
         """Type a keyboard symbol into the word editor the way a key press
         would: replacing any selected text, leaving the caret after it."""
         ent = self.ent_edit
+        if self._selected is None and self._pending_box is None:
+            self.var_status.set("Select one word to type into first.")
+            self.bell()
+            return
         if ent.selection_present():
             ent.delete("sel.first", "sel.last")
         ent.insert("insert", ch)
@@ -852,8 +923,8 @@ class ReviewFrame(ttk.Frame):
         self._selected = None
         self._undo.clear()
         self._cancel_pending_add()
-        self._order_sel = []
-        self._order_anchor = None
+        self._sel = []
+        self._anchor = None
         if self.var_reorder_mode.get():
             self._refresh_order_panel()
         self.canvas.delete("all")
@@ -946,15 +1017,20 @@ class ReviewFrame(ttk.Frame):
             return
         threshold = self._threshold()
         edited = self._touched_ids()
+        chosen = {id(w) for w in self._sel}
         for word in self._page.words:
             flagged = word.needs_review(threshold)
-            if not (flagged or self.var_show_all.get() or id(word) in edited):
+            picked = id(word) in chosen
+            if not (flagged or self.var_show_all.get() or id(word) in edited
+                    or picked):
                 continue
             x, y, bw, bh = word.box_px
-            color = _COLOR_EDITED if id(word) in edited else _wc_color(word.wc)
+            color = (_COLOR_SELECTED if picked
+                     else _COLOR_EDITED if id(word) in edited
+                     else _wc_color(word.wc))
             item = self.canvas.create_rectangle(
                 x * scale, y * scale, (x + bw) * scale, (y + bh) * scale,
-                outline=color, width=3 if word is self._selected else 2,
+                outline=color, width=3 if picked else 2,
                 tags=(_OVERLAY,),
             )
             self._rect_by_word[id(word)] = item
@@ -1005,26 +1081,507 @@ class ReviewFrame(ttk.Frame):
         self.canvas.xview_moveto(max(0.0, min(1.0, (ix * self._scale - event.x) / w)))
         self.canvas.yview_moveto(max(0.0, min(1.0, (iy * self._scale - event.y) / h)))
 
-    # ---------- selection / editing --------------------------------------
+    # ---------- keyboard ---------------------------------------------------
+
+    # Widget classes whose plain keys are typing. A disabled or read-only
+    # one (the zoom/threshold dropdowns, the transcript panel, the editor
+    # while several words are selected) types nothing, so it gets the
+    # shortcuts like any other widget.
+    _TYPING_CLASSES = frozenset({"Entry", "TEntry", "TCombobox", "Spinbox",
+                                 "TSpinbox", "Text"})
+
+    def _widget(self, widget: object) -> Optional[tk.Misc]:
+        if isinstance(widget, tk.Misc):
+            return widget
+        try:
+            return self.nametowidget(str(widget))
+        except (KeyError, tk.TclError):
+            return None  # e.g. a combobox's popdown, which Tkinter never wrapped
+
+    def _owns_event(self, widget: object) -> bool:
+        """Is a key event for this tab? Its widgets (the page view keeps its
+        path when it pops out), or — just after a click on the tab itself —
+        the main window or the notebook while this tab is on show."""
+        path, mine = str(widget), str(self)
+        if path == mine or path.startswith(mine + "."):
+            return True
+        w = self._widget(widget)
+        if w is None or not self.winfo_ismapped():
+            return False
+        return w is self.winfo_toplevel() or isinstance(w, ttk.Notebook)
+
+    def _is_typing(self, widget: object) -> bool:
+        w = self._widget(widget)
+        if w is None:
+            return False
+        try:
+            if w.winfo_class() not in self._TYPING_CLASSES:
+                return False
+            return str(w.cget("state")) not in ("disabled", "readonly")
+        except tk.TclError:
+            return False
+
+    def _focus(self) -> Optional[tk.Misc]:
+        try:
+            return self.focus_get()
+        except (KeyError, tk.TclError):
+            return None
+
+    def _on_key(self, event: tk.Event) -> Optional[str]:
+        """Every Review shortcut, wherever focus sits in the tab.
+
+        Bound with ``bind_all``, so it runs after the focused widget's own
+        bindings: the editor's Enter/Escape and the page list's arrows keep
+        working as before. Ctrl shortcuts work everywhere except the folder
+        fields; plain keys (n, p, a, r, Esc, Delete, Enter, F2) only where
+        they would not be typing."""
+        if not self._owns_event(event.widget):
+            return None
+        key = event.keysym
+        ctrl = bool(event.state & 0x4)
+        alt = bool(event.state & (0x20000 if self._windowing == "win32" else 0x8))
+        typing = self._is_typing(event.widget)
+        editor = str(event.widget) == str(self.ent_edit)
+        other_field = typing and not editor  # the folder entries
+        if ctrl and not alt:
+            k = key.lower()
+            if k == "s":
+                self._save_page()
+            elif key == "Prior":
+                self._goto_page(-1)
+            elif key == "Next":
+                self._goto_page(+1)
+            elif k == "z" and not other_field:
+                self._undo_edit()
+            elif k == "d" and not other_field:
+                self._delete_selection()
+            elif key in ("Up", "Down") and not typing:
+                self._order_nudge(-1 if key == "Up" else +1)
+            else:
+                return None
+            return "break"
+        if typing or alt:
+            return None
+        k = key.lower() if len(key) == 1 else key
+        if k == "n":
+            self._goto_flagged(+1)
+        elif k == "p":
+            self._goto_flagged(-1)
+        elif k == "a":
+            self._toggle_add_mode()
+        elif k == "r":
+            self._toggle_reorder_mode()
+        elif key == "Escape":
+            self._on_canvas_escape()
+        elif key in ("Delete", "BackSpace"):
+            self._delete_selection()
+        elif key in ("Return", "KP_Enter", "F2"):
+            self._edit_selected_word()
+        else:
+            return None
+        return "break"
+
+    # ---------- the scan: clicks, drags, the context menu -----------------
 
     def _on_canvas_click(self, event: tk.Event) -> None:
+        self._canvas_press(event, "plain")
+
+    def _on_canvas_modified_click(self, event: tk.Event, mode: str) -> None:
+        self._canvas_press(event, mode)
+
+    def _canvas_press(self, event: tk.Event, mode: str) -> None:
+        """A button press on the scan. Add mode starts a rubber band; any
+        other mode records the press, and release decides what it was: a
+        click, a box drawn around words, or (reading order, from a selected
+        word) the selection dragged to its new place."""
         self.canvas.focus_set()
+        self._last_click_moved = False
         if self._page is None:
             return
-        if self.var_reorder_mode.get():
-            # Reorder mode: a click selects words or places the selection; a
-            # drag boxes words. Release decides which it was.
-            self._order_press(event, "plain")
-            return
+        cx, cy = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
         if self.var_add_mode.get():
-            # Add mode: the click starts a rubber-band drag, not a selection.
             self._cancel_pending_add()
-            self._drag_start = (self.canvas.canvasx(event.x),
-                                self.canvas.canvasy(event.y))
+            self._drag_start = (cx, cy)
             return
+        word = self._page.word_at(cx / self._scale, cy / self._scale)
+        self._press_at = (cx, cy, mode)
+        self._press_word = word
+        self._drag_rect = None
+        self._dropping = (self.var_reorder_mode.get() and mode == "plain"
+                          and word is not None and self._is_selected(word))
+
+    def _on_canvas_drag(self, event: tk.Event) -> None:
+        if self._drag_start is not None:  # add mode: the word's box
+            x0, y0 = self._drag_start
+            x1, y1 = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+            if self._drag_item is None:
+                self._drag_item = self.canvas.create_rectangle(
+                    x0, y0, x1, y1, outline=_COLOR_EDITED, width=2, dash=(4, 2),
+                    tags=(_OVERLAY,))
+            else:
+                self.canvas.coords(self._drag_item, x0, y0, x1, y1)
+            return
+        if self._press_at is None:
+            return
+        self._autoscroll(event)
+        x0, y0, _mode = self._press_at
+        x1, y1 = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        if self._drag_rect is None and abs(x1 - x0) < 5 and abs(y1 - y0) < 5:
+            return  # still a click: hands wobble
+        if self._dropping:
+            self._draw_drop_marker(x1, y1)
+            return
+        if self._drag_rect is None:
+            self._drag_rect = self.canvas.create_rectangle(
+                x0, y0, x1, y1, outline=_COLOR_SELECTED, width=2, dash=(4, 2),
+                tags=(_OVERLAY,))
+        else:
+            self.canvas.coords(self._drag_rect, x0, y0, x1, y1)
+
+    def _autoscroll(self, event: tk.Event) -> None:
+        """Dragging near an edge of the view scrolls it, so a box or a drop
+        can reach words that are off screen."""
+        margin = 24
+        if event.y < margin:
+            self.canvas.yview_scroll(-1, "units")
+        elif event.y > self.canvas.winfo_height() - margin:
+            self.canvas.yview_scroll(1, "units")
+        if event.x < margin:
+            self.canvas.xview_scroll(-1, "units")
+        elif event.x > self.canvas.winfo_width() - margin:
+            self.canvas.xview_scroll(1, "units")
+
+    def _drop_target(self, cx: float, cy: float) -> tuple[Optional[Word], bool]:
+        """Where a dragged selection would land: the word under the canvas
+        point and whether it goes *before* it (left half) or after it."""
+        word = self._page.word_at(cx / self._scale, cy / self._scale)
+        if word is None or self._is_selected(word):
+            return None, False
+        x, _y, bw, _bh = word.box_px
+        return word, cx / self._scale < x + bw / 2
+
+    def _draw_drop_marker(self, cx: float, cy: float) -> None:
+        """While dragging the selection: an insertion bar on the side of the
+        word it would land beside, and a hint in the status line."""
+        if self._drag_rect is not None:
+            self.canvas.delete(self._drag_rect)
+            self._drag_rect = None
+        self.canvas.configure(cursor="fleur")
+        target, before = self._drop_target(cx, cy)
+        if target is None:
+            # A placeholder item keeps "a drag is in progress" true.
+            self._drag_rect = self.canvas.create_line(
+                cx, cy, cx, cy, fill="", tags=(_OVERLAY,))
+            self.var_status.set(f"Drop the {len(self._sel)} word(s) on the word "
+                                "they belong beside.")
+            return
+        s = self._scale
+        x, y, bw, bh = target.box_px
+        bar_x = (x if before else x + bw) * s
+        self._drag_rect = self.canvas.create_line(
+            bar_x, (y - bh * 0.15) * s, bar_x, (y + bh * 1.15) * s,
+            fill=_COLOR_SELECTED, width=4, capstyle="round", tags=(_OVERLAY,))
+        self.var_status.set(f"Release to move the {len(self._sel)} word(s) "
+                            f"{'before' if before else 'after'} “{target.content}”.")
+
+    def _on_canvas_release(self, event: tk.Event) -> None:
+        if self._drag_start is not None:
+            self._finish_add_drag(event)
+            return
+        if self._press_at is None:
+            return
+        x0, y0, mode = self._press_at
+        word, dropping = self._press_word, self._dropping
+        self._press_at, self._press_word, self._dropping = None, None, False
+        dragged = self._drag_rect is not None
+        if dragged:
+            self.canvas.delete(self._drag_rect)
+            self._drag_rect = None
+            self.canvas.configure(cursor="")
+        if self._page is None:
+            return
+        x1, y1 = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        if dragged and dropping:
+            target, before = self._drop_target(x1, y1)
+            if target is None:
+                self._update_status("Nothing moved — drop the words on a word "
+                                    "outside the selection.")
+            else:
+                self._order_place(target, before)
+            return
+        if dragged:
+            s = self._scale
+            self._box_select((min(x0, x1) / s, min(y0, y1) / s,
+                              abs(x1 - x0) / s, abs(y1 - y0) / s),
+                             add=mode != "plain")
+            return
+        self._click_word(word, mode)
+
+    def _click_word(self, word: Optional[Word], mode: str) -> None:
+        """A click (no drag) on the scan or in the transcript panel."""
+        if self.var_reorder_mode.get():
+            if mode == "ctrl":
+                self._toggle_word(word)
+            else:
+                self._order_pick(word, shift=mode == "shift")
+            return
+        if mode == "ctrl":
+            self._toggle_word(word)
+        elif mode == "shift" and word is not None and self._anchor is not None:
+            self._extend_to(word)
+        else:
+            # Clicking a word is reaching for it: put the caret in the editor.
+            self._select_word(word, focus_editor=word is not None)
+
+    def _on_canvas_multi_click(self, event: tk.Event, unit: str) -> str:
+        """Double-click: the word's whole line; triple-click: its block —
+        a garbage line or a margin note picked up in one gesture. Skipped
+        when the click before it moved words (reading order, with a
+        selection): the gesture was a placement, not a selection."""
+        if (self._page is None or self.var_add_mode.get()
+                or self._last_click_moved):
+            return "break"
         x = self.canvas.canvasx(event.x) / self._scale
         y = self.canvas.canvasy(event.y) / self._scale
-        self._select_word(self._page.word_at(x, y))
+        self._select_unit(self._page.word_at(x, y), unit)
+        return "break"
+
+    def _select_unit(self, word: Optional[Word], unit: str) -> None:
+        if word is None or self._page is None:
+            return
+        words = (self._page.line_words(word) if unit == "line"
+                 else self._page.block_words(word))
+        if not self.var_reorder_mode.get():
+            words = [w for w in words if self._shown(w)] or [word]
+        self._set_selection(words, words[0])
+        if not self.var_reorder_mode.get():
+            self._update_status(f"Selected the {unit}: {len(words)} word(s).")
+
+    def _menu_entries(self, word: Optional[Word]
+                      ) -> list[Optional[tuple[str, Callable[[], None]]]]:
+        """The right-click menu for a click on ``word`` (None: empty scan),
+        as (label, action) pairs and None for separators. Pure state → menu,
+        so it is testable without posting a real menu."""
+        entries: list[Optional[tuple[str, Callable[[], None]]]] = []
+        n = len(self._sel)
+        order = self.var_reorder_mode.get()
+        if order and n and word is not None and not self._is_selected(word):
+            entries += [
+                (f"Move {n} word(s) after “{word.content}”",
+                 lambda: self._order_place(word, before=False)),
+                (f"Move {n} word(s) before “{word.content}”",
+                 lambda: self._order_place(word, before=True)),
+                ("Move them to the page start", self._order_to_start),
+                None,
+            ]
+        if self._selected is not None:
+            entries.append((f"Edit “{self._selected.content}”\tEnter",
+                            self._edit_selected_word))
+        if n:
+            entries.append((f"Delete {n} word(s)\tDel" if n > 1 else "Delete word\tDel",
+                            self._delete_selection))
+        if word is not None:
+            if entries:
+                entries.append(None)
+            entries += [
+                ("Select this line\tdouble-click", lambda: self._select_unit(word, "line")),
+                ("Select this block\ttriple-click", lambda: self._select_unit(word, "block")),
+            ]
+        if n:
+            entries.append(("Clear selection\tEsc", self._clear_selection))
+        return entries
+
+    def _on_canvas_menu(self, event: tk.Event) -> None:
+        if self._page is None or self.var_add_mode.get():
+            return
+        self.canvas.focus_set()
+        x = self.canvas.canvasx(event.x) / self._scale
+        y = self.canvas.canvasy(event.y) / self._scale
+        word = self._page.word_at(x, y)
+        # Right-click outside the selection picks the word first — unless
+        # it is the target of a reading-order move.
+        if word is not None and not self._is_selected(word) and not (
+                self.var_reorder_mode.get() and self._sel):
+            if self.var_reorder_mode.get():
+                self._set_selection([word], word)
+            else:
+                self._select_word(word)
+        entries = self._menu_entries(word)
+        if not entries:
+            return
+        if self._menu is not None:
+            self._menu.destroy()
+        menu = self._menu = tk.Menu(self.canvas, tearoff=False)
+        for entry in entries:
+            if entry is None:
+                menu.add_separator()
+            else:
+                label, action = entry
+                text, _, accel = label.partition("\t")
+                menu.add_command(label=text, accelerator=accel, command=action)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    # ---------- the selection ---------------------------------------------
+
+    def _is_selected(self, word: Word) -> bool:
+        return any(w is word for w in self._sel)
+
+    def _shown(self, word: Word) -> bool:
+        """Is the word drawn on the scan? Outside reading-order mode a box or
+        a line selection only takes words the corrector can see."""
+        if self.var_reorder_mode.get() or self.var_show_all.get():
+            return True
+        return (word.needs_review(self._threshold())
+                or id(word) in self._touched_ids() or self._is_selected(word))
+
+    def _set_selection(self, words: list[Word], anchor: Optional[Word], *,
+                       focus_editor: bool = False, scroll: bool = False,
+                       refill: bool = False) -> None:
+        """Make ``words`` the selection (kept in reading order, the order a
+        move carries them in). Exactly one word also sits in the editor bar.
+
+        Focus is left where it is, with two exceptions: ``focus_editor``
+        puts the caret in the editor (a click on a word), and when the
+        editor holds focus but no longer holds a word, focus goes back to
+        the scan — an empty editor would swallow every shortcut key."""
+        pos = {id(w): i for i, w in enumerate(self._page.words)} if self._page else {}
+        unique = {id(w): w for w in words if id(w) in pos}
+        self._sel = sorted(unique.values(), key=lambda w: pos[id(w)])
+        self._anchor = anchor if anchor is not None and id(anchor) in pos else (
+            self._sel[0] if self._sel else None)
+        single = self._sel[0] if len(self._sel) == 1 else None
+        if self._sel and self._pending_box is not None:
+            # Selecting real words supersedes an un-committed add box.
+            self._pending_box = None
+        changed = single is not self._selected
+        self._selected = single
+        if changed or refill or single is None:
+            self._update_editor()
+        if self.var_reorder_mode.get():
+            self._refresh_order_panel()
+        self._render()
+        in_editor = self._focus() is self.ent_edit
+        if single is not None and focus_editor:
+            self._edit_selected_word()
+        elif single is not None:
+            # Pre-selected, so typing (once Enter/F2 or a click puts the
+            # caret there) or a symbol key replaces the word outright.
+            self.ent_edit.selection_range(0, "end")
+            self.ent_edit.icursor("end")
+        elif single is None and in_editor:
+            self.canvas.focus_set()
+        if scroll and self._sel:
+            self._scroll_to_word(self._sel[0])
+        if len(self._sel) > 1 and not self.var_reorder_mode.get():
+            self._update_status(f"{len(self._sel)} words selected — Delete removes "
+                                "them, Ctrl+Z puts them back, Esc clears.")
+
+    def _select_word(self, word: Optional[Word], *, focus_editor: bool = False) -> None:
+        """Select one word (None: nothing), bring it into view, and put it in
+        the editor — the stepping and clicking selection."""
+        self._set_selection([word] if word is not None else [], word,
+                            focus_editor=focus_editor, scroll=word is not None,
+                            refill=True)
+
+    def _clear_selection(self) -> None:
+        self._set_selection([], None)
+
+    def _toggle_word(self, word: Optional[Word]) -> None:
+        """Ctrl+click: add a word to the selection, or take it out."""
+        if word is None or self._page is None:
+            return
+        if self._is_selected(word):
+            rest = [w for w in self._sel if w is not word]
+            anchor = self._anchor if self._anchor is not word else None
+            self._set_selection(rest, anchor or (rest[0] if rest else None))
+        else:
+            self._set_selection(self._sel + [word], word)
+
+    def _extend_to(self, word: Word) -> bool:
+        """Shift+click: select every word from the anchor to ``word`` in
+        reading order (outside reading-order mode, every one drawn)."""
+        i = self._page.doc_index(self._anchor) if self._anchor is not None else None
+        j = self._page.doc_index(word)
+        if i is None or j is None:
+            return False
+        lo, hi = sorted((i, j))
+        run = [w for w in self._page.words[lo:hi + 1] if self._shown(w)]
+        self._set_selection(run, self._anchor)
+        return True
+
+    def _box_select(self, box: tuple[float, float, float, float], add: bool) -> None:
+        """Select the words whose centers fall inside an image-px box — a
+        column or a caption in one drag, where Tesseract's lines interleave
+        it with the text beside it. ``add`` keeps the current selection."""
+        x, y, bw, bh = box
+        hits = [w for w in self._page.words
+                if x <= w.box_px[0] + w.box_px[2] / 2 <= x + bw
+                and y <= w.box_px[1] + w.box_px[3] / 2 <= y + bh
+                and self._shown(w)]
+        if add:
+            hits = self._sel + [w for w in hits if not self._is_selected(w)]
+        if not hits:
+            self.var_status.set("No words inside that box.")
+            return
+        self._set_selection(hits, self._anchor if add and self._anchor else hits[0])
+
+    def _prune_selection(self) -> None:
+        """Drop selected words that are no longer on the page (deleted,
+        cleared, an undone add)."""
+        on_page = {id(w) for w in self._page.words} if self._page else set()
+        if all(id(w) in on_page for w in self._sel) and (
+                self._selected is None or id(self._selected) in on_page):
+            return
+        self._sel = [w for w in self._sel if id(w) in on_page]
+        if self._anchor is not None and id(self._anchor) not in on_page:
+            self._anchor = self._sel[0] if self._sel else None
+        single = self._sel[0] if len(self._sel) == 1 else None
+        if single is not self._selected:
+            self._selected = single
+            self._update_editor()
+
+    def _edit_selected_word(self) -> None:
+        """Enter/F2/✎ Edit word: put the caret in the editor over the
+        selected word, ready to type. With nothing selected (outside reading
+        order), Enter starts on the next flagged word."""
+        if self._pending_box is not None:
+            self.ent_edit.focus_set()
+            return
+        if self._selected is None:
+            if not self._sel and not self.var_reorder_mode.get() and self._page:
+                self._goto_flagged(+1)
+            if self._selected is None:
+                return
+        self.ent_edit.focus_set()
+        self.ent_edit.selection_range(0, "end")
+        self.ent_edit.icursor("end")
+
+    def _on_canvas_escape(self) -> None:
+        """Esc where nothing is being typed: drop a drawn-but-untyped add
+        box, else the selection, else leave add mode."""
+        if self._pending_box is not None:
+            self._cancel_pending_add()
+        elif self._sel:
+            self._clear_selection()
+        elif self.var_add_mode.get():
+            self._toggle_add_mode()
+        self.canvas.focus_set()
+
+    def _on_escape(self) -> None:
+        """Esc in the editor: abandon what was typed and give the keys back
+        to the shortcuts. A word whose text was untouched is also let go
+        (outside reading order, where the selection is still wanted)."""
+        if self._pending_box is not None:
+            self._cancel_pending_add()
+        elif (self._selected is not None and not self.var_reorder_mode.get()
+              and " ".join(self.var_edit.get().split()) == self._selected.content):
+            self._clear_selection()
+        else:
+            self._update_editor()
+        self.canvas.focus_set()
 
     # ---------- add-word mode ---------------------------------------------
 
@@ -1046,6 +1603,52 @@ class ReviewFrame(ttk.Frame):
                 "Add word: drag a box around the missed word on the scan, "
                 "type the word, press Enter.")
 
+    def _cancel_pending_add(self) -> None:
+        self._drag_start = None
+        if self._drag_item is not None:
+            self.canvas.delete(self._drag_item)
+            self._drag_item = None
+        if self._pending_box is not None:
+            self._pending_box = None
+            self._update_editor()
+
+    def _finish_add_drag(self, event: tk.Event) -> None:
+        x0, y0 = self._drag_start
+        x1, y1 = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        self._drag_start = None
+        box = (min(x0, x1) / self._scale, min(y0, y1) / self._scale,
+               abs(x1 - x0) / self._scale, abs(y1 - y0) / self._scale)
+        if box[2] < 3 or box[3] < 3:  # a stray click, not a drawn box
+            self._cancel_pending_add()
+            return
+        self._sel, self._anchor, self._selected = [], None, None
+        self._pending_box = box
+        self._update_editor()
+        self.var_status.set("Type the word for the drawn box, then press Enter "
+                            "(Escape cancels).")
+        self.ent_edit.focus_set()
+
+    def _commit_add(self) -> None:
+        if self._page is None or self._pending_box is None:
+            return
+        text = self.var_edit.get()
+        if not text.strip():
+            self._cancel_pending_add()
+            self.var_status.set("Add word cancelled (no text).")
+            return
+        try:
+            word = self._page.add_word(self._pending_box, text)
+        except ValueError as e:
+            self.var_status.set(str(e))
+            self.bell()
+            return
+        self._undo.append(_AddEntry(word))
+        self._cancel_pending_add()
+        self.btn_save.configure(state="normal")
+        self._select_word(word)
+        self.canvas.focus_set()  # ready for the next box, or n/p
+        self._update_status()
+
     # ---------- reading-order mode ----------------------------------------
 
     def _toggle_reorder_mode(self) -> None:
@@ -1059,33 +1662,29 @@ class ReviewFrame(ttk.Frame):
         if self.var_add_mode.get():
             self.var_add_mode.set(False)
             self._on_add_mode_toggled()
-        self._select_word(None)
         self._cancel_pending_add()
         self.order_panel.grid()
-        self._refresh_order_panel()
-        self._render()
+        self._set_selection([], None)
         self.canvas.focus_set()
 
     def _teardown_reorder(self) -> None:
-        self._order_sel = []
-        self._order_anchor = None
         self.order_panel.grid_remove()
-        # The editor bar was following the reading-order selection.
-        self._selected = None
-        self._update_editor()
-        self._render()
+        self._set_selection([], None)
 
     def _order_hint(self) -> str:
-        if not self._order_sel:
+        if not self._sel:
             return ("Select the words that are out of place: click one (on the "
                     "scan or in the transcript below), Shift+click to extend to "
-                    "a run, Ctrl+click to add or remove a word, or drag a box "
-                    "around a whole column or caption on the scan. A single "
-                    "selected word can also be corrected in the editor below.")
-        n = len(self._order_sel)
+                    "a run, Ctrl+click to add or remove a word, double-click for "
+                    "a whole line, or drag a box around a column or caption on "
+                    "the scan. A single selected word can also be corrected in "
+                    "the editor below.")
+        n = len(self._sel)
         hint = (f"{n} word(s) selected. Now click the word they should come "
-                "after (“Page start” puts them first). Ctrl+Up/Ctrl+Down nudge "
-                "one word; Esc clears; Ctrl+Z undoes a move.")
+                "after — or drag them onto it (drop on its left half to put "
+                "them before it). Right-click a word for more; “Page start” "
+                "puts them first; Ctrl+Up/Ctrl+Down nudge one word; Delete "
+                "removes them; Esc clears; Ctrl+Z undoes.")
         if n == 1:
             hint += " To fix its text, press Enter or F2 (or ✎ Edit word)."
         return hint
@@ -1093,19 +1692,15 @@ class ReviewFrame(ttk.Frame):
     def _refresh_order_panel(self) -> None:
         """Re-render the transcript (exactly what a save will write), mark
         the selection in it, and refresh the hint and buttons."""
+        self._prune_selection()
         page = self._page
         words = {id(w.elem): w for w in page.words} if page is not None else {}
-        # Words deleted or cleared since they were selected drop out.
-        self._order_sel = [w for w in self._order_sel if id(w.elem) in words]
-        if self._order_anchor is not None and id(self._order_anchor.elem) not in words:
-            self._order_anchor = self._order_sel[0] if self._order_sel else None
         self.var_order_hint.set(self._order_hint())
-        state = "normal" if self._order_sel else "disabled"
+        state = "normal" if self._sel else "disabled"
         for b in self._order_buttons:
             b.configure(state=state)
         self.btn_order_edit.configure(
-            state="normal" if len(self._order_sel) == 1 else "disabled")
-        self._sync_order_editor()
+            state="normal" if len(self._sel) == 1 else "disabled")
 
         txt = self.txt_order
         txt.configure(state="normal")
@@ -1116,7 +1711,7 @@ class ReviewFrame(ttk.Frame):
             txt.insert("1.0", text or "(no words on this page)")
             self._order_spans = [(a, b, words[id(el)]) for el, a, b in spans
                                  if id(el) in words]
-            chosen = {id(w) for w in self._order_sel}
+            chosen = {id(w) for w in self._sel}
             first = None
             prev_end = None  # end of the previous word, when it was chosen too
             for a, b, w in self._order_spans:
@@ -1131,25 +1726,6 @@ class ReviewFrame(ttk.Frame):
             if first is not None:
                 txt.see(f"1.0+{first}c")
         txt.configure(state="disabled")
-
-    def _sync_order_editor(self) -> None:
-        """Reading-order mode: the editor bar holds the selected word when
-        exactly one is selected — so a word read correctly enough to place
-        but spelled wrong (confidence is no guarantee: a 96% word can still
-        be wrong) is fixed on the spot instead of in another mode. Leaves
-        focus alone; Enter/F2 or a click puts the caret in the editor."""
-        word = self._order_sel[0] if len(self._order_sel) == 1 else None
-        if word is not self._selected:
-            self._selected = word
-            self._update_editor()
-
-    def _order_edit_word(self) -> None:
-        """Enter/F2/✎ Edit word: start typing over the selected word."""
-        if self._selected is None or self._pending_box is not None:
-            return
-        self.ent_edit.focus_set()
-        self.ent_edit.selection_range(0, "end")
-        self.ent_edit.icursor("end")
 
     def _order_word_in_text(self, event: tk.Event) -> Optional[Word]:
         """The word under a click in the transcript panel, if any."""
@@ -1169,11 +1745,17 @@ class ReviewFrame(ttk.Frame):
         return word if a <= offset <= b else None
 
     def _on_order_text_click(self, event: tk.Event, shift: bool) -> str:
+        self._last_click_moved = False
         self._order_pick(self._order_word_in_text(event), shift)
         return "break"  # no text selection / insert cursor in the panel
 
     def _on_order_text_toggle(self, event: tk.Event) -> str:
-        self._order_toggle(self._order_word_in_text(event))
+        self._toggle_word(self._order_word_in_text(event))
+        return "break"
+
+    def _on_order_text_multi(self, event: tk.Event, unit: str) -> str:
+        if not self._last_click_moved:
+            self._select_unit(self._order_word_in_text(event), unit)
         return "break"
 
     def _order_pick(self, word: Optional[Word], shift: bool) -> None:
@@ -1187,72 +1769,45 @@ class ReviewFrame(ttk.Frame):
         if self._page is None:
             return
         if word is None:
-            if not shift and self._order_sel:
-                self._set_order_selection([], None)
+            if not shift and self._sel:
+                self._clear_selection()
             return
-        if shift and self._order_anchor is not None:
-            i = self._page.doc_index(self._order_anchor)
-            j = self._page.doc_index(word)
-            if i is not None and j is not None:
-                lo, hi = sorted((i, j))
-                self._set_order_selection(self._page.words[lo:hi + 1], self._order_anchor)
+        if shift and self._anchor is not None and self._extend_to(word):
+            return
+        if not self._sel or shift or self._is_selected(word):
+            self._set_selection([word], word)
+            return
+        self._order_place(word, before=False)
+
+    def _order_place(self, target: Word, before: bool) -> None:
+        """Move the selection to read right after ``target`` — or right
+        before it, which is right after the word read before it (the page
+        start when there is none)."""
+        if before:
+            others = [w for w in self._page.words if not self._is_selected(w)]
+            i = next((k for k, w in enumerate(others) if w is target), None)
+            if i is None:
                 return
-        if not self._order_sel or shift or any(w is word for w in self._order_sel):
-            self._set_order_selection([word], word)
-            return
-        self._order_apply(lambda: self._page.move_words(self._order_sel, word),
-                          f"after “{word.content}”")
-
-    def _order_toggle(self, word: Optional[Word]) -> None:
-        """Ctrl+click: add a word to the selection, or take it out."""
-        if word is None or self._page is None:
-            return
-        if any(w is word for w in self._order_sel):
-            rest = [w for w in self._order_sel if w is not word]
-            anchor = self._order_anchor if self._order_anchor is not word else None
-            self._set_order_selection(rest, anchor or (rest[0] if rest else None))
+            after = others[i - 1] if i > 0 else None
+            where = f"before “{target.content}”"
         else:
-            self._set_order_selection(self._order_sel + [word], word)
-
-    def _order_box_select(self, box: tuple[float, float, float, float], add: bool) -> None:
-        """Select the words whose centers fall inside an image-px box — a
-        column or a caption in one drag, where Tesseract's lines interleave
-        it with the text beside it. ``add`` keeps the current selection."""
-        x, y, bw, bh = box
-        hits = [w for w in self._page.words
-                if x <= w.box_px[0] + w.box_px[2] / 2 <= x + bw
-                and y <= w.box_px[1] + w.box_px[3] / 2 <= y + bh]
-        if add:
-            have = {id(w) for w in self._order_sel}
-            hits = self._order_sel + [w for w in hits if id(w) not in have]
-        if not hits:
-            self.var_status.set("No words inside that box.")
-            return
-        self._set_order_selection(hits, self._order_anchor if add and self._order_anchor
-                                  else hits[0])
-
-    def _set_order_selection(self, words: list[Word], anchor: Optional[Word]) -> None:
-        # Kept in reading order, which is the order a move carries them in.
-        pos = {id(w): i for i, w in enumerate(self._page.words)} if self._page else {}
-        self._order_sel = sorted(words, key=lambda w: pos.get(id(w), 1 << 30))
-        self._order_anchor = anchor
-        self._refresh_order_panel()
-        self._render()
+            after, where = target, f"after “{target.content}”"
+        self._order_apply(lambda: self._page.move_words(self._sel, after), where)
 
     def _order_nudge(self, delta: int) -> None:
-        if self.var_reorder_mode.get() and self._order_sel:
-            self._order_apply(lambda: self._page.nudge_words(self._order_sel, delta),
+        if self.var_reorder_mode.get() and self._sel:
+            self._order_apply(lambda: self._page.nudge_words(self._sel, delta),
                               "one word earlier" if delta < 0 else "one word later")
 
     def _order_to_start(self) -> None:
-        if self._order_sel:
-            self._order_apply(lambda: self._page.move_words(self._order_sel, None),
+        if self._sel:
+            self._order_apply(lambda: self._page.move_words(self._sel, None),
                               "to the start of the page")
 
     def _order_apply(self, do_move: Callable[[], Optional[WordMove]], where: str) -> None:
         """Run one move of the selection; keep the selection so it can be
         nudged again."""
-        if self._page is None or not self._order_sel:
+        if self._page is None or not self._sel:
             return
         try:
             move = do_move()
@@ -1263,65 +1818,13 @@ class ReviewFrame(ttk.Frame):
         if move is None:
             self.var_status.set("Nothing to move — the words are already read there.")
             return
+        self._last_click_moved = True
         self._undo.append(_MoveEntry(move))
         self.btn_save.configure(state="normal")
         self._refresh_order_panel()
         self._render()
-        self._update_status(f"Moved {len(self._order_sel)} word(s) {where}. "
+        self._update_status(f"Moved {len(self._sel)} word(s) {where}. "
                             "Ctrl+Z undoes.")
-
-    def _on_canvas_modified_click(self, event: tk.Event, mode: str) -> None:
-        """Shift/Ctrl+press on the scan: a modified pick or an additive box
-        in reading-order mode; an ordinary click anywhere else."""
-        if not self.var_reorder_mode.get():
-            self._on_canvas_click(event)
-            return
-        self.canvas.focus_set()
-        if self._page is not None:
-            self._order_press(event, mode)
-
-    def _order_press(self, event: tk.Event, mode: str) -> None:
-        self._order_press_at = (self.canvas.canvasx(event.x),
-                                self.canvas.canvasy(event.y), mode)
-        self._order_rect = None
-
-    def _order_drag(self, event: tk.Event) -> None:
-        x0, y0, _mode = self._order_press_at
-        x1, y1 = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
-        if self._order_rect is None:
-            if abs(x1 - x0) < 5 and abs(y1 - y0) < 5:
-                return  # still a click: hands wobble
-            self._order_rect = self.canvas.create_rectangle(
-                x0, y0, x1, y1, outline=_COLOR_EDITED, width=2, dash=(4, 2),
-                tags=(_OVERLAY,))
-        else:
-            self.canvas.coords(self._order_rect, x0, y0, x1, y1)
-
-    def _order_release(self, event: tk.Event) -> None:
-        x0, y0, mode = self._order_press_at
-        self._order_press_at = None
-        if self._page is None:
-            return
-        x1, y1 = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
-        if self._order_rect is not None:
-            self.canvas.delete(self._order_rect)
-            self._order_rect = None
-            s = self._scale
-            self._order_box_select((min(x0, x1) / s, min(y0, y1) / s,
-                                    abs(x1 - x0) / s, abs(y1 - y0) / s),
-                                   add=mode != "plain")
-            return
-        word = self._page.word_at(x0 / self._scale, y0 / self._scale)
-        if mode == "ctrl":
-            self._order_toggle(word)
-        else:
-            self._order_pick(word, shift=mode == "shift")
-
-    def _on_canvas_escape(self) -> None:
-        if self.var_reorder_mode.get() and self._order_sel:
-            self._set_order_selection([], None)
-        else:
-            self._on_escape()
 
     def _draw_order_overlays(self) -> None:
         """Every word outlined, the selection heavy, and the reading path:
@@ -1333,7 +1836,7 @@ class ReviewFrame(ttk.Frame):
         casing so it stays legible where it does cross type (order_link
         keeps it off the words wherever the order is right)."""
         s = self._scale
-        chosen = {id(w) for w in self._order_sel}
+        chosen = {id(w) for w in self._sel}
         for word in self._page.words:
             if id(word) in chosen:
                 continue  # drawn last, over the path
@@ -1366,140 +1869,68 @@ class ReviewFrame(ttk.Frame):
                     *coords, fill=color, width=width, capstyle="round",
                     arrow="none" if same_line else "last", arrowshape=arrow,
                     tags=(_OVERLAY,))
-        for word in self._order_sel:
+        for word in self._sel:
             x, y, bw, bh = (v * s for v in word.box_px)
             self.canvas.create_rectangle(
                 x, y, x + bw, y + bh, outline=_COLOR_EDITED, width=3,
                 tags=(_OVERLAY,))
 
-    def _cancel_pending_add(self) -> None:
-        self._drag_start = None
-        if self._drag_item is not None:
-            self.canvas.delete(self._drag_item)
-            self._drag_item = None
-        if self._pending_box is not None:
-            self._pending_box = None
-            self._update_editor()
-
-    def _on_canvas_drag(self, event: tk.Event) -> None:
-        if self._order_press_at is not None:
-            self._order_drag(event)
-            return
-        if self._drag_start is None:
-            return
-        x0, y0 = self._drag_start
-        x1, y1 = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
-        if self._drag_item is None:
-            self._drag_item = self.canvas.create_rectangle(
-                x0, y0, x1, y1, outline=_COLOR_EDITED, width=2, dash=(4, 2),
-                tags=(_OVERLAY,))
-        else:
-            self.canvas.coords(self._drag_item, x0, y0, x1, y1)
-
-    def _on_canvas_release(self, event: tk.Event) -> None:
-        if self._order_press_at is not None:
-            self._order_release(event)
-            return
-        if self._drag_start is None:
-            return
-        x0, y0 = self._drag_start
-        x1, y1 = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
-        self._drag_start = None
-        box = (min(x0, x1) / self._scale, min(y0, y1) / self._scale,
-               abs(x1 - x0) / self._scale, abs(y1 - y0) / self._scale)
-        if box[2] < 3 or box[3] < 3:  # a stray click, not a drawn box
-            self._cancel_pending_add()
-            return
-        self._pending_box = box
-        self._selected = None
-        self._update_editor()
-        self.var_status.set("Type the word for the drawn box, then press Enter "
-                            "(Escape cancels).")
-        self.ent_edit.focus_set()
-
-    def _commit_add(self) -> None:
-        if self._page is None or self._pending_box is None:
-            return
-        text = self.var_edit.get()
-        if not text.strip():
-            self._cancel_pending_add()
-            self.var_status.set("Add word cancelled (no text).")
-            return
-        try:
-            word = self._page.add_word(self._pending_box, text)
-        except ValueError as e:
-            self.var_status.set(str(e))
-            self.bell()
-            return
-        self._undo.append(_AddEntry(word))
-        self._cancel_pending_add()
-        self.btn_save.configure(state="normal")
-        self._render()
-        self._select_word(word)
-        self._update_status()
-
-    def _on_escape(self) -> None:
-        if self._pending_box is not None:
-            self._cancel_pending_add()
-            self.canvas.focus_set()
-        elif self.var_reorder_mode.get():
-            # Abandon the typing, keep the selection.
-            self._update_editor()
-            self.canvas.focus_set()
-        else:
-            self._select_word(None)
-
-    # ---------- selection -------------------------------------------------
-
-    def _select_word(self, word: Optional[Word]) -> None:
-        if word is not None and self._pending_box is not None:
-            # Selecting a real word supersedes an un-committed add box.
-            self._pending_box = None
-            if self._drag_item is not None:
-                self.canvas.delete(self._drag_item)
-                self._drag_item = None
-        prev = self._selected
-        self._selected = word
-        for w, width in ((prev, 2), (word, 3)):
-            if w is not None:
-                item = self._rect_by_word.get(id(w))
-                if item is not None:
-                    self.canvas.itemconfigure(item, width=width)
-        self._update_editor()
-        if word is not None:
-            self._scroll_to_word(word)
-            self.ent_edit.focus_set()
-            self.ent_edit.selection_range(0, "end")
+    # ---------- the editor bar --------------------------------------------
 
     def _scroll_to_word(self, word: Word) -> None:
-        x, y, bw, bh = word.box_px
+        """Bring a word into view — centred, but only when it is not already
+        on screen, so clicking a visible word never jerks the page."""
+        x, y, bw, bh = (v * self._scale for v in word.box_px)
+        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
+        left, top = self.canvas.canvasx(0), self.canvas.canvasy(0)
+        if left <= x and x + bw <= left + cw and top <= y and y + bh <= top + ch:
+            return
         w = max(int(self._pil.width * self._scale), 1)
         h = max(int(self._pil.height * self._scale), 1)
-        # Center the word in the visible area, clamped to [0, 1].
-        cx = ((x + bw / 2) * self._scale - self.canvas.winfo_width() / 2) / w
-        cy = ((y + bh / 2) * self._scale - self.canvas.winfo_height() / 2) / h
-        self.canvas.xview_moveto(max(0.0, min(1.0, cx)))
-        self.canvas.yview_moveto(max(0.0, min(1.0, cy)))
+        self.canvas.xview_moveto(max(0.0, min(1.0, (x + bw / 2 - cw / 2) / w)))
+        self.canvas.yview_moveto(max(0.0, min(1.0, (y + bh / 2 - ch / 2) / h)))
+
+    _SNIPPET_H = 48
+    _SNIPPET_MAX_W = 520
 
     def _set_snippet(self, x: float, y: float, bw: float, bh: float) -> None:
-        """Show a magnified crop of the scan region in the editor bar."""
+        """Show a magnified crop of the scan region in the editor bar — a
+        word, or the span of a multi-word selection (narrowed to fit)."""
         pad = 8
         crop = self._pil.crop((
             max(0, int(x - pad)), max(0, int(y - pad)),
             min(self._pil.width, int(x + bw + pad)),
             min(self._pil.height, int(y + bh + pad)),
         ))
-        target_h = 48
-        scale = target_h / max(crop.height, 1)
-        crop = crop.resize((max(int(crop.width * scale), 1), target_h), Image.LANCZOS)
+        scale = min(self._SNIPPET_H / max(crop.height, 1),
+                    self._SNIPPET_MAX_W / max(crop.width, 1))
+        crop = crop.resize((max(int(crop.width * scale), 1),
+                            max(int(crop.height * scale), 1)), Image.LANCZOS)
         self._snippet_photo = ImageTk.PhotoImage(crop)
         self.lbl_snippet.configure(image=self._snippet_photo)
 
     def _update_editor(self) -> None:
+        self.ent_edit.configure(state="normal")
+        self.btn_delete.configure(text="Delete word")
+        self.editor_frame.configure(text="Selected word")
         if self._pending_box is not None and self._pil is not None:
             self._set_snippet(*self._pending_box)
             self.lbl_wc.configure(text="New word")
             self.var_edit.set("")
+            return
+        if len(self._sel) > 1 and self._pil is not None:
+            boxes = [w.box_px for w in self._sel]
+            x0 = min(b[0] for b in boxes)
+            y0 = min(b[1] for b in boxes)
+            x1 = max(b[0] + b[2] for b in boxes)
+            y1 = max(b[1] + b[3] for b in boxes)
+            self._set_snippet(x0, y0, x1 - x0, y1 - y0)
+            n = len(self._sel)
+            self.editor_frame.configure(text=f"{n} words selected")
+            self.lbl_wc.configure(text=f"{n} words — Delete removes them all")
+            self.btn_delete.configure(text=f"Delete {n} words")
+            self.var_edit.set("")
+            self.ent_edit.configure(state="disabled")
             return
         word = self._selected
         if word is None or self._pil is None:
@@ -1523,7 +1954,7 @@ class ReviewFrame(ttk.Frame):
             return
         new_text = self.var_edit.get()
         if not new_text.strip():
-            self._delete_word()
+            self._delete_selection()
             return
         if " ".join(new_text.split()) != word.content:
             old_content, old_wc = word.content, word.wc
@@ -1562,35 +1993,42 @@ class ReviewFrame(ttk.Frame):
         """Recolor a word the corrector just settled (edited or confirmed)
         and enable the save button."""
         item = self._rect_by_word.get(id(word))
-        if item is not None:
+        if item is not None and not self._is_selected(word):
             self.canvas.itemconfigure(item, outline=_COLOR_EDITED)
         self.btn_save.configure(state="normal")
 
-    def _delete_word(self) -> None:
-        """Delete the selected word at once — no confirmation prompt; the
-        deletion goes on the undo stack and Ctrl+Z restores it exactly."""
-        word = self._selected
-        if word is None or self._page is None:
+    def _delete_selection(self) -> None:
+        """Delete every selected word at once — no confirmation prompt; the
+        whole deletion is one entry on the undo stack, so one Ctrl+Z puts
+        every word back exactly. Outside reading order the next flagged
+        word after them is selected, as after a single deletion."""
+        words = list(self._sel)
+        if not words or self._page is None:
             return
-        nxt = self._next_after(word)
-        added = any(isinstance(e, _AddEntry) and e.word is word for e in self._undo)
-        if added:
-            # A word added this session: net it out of the provenance count
-            # instead of counting an add plus a delete.
-            removal = self._page.undo_add(word)
-        else:
-            removal = self._page.delete_word(word)
-        self._undo.append(_DeleteEntry(word, removal, added))
-        self._selected = None
+        nxt = None
+        if not self.var_reorder_mode.get():
+            gone = {id(w) for w in words}
+            pool = [w for w in self._flagged_now() if id(w) not in gone]
+            nxt = self._page.step_from(words[-1], pool, +1)
+        added = {id(e.word) for e in self._undo if isinstance(e, _AddEntry)}
+        items: list[tuple[Word, Removal, bool]] = []
+        for word in words:
+            if id(word) in added:
+                # A word added this session: net it out of the provenance
+                # count instead of counting an add plus a delete.
+                items.append((word, self._page.undo_add(word), True))
+            else:
+                items.append((word, self._page.delete_word(word), False))
+        self._undo.append(_DeleteEntry(items))
         self.btn_save.configure(state="normal")
+        what = (f"“{words[0].content}”" if len(words) == 1
+                else f"{len(words)} words")
         if self.var_reorder_mode.get():
-            self._set_order_selection([], None)  # refreshes the panel + scan
-            self.canvas.focus_set()
-            self._update_status(f"Deleted “{word.content}” (Ctrl+Z puts it back).")
-            return
-        self._render()
-        self._select_word(nxt)
-        self._update_status(f"Deleted “{word.content}” (Ctrl+Z puts it back).")
+            self._clear_selection()  # refreshes the panel + scan
+        else:
+            self._select_word(nxt)
+        self._update_status(f"Deleted {what} (Ctrl+Z puts "
+                            f"{'it' if len(words) == 1 else 'them'} back).")
 
     def _clear_page(self) -> None:
         """Bulk-delete every word — for pages whose OCR is wholly
@@ -1605,22 +2043,19 @@ class ReviewFrame(ttk.Frame):
             "Review",
             f"Remove all {n} word(s) from this page?\n\n"
             "Use this when the whole page is hallucinated OCR — texture or "
-            "noise read as text on covers, photographs, or blank pages.\n\n"
+            "noise read as text on covers, photographs, or blank pages. To "
+            "remove only some words, select them (drag a box, or double-click "
+            "a line) and press Delete instead.\n\n"
             "This can't be undone except by reloading the page unsaved.",
             parent=self._ws_parent(),
         ):
             return
         removed = self._page.clear_words()
         self._undo.clear()
-        self._selected = None
         self._cancel_pending_add()
-        self._order_sel = []
-        self._order_anchor = None
-        if self.var_reorder_mode.get():
-            self._refresh_order_panel()
         self.btn_save.configure(state="normal")
-        self._render()
-        self._update_editor()
+        self._set_selection([], None)
+        self.canvas.focus_set()
         self.var_status.set(
             f"{self._stem}: cleared {removed} word(s) — page is now empty. "
             "Save page to keep this.")
@@ -1639,47 +2074,39 @@ class ReviewFrame(ttk.Frame):
             return
         if isinstance(entry, _AddEntry):  # remove the added word again
             self._page.undo_add(entry.word)
-            if self._selected is entry.word:
-                self._selected = None
             self._maybe_disable_save()
-            if self.var_reorder_mode.get():  # the add's containers may be gone
-                self._refresh_order_panel()
-            self._render()
-            self._update_editor()
+            self._set_selection([w for w in self._sel if w is not entry.word],
+                                self._anchor)
             self._update_status()
             return
-        if isinstance(entry, _DeleteEntry):  # put the deleted word back
-            if entry.added:
-                self._page.redo_add(entry.word, entry.removal)
-            else:
-                self._page.undo_delete(entry.word, entry.removal)
+        if isinstance(entry, _DeleteEntry):  # put the deleted words back
+            for word, removal, added in reversed(entry.items):
+                if added:
+                    self._page.redo_add(word, removal)
+                else:
+                    self._page.undo_delete(word, removal)
             self._maybe_disable_save()
-            if self.var_reorder_mode.get():  # its containers are back too
-                self._refresh_order_panel()
-            self._render()
-            self._show_word(entry.word)
-            self._update_status(f"Restored “{entry.word.content}”.")
+            words = entry.words
+            if len(words) == 1:
+                self._show_word(words[0])
+            else:
+                self._set_selection(words, words[0], scroll=True)
+            self._update_status(
+                f"Restored “{words[0].content}”." if len(words) == 1
+                else f"Restored {len(words)} words.")
             return
         if isinstance(entry, _VerifyEntry):  # un-confirm: engine WC back
             self._page.unverify_word(entry.word, entry.old_wc)
         else:
             self._page.revert_word(entry.word, entry.old_content, entry.old_wc)
-        item = self._rect_by_word.get(id(entry.word))
-        if item is not None:
-            self.canvas.itemconfigure(item, outline=_wc_color(entry.word.wc))
         self._maybe_disable_save()
         self._show_word(entry.word)
         self._update_status()
 
     def _show_word(self, word: Word) -> None:
-        """Put an undone word back in front of the corrector: in the editor
-        normally; as the reading-order selection (which the editor follows)
-        while ordering, so the undo does not pull focus out of the mode."""
-        if self.var_reorder_mode.get():
-            self._set_order_selection([word], word)
-            self._update_editor()  # same word, new text: refill the editor
-        else:
-            self._select_word(word)
+        """Put an undone word back in front of the corrector: selected, in
+        the editor with its restored text, in view."""
+        self._set_selection([word], word, scroll=True, refill=True)
 
     def _maybe_disable_save(self) -> None:
         """After an undo: a page back exactly as it was loaded (or last
@@ -1699,23 +2126,22 @@ class ReviewFrame(ttk.Frame):
         touched = self._touched_ids()
         return [w for w in self._page.flagged(self._threshold()) if id(w) not in touched]
 
-    def _next_after(self, word: Word) -> Optional[Word]:
-        if self._page is None:
-            return None
-        return self._page.step_from(word, self._flagged_now(), +1)
-
     def _goto_flagged(self, delta: int) -> None:
         """Step to the next/previous flagged word *from where the corrector
         is on the page*. Position, not membership in the flagged list: a word
         just corrected is no longer flagged (``WC="1.00"``), and looking it up
         in that list is what used to bounce the corrector back to the page's
-        first flagged word after every edit."""
+        first flagged word after every edit. From a multi-word selection the
+        step starts at its last (or, going back, first) word."""
+        if self._page is None:
+            return
         flagged = self._flagged_now()
-        if not flagged or self._page is None:
+        if not flagged:
             self._select_word(None)
             self.var_status.set("No flagged words left on this page. Save and pick the next page.")
             return
-        current = self._selected
+        current = self._selected or (
+            (self._sel[-1] if delta > 0 else self._sel[0]) if self._sel else None)
         if current is None:
             self._select_word(flagged[0] if delta > 0 else flagged[-1])
             return

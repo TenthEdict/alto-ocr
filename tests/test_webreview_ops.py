@@ -313,6 +313,17 @@ class PagePayloadTests(_PageCase):
         self.assertEqual(payload["token"], ops.load_token(self.alto_path))
         self.assertEqual(payload["pc"], "0.70")
 
+    def test_words_carry_their_line_and_block(self) -> None:
+        """The browser selects a word's whole line (double-click) or block
+        (triple-click) by these numbers."""
+        page = self.load()
+        payload = ops.page_payload(page, stem="page_0001",
+                                   alto_path=self.alto_path, low_wc=0.5)
+        self.assertEqual([(w["line"], w["block"]) for w in payload["words"]],
+                         [(0, 0), (0, 0), (0, 0)])
+        order = ops.order_payload(page, page.words)["order"]
+        self.assertEqual([o["block"] for o in order], [0, 0, 0])
+
     def test_unscored_words_are_flagged(self) -> None:
         """A word no engine attached confidence to needs eyes just as much."""
         self.alto_path.write_text(_ALTO.replace(' WC="0.96"', ""), encoding="utf-8")

@@ -164,6 +164,17 @@ class EditTests(_PageFixture):
         self.assertEqual([w.content for w in self.page.words], ["Board", "1927"])
 
 
+class LineBlockTests(_PageFixture):
+    def test_line_and_block_words(self) -> None:
+        by = {w.content: w for w in self.page.words}
+        self.assertEqual([w.content for w in self.page.line_words(by["cf"])],
+                         ["Board", "cf"])
+        self.assertEqual([w.content for w in self.page.block_words(by["1927"])],
+                         ["Board", "cf", "1927"])
+        self.assertEqual([w.content for w in self.page.block_words(by["Lone"])],
+                         ["Lone"])
+
+
 class DeleteUndoTests(_PageFixture):
     """The review GUI deletes without a confirmation prompt (2026-09-24);
     Ctrl+Z restoring the page *exactly* is what makes that safe."""

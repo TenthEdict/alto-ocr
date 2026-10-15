@@ -405,7 +405,7 @@ class ReviewTabTests(ReviewFixture):
         self.rv._goto_flagged(+1)
         word = self.rv._selected
         self.assertEqual(word.content, "cf")
-        self.rv._delete_word()  # any dialog would fail the test
+        self.rv._delete_selection()  # any dialog would fail the test
         self.assertNotIn(word, self.rv._page.words)
         self.assertIn("Ctrl+Z", self.rv.var_status.get())
         self.assertEqual(str(self.rv.btn_save.cget("state")), "normal")
@@ -534,7 +534,7 @@ class ReadingOrderTests(ReviewFixture):
         self.rv._order_to_start()
         self.assertEqual(self.transcript(), "Trustees Board cf\n")
         self.rv._on_canvas_escape()
-        self.assertEqual(self.rv._order_sel, [])
+        self.assertEqual(self.rv._sel, [])
         self.assertEqual(self.highlighted(), [])
 
     def test_clicking_inside_the_selection_starts_over(self) -> None:
@@ -554,25 +554,25 @@ class ReadingOrderTests(ReviewFixture):
         self.assertIn("1 reading-order change(s)", body)
 
     def test_ctrl_click_toggles_words_in_and_out(self) -> None:
-        self.rv._order_toggle(self.words["Trustees"])
-        self.rv._order_toggle(self.words["Board"])
+        self.rv._toggle_word(self.words["Trustees"])
+        self.rv._toggle_word(self.words["Board"])
         # Kept in reading order, whatever order they were picked in.
-        self.assertEqual([w.content for w in self.rv._order_sel], ["Board", "Trustees"])
+        self.assertEqual([w.content for w in self.rv._sel], ["Board", "Trustees"])
         self.assertEqual(self.highlighted(), ["Board", "Trustees"])
-        self.rv._order_toggle(self.words["Board"])
-        self.assertEqual([w.content for w in self.rv._order_sel], ["Trustees"])
+        self.rv._toggle_word(self.words["Board"])
+        self.assertEqual([w.content for w in self.rv._sel], ["Trustees"])
 
     def test_box_selects_words_by_center_and_shift_adds(self) -> None:
         def box(word):  # a box snug around one word, in image px
             x, y, w, h = word.box_px
             return (x - 1, y - 1, w + 2, h + 2)
-        self.rv._order_box_select(box(self.words["cf"]), add=False)
-        self.assertEqual([w.content for w in self.rv._order_sel], ["cf"])
-        self.rv._order_box_select(box(self.words["Trustees"]), add=True)
-        self.assertEqual([w.content for w in self.rv._order_sel], ["cf", "Trustees"])
-        self.rv._order_box_select((0, 0, 1, 1), add=False)  # empty: says so, keeps
+        self.rv._box_select(box(self.words["cf"]), add=False)
+        self.assertEqual([w.content for w in self.rv._sel], ["cf"])
+        self.rv._box_select(box(self.words["Trustees"]), add=True)
+        self.assertEqual([w.content for w in self.rv._sel], ["cf", "Trustees"])
+        self.rv._box_select((0, 0, 1, 1), add=False)  # empty: says so, keeps
         self.assertIn("No words", self.rv.var_status.get())
-        self.assertEqual(len(self.rv._order_sel), 2)
+        self.assertEqual(len(self.rv._sel), 2)
 
     def test_one_selected_word_sits_in_the_editor(self) -> None:
         self.assertEqual(str(self.rv.btn_order_edit.cget("state")), "disabled")
@@ -582,7 +582,7 @@ class ReadingOrderTests(ReviewFixture):
         self.assertEqual(str(self.rv.btn_order_edit.cget("state")), "normal")
         self.assertIn("Enter or F2", self.rv.var_order_hint.get())
         # Two words: nothing to edit; none: the editor empties.
-        self.rv._order_toggle(self.words["Board"])
+        self.rv._toggle_word(self.words["Board"])
         self.assertIsNone(self.rv._selected)
         self.assertEqual(str(self.rv.btn_order_edit.cget("state")), "disabled")
         self.rv._on_canvas_escape()
@@ -596,7 +596,7 @@ class ReadingOrderTests(ReviewFixture):
         self.rv._apply_edit(advance=True)
         self.assertEqual(word.content, "Boord")
         self.assertTrue(self.rv.var_reorder_mode.get())
-        self.assertEqual(self.rv._order_sel, [word])  # still there to move
+        self.assertEqual(self.rv._sel, [word])  # still there to move
         self.assertIs(self.rv._selected, word)
         self.assertEqual(self.transcript(), "Boord cf\nTrustees\n")
         self.assertEqual(str(self.rv.btn_save.cget("state")), "normal")
@@ -606,7 +606,7 @@ class ReadingOrderTests(ReviewFixture):
         self.rv._undo_edit()
         self.rv._undo_edit()
         self.assertEqual(self.transcript(), "Board cf\nTrustees\n")
-        self.assertEqual(self.rv._order_sel, [word])  # undo re-selects it
+        self.assertEqual(self.rv._sel, [word])  # undo re-selects it
         self.assertEqual(self.rv.var_edit.get(), "Board")
         self.assertTrue(self.rv.var_reorder_mode.get())
 
@@ -617,17 +617,17 @@ class ReadingOrderTests(ReviewFixture):
         self.rv._on_escape()
         self.assertEqual(self.rv.var_edit.get(), "cf")
         self.assertEqual(word.content, "cf")
-        self.assertEqual(self.rv._order_sel, [word])
+        self.assertEqual(self.rv._sel, [word])
 
     def test_delete_from_reading_order_mode(self) -> None:
         self.rv._order_pick(self.words["cf"], shift=False)
-        self.rv._delete_word()
+        self.rv._delete_selection()
         self.assertEqual(self.transcript(), "Board\nTrustees\n")
-        self.assertEqual(self.rv._order_sel, [])
+        self.assertEqual(self.rv._sel, [])
         self.assertIsNone(self.rv._selected)
         self.rv._undo_edit()
         self.assertEqual(self.transcript(), "Board cf\nTrustees\n")
-        self.assertEqual([w.content for w in self.rv._order_sel], ["cf"])
+        self.assertEqual([w.content for w in self.rv._sel], ["cf"])
 
     def test_leaving_the_mode_empties_the_editor(self) -> None:
         self.rv._order_pick(self.words["cf"], shift=False)
@@ -666,19 +666,288 @@ class ReadingOrderTests(ReviewFixture):
         # Overlapping boxes on one line: centre to centre.
         self.assertEqual(link(a, (120, 100, 50, 20), True), (125, 110, 145, 110))
 
+    def test_place_before_a_word(self) -> None:
+        self.rv._order_pick(self.words["Trustees"], shift=False)
+        self.rv._order_place(self.words["Board"], before=True)
+        self.assertEqual(self.transcript(), "Trustees Board cf\n")
+        self.rv._order_pick(self.words["Board"], shift=False)
+        self.rv._order_place(self.words["Trustees"], before=True)
+        self.assertEqual(self.transcript(), "Board Trustees cf\n")
+
+    def test_drag_the_selection_onto_a_word(self) -> None:
+        self.rv.var_zoom.set("100%")
+        self.rv._render()
+        trustees, board = self.words["Trustees"], self.words["Board"]
+        self.rv._order_pick(trustees, shift=False)
+        with mock.patch.object(self.rv, "_autoscroll"):
+            self.rv._canvas_press(_Click(self.rv, trustees), "plain")
+            self.assertTrue(self.rv._dropping)
+            self.rv._on_canvas_drag(_Click(self.rv, board, fx=0.2))
+            self.assertIn("before “Board”", self.rv.var_status.get())
+            self.rv._on_canvas_drag(_Click(self.rv, board, fx=0.8))
+            self.assertIn("after “Board”", self.rv.var_status.get())
+            self.rv._on_canvas_release(_Click(self.rv, board, fx=0.8))
+        self.assertEqual(self.transcript(), "Board Trustees cf\n")
+        self.assertEqual(self.rv._sel, [trustees])  # still selected
+        self.assertEqual(str(self.rv.canvas.cget("cursor")), "")
+
+    def test_click_without_drag_still_starts_over(self) -> None:
+        self.rv.var_zoom.set("100%")
+        self.rv._render()
+        board = self.words["Board"]
+        self.rv._order_pick(board, shift=False)
+        self.rv._order_pick(self.words["cf"], shift=True)
+        self.rv._canvas_press(_Click(self.rv, board), "plain")
+        self.rv._on_canvas_release(_Click(self.rv, board))
+        self.assertEqual(self.highlighted(), ["Board"])
+
+    def test_double_click_after_a_move_selects_nothing_more(self) -> None:
+        self.rv.var_zoom.set("100%")
+        self.rv._render()
+        self.rv._order_pick(self.words["Trustees"], shift=False)
+        self.rv._order_pick(self.words["Board"], shift=False)  # a move
+        self.rv._on_canvas_multi_click(_Click(self.rv, self.words["Board"]), "line")
+        self.assertEqual(self.highlighted(), ["Trustees"])
+
+    def test_menu_moves_after_and_before(self) -> None:
+        self.rv._order_pick(self.words["Trustees"], shift=False)
+        entries = {e[0]: e[1] for e in self.rv._menu_entries(self.words["Board"]) if e}
+        entries["Move 1 word(s) before “Board”"]()
+        self.assertEqual(self.transcript(), "Trustees Board cf\n")
+
+    def test_delete_key_in_the_mode_removes_the_selection(self) -> None:
+        self.rv._order_pick(self.words["Board"], shift=False)
+        self.rv._order_pick(self.words["cf"], shift=True)
+        self.rv._on_key(_Key(self.rv.canvas, "Delete"))
+        self.assertEqual(self.transcript(), "Trustees\n")
+        self.assertTrue(self.rv.var_reorder_mode.get())
+        self.rv._undo_edit()
+        self.assertEqual(self.transcript(), "Board cf\nTrustees\n")
+
+    def test_escape_clears_the_selection_from_any_widget(self) -> None:
+        self.rv._order_pick(self.words["Board"], shift=False)
+        self.rv._on_key(_Key(self.rv.txt_order, "Escape"))
+        self.assertEqual(self.rv._sel, [])
+
     def test_add_word_mode_turns_reading_order_off(self) -> None:
         self.rv._order_pick(self.words["Board"], shift=False)
         self.rv._toggle_add_mode()
         self.assertFalse(self.rv.var_reorder_mode.get())
         self.assertFalse(self.rv.order_panel.winfo_manager())
-        self.assertEqual(self.rv._order_sel, [])
+        self.assertEqual(self.rv._sel, [])
+
+
+class _Key:
+    """A stand-in for the Tk key event the tab's dispatcher receives."""
+
+    def __init__(self, widget, keysym: str, *, ctrl: bool = False) -> None:
+        self.widget = widget
+        self.keysym = keysym
+        self.state = 0x4 if ctrl else 0
+
+
+class _Click:
+    """A stand-in for a mouse event at a word's spot on the canvas."""
+
+    def __init__(self, rv, word, fx: float = 0.5) -> None:
+        x, y, bw, bh = word.box_px
+        self.x = (x + bw * fx) * rv._scale - rv.canvas.canvasx(0)
+        self.y = (y + bh / 2) * rv._scale - rv.canvas.canvasy(0)
+        self.x_root = self.y_root = 0
+
+
+class KeyboardTests(ReviewFixture):
+    """Shortcuts go through one dispatcher, so they keep working wherever
+    focus lands — the usability-test failure was ``n`` typing into the
+    editor after the first ``n`` had moved focus there."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.open("p1")
+        self.words = {w.content: w for w in self.rv._page.words}
+
+    def key(self, widget, keysym: str, **kw):
+        return self.rv._on_key(_Key(widget, keysym, **kw))
+
+    def combobox(self):
+        stack = [self.rv.workspace]
+        while stack:
+            w = stack.pop()
+            if isinstance(w, ttk.Combobox):
+                return w
+            stack.extend(w.winfo_children())
+        self.fail("no combobox in the page view")
+
+    def test_n_steps_from_every_non_typing_widget(self) -> None:
+        for widget in (self.rv.canvas, self.rv.lst_pages, self.combobox(),
+                       self.rv.txt_order):
+            with self.subTest(widget=widget.winfo_class()):
+                self.rv._select_word(None)
+                self.assertEqual(self.key(widget, "n"), "break")
+                self.assertIs(self.rv._selected, self.words["cf"])
+                self.assertEqual(self.key(widget, "n"), "break")
+                self.assertIs(self.rv._selected, self.words["Trustees"])
+
+    def test_focus_on_the_window_itself_counts_while_the_tab_shows(self) -> None:
+        # Right after a click on the notebook tab, focus is on the window.
+        with mock.patch.object(self.rv, "winfo_ismapped", return_value=1):
+            self.assertEqual(self.key(self.root, "n"), "break")
+        self.assertIs(self.rv._selected, self.words["cf"])
+        with mock.patch.object(self.rv, "winfo_ismapped", return_value=0):
+            self.assertIsNone(self.key(self.root, "n"))  # Run tab on show
+
+    def test_stepping_never_types_into_the_editor(self) -> None:
+        self.key(self.rv.canvas, "n")
+        self.key(self.rv.canvas, "n")
+        self.assertEqual(self.rv.var_edit.get(), "Trustees")
+        self.assertEqual(self.words["Trustees"].content, "Trustees")
+
+    def test_plain_keys_type_in_the_editor(self) -> None:
+        self.rv._goto_flagged(+1)
+        self.assertIsNone(self.key(self.rv.ent_edit, "n"))  # left to the Entry
+        self.assertIs(self.rv._selected, self.words["cf"])
+
+    def test_tab_steps_from_inside_the_editor(self) -> None:
+        # Tk's focus traversal owns <Tab> at the "all" level, so the editor
+        # and the scan bind it themselves (a synthetic key event cannot be
+        # aimed at a widget on a hidden window, so check the bindings).
+        for widget in (self.rv.ent_edit, self.rv.canvas):
+            for seq in ("<Tab>", "<Shift-Tab>"):
+                with self.subTest(widget=widget.winfo_class(), seq=seq):
+                    self.assertIn("break", widget.bind(seq))
+
+    def test_ctrl_shortcuts_work_from_the_editor_not_the_folder_fields(self) -> None:
+        self.rv._goto_flagged(+1)
+        self.rv.var_edit.set("of")
+        self.rv._apply_edit(advance=False)
+        folder_field = next(w for w in self.rv.winfo_children()[0].winfo_children()
+                            if isinstance(w, ttk.Entry))
+        self.assertIsNone(self.key(folder_field, "z", ctrl=True))
+        self.assertEqual(self.words["cf"].content, "of")
+        self.assertEqual(self.key(self.rv.ent_edit, "z", ctrl=True), "break")
+        self.assertEqual(self.words["cf"].content, "cf")
+
+    def test_keys_for_other_windows_are_ignored(self) -> None:
+        other = tk.Toplevel(self.root)
+        self.addCleanup(other.destroy)
+        self.assertIsNone(self.key(tk.Entry(other), "n"))
+        self.assertIsNone(self.key(other, "n"))
+        self.assertIsNone(self.rv._selected)
+
+    def test_escape_in_the_editor_hands_keys_back(self) -> None:
+        self.rv._goto_flagged(+1)
+        self.rv._on_escape()  # unchanged word: let go of it
+        self.assertIsNone(self.rv._selected)
+        self.rv._goto_flagged(+1)
+        self.rv.var_edit.set("ofx")
+        self.rv._on_escape()  # typed text: abandon it, keep the word
+        self.assertIs(self.rv._selected, self.words["cf"])
+        self.assertEqual(self.rv.var_edit.get(), "cf")
+
+    def test_tool_buttons_take_no_focus(self) -> None:
+        for widget in self.rv._tool_widgets(self.rv.workspace):
+            with self.subTest(widget=str(widget)):
+                self.assertFalse(widget.cget("takefocus"))
+
+
+class MultiSelectTests(ReviewFixture):
+    """Selecting several words outside reading order, and deleting them in
+    one step — without clearing the whole page."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.open("p1")
+        self.before = etree.tostring(self.rv._page.root)
+        self.words = {w.content: w for w in self.rv._page.words}
+
+    def contents(self) -> list[str]:
+        return [w.content for w in self.rv._sel]
+
+    def test_shift_click_extends_and_ctrl_click_toggles(self) -> None:
+        self.rv._click_word(self.words["Board"], "plain")
+        self.rv._click_word(self.words["Trustees"], "shift")
+        self.assertEqual(self.contents(), ["Board", "cf", "Trustees"])
+        self.rv._click_word(self.words["cf"], "ctrl")
+        self.assertEqual(self.contents(), ["Board", "Trustees"])
+        self.rv._click_word(self.words["cf"], "ctrl")
+        self.assertEqual(self.contents(), ["Board", "cf", "Trustees"])
+
+    def test_several_words_disable_the_editor_and_name_the_count(self) -> None:
+        self.rv._set_selection([self.words["Board"], self.words["cf"]], None)
+        self.assertIsNone(self.rv._selected)
+        self.assertEqual(str(self.rv.ent_edit.cget("state")), "disabled")
+        self.assertEqual(self.rv.btn_delete.cget("text"), "Delete 2 words")
+        self.assertIn("2 words", self.rv.editor_frame.cget("text"))
+        self.rv._clear_selection()
+        self.assertEqual(str(self.rv.ent_edit.cget("state")), "normal")
+        self.assertEqual(self.rv.btn_delete.cget("text"), "Delete word")
+
+    def test_delete_key_removes_the_selection_and_one_undo_restores_it(self) -> None:
+        self.rv._select_unit(self.words["Board"], "line")
+        self.assertEqual(self.contents(), ["Board", "cf"])
+        self.assertEqual(self.rv._on_key(_Key(self.rv.canvas, "Delete")), "break")
+        self.assertEqual([w.content for w in self.rv._page.words], ["Trustees"])
+        self.assertIn("Deleted 2 words", self.rv.var_status.get())
+        self.assertEqual(self.rv._page.session_edits, 2)
+        self.rv._undo_edit()
+        self.assertEqual(etree.tostring(self.rv._page.root), self.before)
+        self.assertEqual(self.contents(), ["Board", "cf"])  # selected again
+        self.assertFalse(self.rv._page.dirty)
+        self.assertEqual(self.rv._page.session_edits, 0)
+
+    def test_ctrl_d_deletes_from_the_editor(self) -> None:
+        self.rv._goto_flagged(+1)
+        self.assertEqual(self.rv._on_key(_Key(self.rv.ent_edit, "d", ctrl=True)), "break")
+        self.assertNotIn(self.words["cf"], self.rv._page.words)
+
+    def test_deleting_an_added_word_with_others_nets_out(self) -> None:
+        added = self.rv._page.add_word((600, 900, 120, 60), "new")
+        self.rv._undo.append(review._AddEntry(added))
+        edits = self.rv._page.session_edits
+        self.rv._set_selection([added, self.words["cf"]], None)
+        self.rv._delete_selection()
+        self.assertNotIn(added, self.rv._page.words)
+        self.rv._undo_edit()
+        self.assertIn(added, self.rv._page.words)
+        self.assertIn(self.words["cf"], self.rv._page.words)
+        self.assertEqual(self.rv._page.session_edits, edits)
+
+    def test_line_and_block_selection(self) -> None:
+        self.rv._select_unit(self.words["Trustees"], "line")
+        self.assertEqual(self.contents(), ["Trustees"])
+        self.rv._select_unit(self.words["cf"], "block")
+        self.assertEqual(self.contents(), ["Board", "cf", "Trustees"])
+
+    def test_box_takes_only_words_drawn_on_the_scan(self) -> None:
+        self.rv.var_show_all.set(False)  # Board (96%) is not drawn
+        self.rv._box_select((0, 0, 10_000, 10_000), add=False)
+        self.assertEqual(self.contents(), ["cf", "Trustees"])
+        self.rv.var_show_all.set(True)
+        self.rv._box_select((0, 0, 10_000, 10_000), add=False)
+        self.assertEqual(self.contents(), ["Board", "cf", "Trustees"])
+
+    def test_clicking_empty_scan_clears(self) -> None:
+        self.rv._select_unit(self.words["Board"], "block")
+        self.rv._click_word(None, "plain")
+        self.assertEqual(self.rv._sel, [])
+
+    def test_stepping_continues_after_a_multi_selection(self) -> None:
+        self.rv._set_selection([self.words["Board"], self.words["cf"]], None)
+        self.rv._goto_flagged(+1)
+        self.assertIs(self.rv._selected, self.words["Trustees"])
+
+    def test_menu_offers_delete_and_line_selection(self) -> None:
+        self.rv._select_unit(self.words["Board"], "line")
+        labels = [e[0] for e in self.rv._menu_entries(self.words["Board"]) if e]
+        self.assertIn("Delete 2 word(s)\tDel", labels)
+        self.assertIn("Select this line\tdouble-click", labels)
 
 
 class PopOutTests(ReviewFixture):
     def test_page_pops_out_and_docks_back_with_its_state(self) -> None:
         self.open("p1")
         self.rv._goto_flagged(+1)
-        self.rv._delete_word()
+        self.rv._delete_selection()
         ws = self.rv.workspace
         self.rv._toggle_page_window()
         self.addCleanup(self.rv._page_window.attach)
