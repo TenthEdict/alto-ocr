@@ -31,6 +31,13 @@ Semantics (agreed 2026-07-30):
 * **Text a human types** is checked before it touches the tree
   (``alto_format.content_problem``): a control character pasted in from
   elsewhere is refused with a message, never half-applied.
+* **Provenance counts net effect per word** (2026-10-15; per action
+  before, so a word edited twice, or edited and then deleted, counted
+  twice). The page snapshots each ``<String>`` before its first change
+  since load/save, and save compares: added, deleted or re-worded is one
+  correction, the same words with a new ``WC`` is one confirmation, and
+  back where it started is nothing. Undo therefore needs no counting of
+  its own. Reading-order moves still count per move, deliberately.
 * **Clearing a page** (2026-07-31; the whole page is hallucinated OCR —
   covers/photographs where texture was read as thousands of garbage
   words) bulk-deletes every word in one operation, leaving the
@@ -255,9 +262,65 @@ class ReviewPage:
         self._clean_state = etree.tostring(self.root)
 
         self.dirty = False
-        self.session_edits = 0  # edits+deletions since load, folded into provenance on save
+        # Each <String> touched since load/save -> its state before the first
+        # touch (None: not on the page then, i.e. added this session). save()
+        # counts provenance from these by net effect per word.
+        self._before: dict[etree._Element, tuple[str, float | None] | None] = {}
         self.session_moves = 0  # reading-order moves since load, folded into provenance on save
-        self.session_verifies = 0  # confirmed-as-correct words, counted apart from edits
+
+    # ---------- provenance counting ---------------------------------------
+
+    def _state(self, el: etree._Element) -> tuple[str, float | None] | None:
+        """A String's countable state: ``None`` when it is not on the page,
+        else its CONTENT and WC. WC is compared as a number, rounded the way
+        it is written, so an undo that rewrites ``0.4`` as ``0.40`` is not
+        mistaken for a change."""
+        if not self._attached(el):
+            return None
+        try:
+            wc: float | None = round(float(el.get("WC")), 2)
+        except (TypeError, ValueError):
+            wc = None
+        return el.get("CONTENT", ""), wc
+
+    def _touch(self, el: etree._Element) -> None:
+        """Record a String's state before its first change since load/save.
+        Every mutator calls this *before* mutating, undo paths included: an
+        undo reaching back past a save is itself a change to the saved file."""
+        if el not in self._before:
+            self._before[el] = self._state(el)
+
+    def _net_counts(self) -> tuple[int, int]:
+        """``(corrected, confirmed)`` by net effect per word, since load/save.
+
+        A word counts once however many actions touched it: added, deleted,
+        or with different CONTENT is one correction; the same CONTENT with a
+        different WC (a human vouching for it) is one confirmation; back
+        where it started is nothing. So a word edited twice, or edited and
+        then deleted, is one correction, and a word added and then deleted
+        again is none. Undo needs no bookkeeping of its own: it puts the
+        state back, and the comparison sees that.
+        """
+        corrected = confirmed = 0
+        for el, before in self._before.items():
+            after = self._state(el)
+            if before == after:
+                continue
+            if before is None or after is None or before[0] != after[0]:
+                corrected += 1
+            else:
+                confirmed += 1
+        return corrected, confirmed
+
+    @property
+    def session_edits(self) -> int:
+        """Words corrected (edited, added or deleted) since load/save, net."""
+        return self._net_counts()[0]
+
+    @property
+    def session_verifies(self) -> int:
+        """Words confirmed as correct since load/save, net."""
+        return self._net_counts()[1]
 
     # ---------- queries ---------------------------------------------------
 
@@ -322,11 +385,11 @@ class ReviewPage:
         text = _checked_content(new_text)
         if not text:
             raise ValueError("Empty text — use delete_word to remove a word.")
+        self._touch(word.elem)
         word.elem.set("CONTENT", text)
         word.elem.set("WC", "1.00")
         reorder_attrs(word.elem, ATTR_ORDER["String"])
         self.dirty = True
-        self.session_edits += 1
 
     def verify_word(self, word: Word) -> bool:
         """Confirm a low-confidence word the OCR actually got right: stamp
@@ -347,10 +410,10 @@ class ReviewPage:
         wc = word.wc
         if wc is not None and wc >= 1.0:
             return False
+        self._touch(word.elem)
         word.elem.set("WC", "1.00")
         reorder_attrs(word.elem, ATTR_ORDER["String"])
         self.dirty = True
-        self.session_verifies += 1
         return True
 
     def delete_word(self, word: Word) -> Removal:
@@ -358,19 +421,17 @@ class ReviewPage:
         The returned ``Removal`` lets ``undo_delete`` restore it exactly."""
         removal = self._remove_string(word)
         self.dirty = True
-        self.session_edits += 1
         return removal
 
     def undo_delete(self, word: Word, removal: Removal) -> None:
         """Undo one ``delete_word`` (GUI undo stack): put the String, its SP
-        and every container the cascade removed back where they were, and
-        un-count the deletion. ``dirty`` stays as-is, like ``revert_word`` —
+        and every container the cascade removed back where they were (the
+        deletion then nets out of provenance). ``dirty`` stays as-is, like ``revert_word`` —
         other unsaved changes may exist; reloading is the full reset.
 
         Only exact while the tree is as the deletion left it, which a strict
         undo stack guarantees: every later change has been undone first."""
         self._restore(word, removal)
-        self.session_edits = max(0, self.session_edits - 1)
 
     def line_words(self, word: Word) -> list[Word]:
         """Every word on ``word``'s TextLine, in reading order — a whole
@@ -390,6 +451,7 @@ class ReviewPage:
     def _remove_string(self, word: Word) -> Removal:
         """Detach a word's ``<String>`` plus a neighboring ``<SP>``, cascading
         away emptied containers. Shared by ``delete_word`` and ``undo_add``."""
+        self._touch(word.elem)
         steps: list[tuple[etree._Element, int, etree._Element]] = []
 
         def detach(node: etree._Element) -> None:
@@ -424,6 +486,7 @@ class ReviewPage:
     def _restore(self, word: Word, removal: Removal) -> None:
         """Replay a ``Removal`` backwards and put the word back into
         ``self.words`` at its reading-order position."""
+        self._touch(word.elem)
         for parent, index, node in reversed(removal.steps):
             parent.insert(index, node)
         self._insert_in_reading_order(word)
@@ -457,6 +520,8 @@ class ReviewPage:
         strings = list(self.root.iter(qname(self.ns, "String")))
         if not strings:
             return 0
+        for el in strings:
+            self._touch(el)
         removable = {"TextLine", "TextBlock", "ComposedBlock"}
         for el in strings:
             top = el
@@ -469,7 +534,6 @@ class ReviewPage:
         self.words.clear()
         self.page.attrib.pop("PC", None)
         self.dirty = True
-        self.session_edits += len(strings)
         return len(strings)
 
     # ---------- word insertion (missed-word corrections) ------------------
@@ -503,6 +567,7 @@ class ReviewPage:
         height = max(1, int(round(h / self.sy)))
 
         el = etree.Element(qname(self.ns, "String"))
+        self._touch(el)  # not on the page yet: counts as added
         el.set("ID", self._next_id("String"))
         for attr, val in (("HPOS", hpos), ("VPOS", vpos),
                           ("WIDTH", width), ("HEIGHT", height)):
@@ -523,28 +588,23 @@ class ReviewPage:
         self._insert_in_reading_order(word)
 
         self.dirty = True
-        self.session_edits += 1
         return word
 
     def undo_add(self, word: Word) -> Removal:
         """Undo one ``add_word`` (GUI undo stack): detach the String again
-        and un-count the edit. ``dirty`` stays as-is, like ``revert_word`` —
-        other unsaved changes may exist; reloading is the full reset.
+        (the add then nets out of provenance). ``dirty`` stays as-is, like
+        ``revert_word`` — other unsaved changes may exist; reloading is the
+        full reset.
 
-        Also how the GUI deletes a word added in the same session, netting
-        the add out of the provenance count instead of counting an add plus
-        a delete; the returned ``Removal`` lets ``redo_add`` bring it back
+        Also how the GUI deletes a word added in the same session; the returned ``Removal`` lets ``redo_add`` bring it back
         when that deletion is itself undone."""
-        removal = self._remove_string(word)
-        self.session_edits = max(0, self.session_edits - 1)
-        return removal
+        return self._remove_string(word)
 
     def redo_add(self, word: Word, removal: Removal) -> None:
         """Reverse ``undo_add``: re-attach the added word exactly where it
-        was and count it again."""
+        was (it counts as added again)."""
         self._restore(word, removal)
         self.dirty = True
-        self.session_edits += 1
 
     @staticmethod
     def _box_of(el: etree._Element) -> tuple[int, int, int, int] | None:
@@ -721,26 +781,26 @@ class ReviewPage:
 
     def revert_word(self, word: Word, old_content: str, old_wc: float | None) -> None:
         """Undo one ``edit_word`` (GUI undo stack): restore the exact prior
-        CONTENT/WC and un-count the edit. ``dirty`` stays as-is — other
+        CONTENT/WC (the edit then nets out of provenance). ``dirty`` stays as-is — other
         unsaved changes may exist; reloading the page is the full reset."""
+        self._touch(word.elem)
         word.elem.set("CONTENT", old_content)
         if old_wc is None:
             word.elem.attrib.pop("WC", None)
         else:
             word.elem.set("WC", f"{old_wc:.2f}")
         reorder_attrs(word.elem, ATTR_ORDER["String"])
-        self.session_edits = max(0, self.session_edits - 1)
 
     def unverify_word(self, word: Word, old_wc: float | None) -> None:
         """Undo one ``verify_word`` (GUI undo stack): restore the engine's
-        WC and un-count the confirmation. ``dirty`` stays as-is, like
+        WC (the confirmation then nets out of provenance). ``dirty`` stays as-is, like
         ``revert_word`` — reloading the page is the full reset."""
+        self._touch(word.elem)
         if old_wc is None:
             word.elem.attrib.pop("WC", None)
         else:
             word.elem.set("WC", f"{old_wc:.2f}")
         reorder_attrs(word.elem, ATTR_ORDER["String"])
-        self.session_verifies = max(0, self.session_verifies - 1)
 
     # ---------- reading order ---------------------------------------------
 
@@ -1050,9 +1110,8 @@ class ReviewPage:
         # now — zero the counters BEFORE the writes, so a failed txt write
         # followed by a retried save can't fold the same edits in twice
         # (_stamp_provenance re-reads the tree's totals as `prior`).
-        self.session_edits = 0
+        self._before.clear()
         self.session_moves = 0
-        self.session_verifies = 0
         serialize_with_tabs(self.tree, self.alto_path)
         self._loaded_mtime_ns = self.alto_path.stat().st_mtime_ns
         self._clean_state = etree.tostring(self.root)
@@ -1106,9 +1165,10 @@ class ReviewPage:
                 m = re.search(r"(\d+) reading-order", step.text)
                 prior_moves = int(m.group(1)) if m else 0
 
-        total = prior + self.session_edits
+        corrected, confirmed = self._net_counts()
+        total = prior + corrected
         total_moves = prior_moves + self.session_moves
-        total_verifies = prior_verifies + self.session_verifies
+        total_verifies = prior_verifies + confirmed
         # Corrected leads, so the loose "(\d+) word" parse above still finds
         # it; the moves clause never contains "word" at all.
         step_text = f"human review: {total} word(s) corrected"

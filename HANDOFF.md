@@ -14,7 +14,7 @@ anything Goobi.
 
 | | |
 |---|---|
-| Version | **0.10.4** (`src/alto_ocr/__init__.py`) |
+| Version | **0.10.6** (`src/alto_ocr/__init__.py`; 0.10.5–0.10.6 made on the WSL machine, see git log) |
 | `main` | `0e35ba3` *merge: Goobi provisioning kit*, **pushed** to the `alto-ocr` remote |
 | Remote | `alto-ocr` = `https://github.itap.purdue.edu/schipp0/alto-ocr.git` (named `alto-ocr`, not `origin`) |
 | Tests | 463 pass, 16 skipped on Windows (`python -m unittest discover -s tests`) |
@@ -237,13 +237,11 @@ stage 8 (S3 upload to LibSafe) was specified but not built.
 
 ## 6. Open work, roughly in priority order
 
-1. **Port the provenance net-count fix** (section 2a) onto current `main`.
-   Rebuild it against `remediate.py` as it is now: `delete_word`,
-   `verify_word`, `add_word`/`undo_add` and the multi-word delete from 0.10.4
-   all touch the counters. Add tests in `tests/test_remediate.py`. Keep
-   reading-order moves counted per move (deliberate). The browser review
-   already sends at most one operation per word, so the over-count is a Tk
-   tab problem, and the fix belongs in `remediate.py`.
+1. ~~**Port the provenance net-count fix**~~ **Done in v0.10.6 (2026-10-15)**,
+   rebuilt from this description on `main`, not ported from the 2026-09-24
+   worktree (which never reached the remote). It snapshots each word, as in
+   `ReviewPage._before`, and counts net effect with `_net_counts`. Tests are
+   `NetCountTests` in `tests/test_remediate.py`.
 2. **Sub-series folders and long paths** (found 2026-09-28; **waiting on your
    decision**). LibSafe adds a sub-series level above Ref IDs with names up to
    126 characters, which pushes Windows paths past MAX_PATH (`LongPathsEnabled=0`
