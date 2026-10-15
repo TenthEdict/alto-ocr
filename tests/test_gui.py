@@ -193,11 +193,19 @@ class _AppFixture(unittest.TestCase):
         # pending (the app's log poll) fires into the *next* test's Tk and
         # prints "invalid command name". Cancel them, then let queued events
         # run — making a frame its own window makes ttk queue a
-        # <<ThemeChanged>> that errors if it fires after destroy.
+        # <<ThemeChanged>> that errors if it fires after destroy. Cancel
+        # again afterwards: those events can schedule timers of their own
+        # (a docked page's <Configure> queues the deferred fit-to-width).
+        # Cancel in Tcl, not with root.after_cancel: that deletes the
+        # callback's Tcl command, but the widget that scheduled it still
+        # lists the command, so destroy() then fails half-way ("can't
+        # delete Tcl command") and leaves this root as tkinter's default
+        # root, where the next test's images get created.
         try:
-            for after_id in self.root.tk.splitlist(self.root.tk.call("after", "info")):
-                self.root.after_cancel(after_id)
-            self.root.update()
+            for _ in range(2):
+                for after_id in self.root.tk.splitlist(self.root.tk.call("after", "info")):
+                    self.root.tk.call("after", "cancel", after_id)
+                self.root.update()
             self.root.destroy()
         except tk.TclError:
             pass

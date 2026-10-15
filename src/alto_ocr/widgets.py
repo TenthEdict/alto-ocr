@@ -165,6 +165,11 @@ class Detachable:
             return
         frame = self.frame
         try:
+            # X11 maps a newly managed window from an idle handler; until it
+            # runs, the window reports "iconic" at 1x1 (Windows reports the
+            # real state at once). Flush it, or a page docked before the
+            # event loop turns over loses its geometry.
+            frame.update_idletasks()
             state = tk.Wm.wm_state(frame)
             geometry = tk.Wm.wm_geometry(frame)
         except tk.TclError:
