@@ -39,6 +39,8 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from lxml import etree
+
 from ..remediate import ConcurrentEditError, ReviewPage, Word, transcript_spans
 from ..triage import DEFAULT_LOW_WC
 
@@ -345,16 +347,35 @@ def check_token(alto_path: Path, token: str | None) -> None:
             "it with your corrections.")
 
 
+def _layout_numbers(page: ReviewPage) -> dict[int, tuple[int, int | None]]:
+    """``id(String)`` → (its TextLine's number, its TextBlock's number or
+    None), both counted in document order: what the browser groups by when
+    a double-click selects a word's line and a triple-click its block."""
+    lines: dict[int, int] = {}
+    blocks: dict[int, int] = {}
+    out: dict[int, tuple[int, int | None]] = {}
+    for w in page.words:
+        line = w.elem.getparent()
+        block = next((a for a in w.elem.iterancestors()
+                      if etree.QName(a).localname == "TextBlock"), None)
+        ln = lines.setdefault(id(line), len(lines))
+        bn = blocks.setdefault(id(block), len(blocks)) if block is not None else None
+        out[id(w.elem)] = (ln, bn)
+    return out
+
+
 def order_payload(page: ReviewPage, load_words: list[Word]) -> dict:
     """The page's reading order and transcript as they stand now (after a
     batch was applied to this in-memory load).
 
-    ``order`` lists every word in reading order as ``{i, box, line, start,
-    end}``: ``i`` is the word's load-time index (None for a word added in
-    the batch -- it has none), ``box`` its source-image pixel box, ``line``
-    a counter that changes at each line break, and ``start``/``end`` its
-    span in ``transcript``, which is exactly the text a save would write.
+    ``order`` lists every word in reading order as ``{i, box, line, block,
+    start, end}``: ``i`` is the word's load-time index (None for a word
+    added in the batch -- it has none), ``box`` its source-image pixel box,
+    ``line`` a counter that changes at each line break, ``block`` its
+    TextBlock's number (None outside one), and ``start``/``end`` its span
+    in ``transcript``, which is exactly the text a save would write.
     """
+    numbers = _layout_numbers(page)
     index_of = {id(w.elem): i for i, w in enumerate(load_words)}
     word_of = {id(w.elem): w for w in page.words}
     text, spans = transcript_spans(page.root)
@@ -370,6 +391,7 @@ def order_payload(page: ReviewPage, load_words: list[Word]) -> dict:
             "i": index_of.get(id(el)),
             "box": [round(v, 2) for v in word.box_px] if word else None,
             "line": line,
+            "block": numbers.get(id(el), (None, None))[1],
             "start": start,
             "end": end,
         })
@@ -387,6 +409,7 @@ def page_payload(page: ReviewPage, *, stem: str, alto_path: Path,
     own ALTO editor: the ratio is computed from the file's own Page
     dimensions rather than assuming ALTO units are pixels.
     """
+    numbers = _layout_numbers(page)
     words = [
         {
             "i": i,
@@ -394,6 +417,9 @@ def page_payload(page: ReviewPage, *, stem: str, alto_path: Path,
             "wc": w.wc,
             "box": [round(v, 2) for v in w.box_px],
             "flagged": w.needs_review(low_wc),
+            # Which line / block the word sits in, for selecting a whole one.
+            "line": numbers[id(w.elem)][0],
+            "block": numbers[id(w.elem)][1],
         }
         for i, w in enumerate(page.words)
     ]

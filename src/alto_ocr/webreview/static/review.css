@@ -196,6 +196,10 @@ input[type=text]:focus, input[type=search]:focus {
 .obox.chosen { stroke: var(--done); stroke-width: 3;
                fill: color-mix(in srgb, var(--done) 14%, transparent); }
 .obox.added { stroke: var(--ok); stroke-dasharray: 4 3; }
+/* Reading order: dragging the selection shows where it would land. */
+.stage.dropping { cursor: grabbing; }
+.dropbar { stroke: var(--sel); stroke-width: 4; stroke-linecap: round;
+  vector-effect: non-scaling-stroke; }
 .opath, .ocase { fill: none; stroke-linecap: round; vector-effect: non-scaling-stroke; }
 .opath { stroke: var(--order); }
 .ocase { stroke: var(--order-casing); }
@@ -232,12 +236,19 @@ select {
   display: flex; gap: 14px; align-items: center; padding: 10px 12px;
   background: var(--panel); border-top: 1px solid var(--line);
 }
+/* A fixed slot: the bar keeps its height whatever is in it (or nothing),
+   so a fit zoom never re-fits the scan when the selection changes. */
 .snippet {
-  max-height: 88px; max-width: 42%; border: 1px solid var(--line);
+  width: 260px; height: 72px; object-fit: contain; max-width: 42%;
+  flex: 0 0 auto; border: 1px solid var(--line);
   border-radius: 5px; background: #fff; image-rendering: crisp-edges;
 }
+.snippet:not([src]) { visibility: hidden; }  /* empty editor: keep the slot, not a broken image */
 .editor-fields { flex: 1 1 auto; min-width: 0; display: grid; gap: 6px; }
-.editor-meta { display: flex; gap: 10px; align-items: center; }
+.editor-meta { display: flex; gap: 10px; align-items: center; min-width: 0; }
+/* One line, always: a status that wrapped would change the bar's height
+   and with it a fit zoom's scale. */
+.editor-meta > * { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .editor-fields input[type=text] { font-size: 17px; padding: 7px 10px; width: 100%; }
 .editor-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 .badge { font-size: 12px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--ink-soft); }

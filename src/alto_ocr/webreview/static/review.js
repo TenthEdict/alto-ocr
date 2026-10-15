@@ -254,6 +254,9 @@ const prefs = {
 let walk = null;
 
 const WORD_OPS = new Set(['edit', 'verify', 'delete']);
+// Inputs that do not take typed text: shortcut keys still apply on them.
+const NON_TEXT_INPUTS = new Set(['checkbox', 'radio', 'button', 'submit', 'reset',
+                                 'range', 'color', 'file', 'image']);
 const ZOOM_CHOICES = [['fit', 'Fit page'], ['width', 'Fit width'], [0.25, '25%'], [0.5, '50%'],
                       [0.75, '75%'], [1, '100%'], [1.5, '150%'], [2, '200%'], [3, '300%']];
 
@@ -279,6 +282,13 @@ async function renderPage(refId, stem) {
   const undoStack = [];          // {op, prev?}: Ctrl+Z takes `op` out, puts `prev` back
   let clearPending = false;
   let selected = null;           // word being edited
+  // Several words selected outside reading order (load-time indices, in
+  // document order) -- what Delete removes in one step. Empty while one
+  // word or none is selected; `selected` holds the one.
+  let picked = [];
+  let pickAnchor = null;         // where Shift+click extends from
+  let lastClickMoved = false;    // reading order: the click a double-click began moved words
+  let suppressClick = false;     // a box drag ended on a word: not a click on it
   let zoom = 'fit';              // 'fit' | 'width' | a scale factor
   let mode = null;               // null | 'add' | 'order'
   let draw = null;               // add mode: drag in progress {x0,y0,x1,y1}
@@ -315,18 +325,31 @@ async function renderPage(refId, stem) {
   /* Record one correction. Returns a promise that settles once the views
    * have caught up (the reading-order preview is a round trip), or null
    * when the correction was refused. */
-  const record = (op) => {
-    if (clearPending && op.op !== 'add') {
-      say('The page is queued to be cleared — save that first.', 'err');
-      return null;
-    }
+  const logOp = (op) => {
     const entry = { op };
     if (WORD_OPS.has(op.op)) {
       entry.prev = wordOp(op.index);
       if (entry.prev) log.splice(log.indexOf(entry.prev), 1);
     }
     log.push(op);
-    undoStack.push(entry);
+    return entry;
+  };
+  const record = (op) => {
+    if (clearPending && op.op !== 'add') {
+      say('The page is queued to be cleared — save that first.', 'err');
+      return null;
+    }
+    undoStack.push(logOp(op));
+    return changed();
+  };
+  /* Several corrections that undo as one step (deleting a selection). */
+  const recordGroup = (ops) => {
+    if (clearPending) {
+      say('The page is queued to be cleared — save that first.', 'err');
+      return null;
+    }
+    const group = ops.map(logOp);
+    undoStack.push(group.length === 1 ? group[0] : { group });
     return changed();
   };
 
@@ -339,6 +362,19 @@ async function renderPage(refId, stem) {
   const undo = () => {
     const entry = undoStack.pop();
     if (!entry) { say('Nothing to undo on this page.'); return; }
+    if (entry.group) {
+      for (const e of [...entry.group].reverse()) {
+        const at = log.indexOf(e.op);
+        if (at >= 0) log.splice(at, 1);
+        if (e.prev) log.push(e.prev);
+      }
+      const indices = entry.group.map(e => e.op.index);
+      say(`Undone: deletion of ${indices.length} words.`);
+      const done = changed();
+      if (mode === 'order') done.then(() => setOrderSel(indices, indices[0]));
+      else if (mode === null) setPicked(indices, indices[0]);
+      return;
+    }
     const at = log.indexOf(entry.op);
     if (at >= 0) log.splice(at, 1);
     if (entry.prev) log.push(entry.prev);
@@ -420,16 +456,15 @@ async function renderPage(refId, stem) {
     if (!clearPending) {
       for (const w of page.words) {
         const op = wordOp(w.i);
-        const isSel = selected && selected.i === w.i;
+        const isSel = (selected && selected.i === w.i) || picked.includes(w.i);
         if (!showAll && !flagged(w) && !op && !isSel) continue;
         const [x, y, bw, bh] = w.box;
         const rect = svgEl('rect', { x, y, width: Math.max(bw, 1), height: Math.max(bh, 1) });
         rect.setAttribute('class', 'wbox ' + boxClass(w) + (isSel ? ' sel' : ''));
-        rect.addEventListener('mousedown', (ev) => { if (mode !== 'add') ev.stopPropagation(); });
         rect.addEventListener('click', (ev) => {
           if (mode === 'add') return;
           ev.stopPropagation();
-          select(w);
+          clickWord(w, ev);
         });
         const label = op && op.op === 'edit' ? `${w.text} → ${op.text}`
                     : op && op.op === 'delete' ? `${w.text} (delete)`
@@ -457,7 +492,13 @@ async function renderPage(refId, stem) {
       const [x, y, bw, bh] = pendingBox;
       overlay.append(svgEl('rect', { class: 'drawbox', x, y, width: bw, height: bh }));
     }
+    if (press && press.dragging) overlay.append(pressBox());
   };
+  const pressBox = () => svgEl('rect', {
+    class: 'drawbox',
+    x: Math.min(press.x0, press.x1), y: Math.min(press.y0, press.y1),
+    width: Math.abs(press.x1 - press.x0), height: Math.abs(press.y1 - press.y0),
+  });
 
   /* Where the reading-path link from box a to box b runs -- between the
    * words, never through them, so the path does not strike out the text
@@ -535,23 +576,55 @@ async function renderPage(refId, stem) {
         x, y, width: Math.max(bw, 1), height: Math.max(bh, 1), class: 'obox chosen',
       }));
     }
-    if (press && press.dragging) {
-      overlay.append(svgEl('rect', {
-        class: 'drawbox',
-        x: Math.min(press.x0, press.x1), y: Math.min(press.y0, press.y1),
-        width: Math.abs(press.x1 - press.x0), height: Math.abs(press.y1 - press.y0),
-      }));
+    if (press && press.dragging && press.dropping) {
+      // An insertion bar on the side of the word the selection would land by.
+      if (press.target) {
+        const [x, y, bw, bh] = press.target.box;
+        const bx = press.target.before ? x : x + bw;
+        overlay.append(svgEl('line', { class: 'dropbar', x1: bx, y1: y - bh * 0.15,
+                                        x2: bx, y2: y + bh * 1.15 }));
+      }
+    } else if (press && press.dragging) {
+      overlay.append(pressBox());
     }
   };
 
   /* ---- editor ---- */
   const editor = $('editor'), edText = $('ed-text');
 
+  /* The editor bar with no word in it. It stays on screen rather than
+   * hiding: with a fit zoom, a bar that came and went re-fitted the scan on
+   * every select and deselect, moving every word out from under the mouse
+   * -- in reading order, between the click that selects a word and the
+   * click (or drag) that places it. */
+  const emptyEditor = () => {
+    selected = null;
+    if (document.activeElement === edText) edText.blur();
+    $('addbar').hidden = true;
+    editor.hidden = false;
+    const badge = $('ed-wc');
+    badge.textContent = 'no word selected';
+    badge.className = 'badge';
+    $('ed-pos').textContent = mode === 'order'
+      ? 'Select one word to correct its text here'
+      : 'Click a word, or press n for the next flagged one';
+    edText.value = '';
+    edText.disabled = true;
+    for (const id of ['ed-commit', 'ed-confirm', 'ed-delete']) $(id).disabled = true;
+    $('ed-delete').textContent = 'Delete';
+    $('snippet').removeAttribute('src');
+  };
+
   /* Put a word in the editor bar without moving focus or the view. */
   const fillEditor = (w) => {
     selected = w;
     $('addbar').hidden = true;
     editor.hidden = false;
+    edText.disabled = false;
+    $('ed-commit').disabled = false;
+    $('ed-confirm').disabled = false;
+    $('ed-delete').disabled = false;
+    $('ed-delete').textContent = 'Delete';
     const wc = w.wc;
     const badge = $('ed-wc');
     badge.textContent = wc === null || wc === undefined ? 'unscored' : `confidence ${pct(wc)}`;
@@ -563,12 +636,107 @@ async function renderPage(refId, stem) {
     if ($('snippet').getAttribute('src') !== src) $('snippet').src = src;
   };
 
-  const select = (w) => {
+  /* Select one word (null: none) and put it in the editor. Focus moves
+   * into the word box only when asked (a click on the word) or when it is
+   * already there (Enter / Tab moving on while correcting): stepping with
+   * n/p from anywhere else must leave the keys with the shortcuts, or the
+   * next n is typed over the word -- the trap usability testing hit. */
+  const select = (w, focusEditor = false) => {
+    const editing = document.activeElement === edText;
     selected = w;
-    if (!w) { editor.hidden = true; drawOverlay(); return; }
+    picked = [];
+    pickAnchor = w ? w.i : null;
+    if (!w) { emptyEditor(); drawOverlay(); return; }
     fillEditor(w);
     drawOverlay();
     scrollToBox(w.box);
+    if (focusEditor || editing) { edText.focus(); edText.select(); }
+  };
+
+  /* ---- several words at once (outside reading order) ---- */
+  const isGone = (i) => { const op = wordOp(i); return !!op && op.op === 'delete'; };
+  const shownWord = (w) => showAll || flagged(w) || !!wordOp(w.i);
+  const currentPick = () => (picked.length ? [...picked] : selected ? [selected.i] : []);
+  const anchorOf = () => pickAnchor ?? (selected ? selected.i : null);
+  const setPicked = (indices, anchor) => {
+    const uniq = [...new Set(indices)].filter(i => page.words[i] && !isGone(i)).sort((a, b) => a - b);
+    if (uniq.length <= 1) {
+      select(uniq.length ? page.words[uniq[0]] : null);
+      if (uniq.length && anchor !== null && anchor !== undefined) pickAnchor = anchor;
+      return;
+    }
+    picked = uniq;
+    pickAnchor = anchor ?? uniq[0];
+    selected = null;
+    showMulti();
+    drawOverlay();
+  };
+  const showMulti = () => {
+    const n = picked.length;
+    $('addbar').hidden = true;
+    editor.hidden = false;
+    const badge = $('ed-wc');
+    badge.textContent = `${n} words selected`;
+    badge.className = 'badge';
+    $('ed-pos').textContent = 'Delete removes them all · Esc clears';
+    edText.value = '';
+    // Let go of focus first: a focused input that becomes disabled keeps
+    // focus in Chrome and swallows every key -- Delete included.
+    if (document.activeElement === edText) edText.blur();
+    edText.disabled = true;
+    $('ed-commit').disabled = true;
+    $('ed-confirm').disabled = true;
+    $('ed-delete').disabled = false;
+    $('ed-delete').textContent = `Delete ${n} words`;
+    const boxes = picked.map(i => page.words[i].box);
+    const x0 = Math.min(...boxes.map(b => b[0])), y0 = Math.min(...boxes.map(b => b[1]));
+    const x1 = Math.max(...boxes.map(b => b[0] + b[2])), y1 = Math.max(...boxes.map(b => b[1] + b[3]));
+    // The span of the selection, narrowed so a whole line stays a snippet.
+    const zoom = Math.max(0.1, Math.min(2.5, 560 / Math.max(x1 - x0, 1)));
+    $('snippet').src = `${pageUrl(refId, stem)}/crop?x=${x0}&y=${y0}&w=${x1 - x0}&h=${y1 - y0}&zoom=${zoom.toFixed(2)}`;
+  };
+  const togglePick = (i) => {
+    const cur = currentPick();
+    setPicked(cur.includes(i) ? cur.filter(v => v !== i) : [...cur, i], i);
+  };
+  const extendPick = (i) => {
+    const a = anchorOf();
+    const [lo, hi] = a < i ? [a, i] : [i, a];
+    setPicked(page.words.filter(w => w.i >= lo && w.i <= hi && shownWord(w)).map(w => w.i), a);
+  };
+  const pickUnit = (i, unit) => {
+    const w = page.words[i];
+    const key = unit === 'block' && w.block !== null && w.block !== undefined ? 'block' : 'line';
+    setPicked(page.words.filter(v => v[key] === w[key] && shownWord(v)).map(v => v.i), i);
+    if (picked.length > 1) say(`Selected the ${unit}: ${picked.length} words. Delete removes them; Ctrl+Z puts them back.`);
+  };
+  const pickBox = (box, add) => {
+    const [x, y, bw, bh] = box;
+    let hits = page.words.filter(w => shownWord(w) && !isGone(w.i)).filter(w => {
+      const [cx, cy] = center(w.box);
+      return cx >= x && cx <= x + bw && cy >= y && cy <= y + bh;
+    }).map(w => w.i);
+    if (!hits.length) { say('No words inside that box.'); return; }
+    if (add) hits = [...currentPick(), ...hits];
+    setPicked(hits, add ? anchorOf() : hits[0]);
+    if (picked.length > 1) say(`${picked.length} words selected — Delete removes them, Ctrl+Z puts them back, Esc clears.`);
+  };
+  /* A click on a word's box: plain selects it for typing, Shift extends
+   * from the anchor, Ctrl adds or drops it, a double-click takes its whole
+   * line and a triple-click its block. */
+  const clickWord = (w, ev) => {
+    if (suppressClick) { suppressClick = false; return; }
+    if (ev.detail >= 2) { pickUnit(w.i, ev.detail >= 3 ? 'block' : 'line'); return; }
+    if (ev.ctrlKey || ev.metaKey) { togglePick(w.i); return; }
+    if (ev.shiftKey && anchorOf() !== null) { extendPick(w.i); return; }
+    select(w, true);
+  };
+  /* Enter / F2 where nothing is being typed: start typing over the word in
+   * hand -- or, with none, over the next flagged word. */
+  const editSelected = () => {
+    if (mode === 'order') { editOrderWord(); return; }
+    if (!selected && !picked.length) step(1);
+    if (!selected) return;
     edText.focus();
     edText.select();
   };
@@ -647,12 +815,20 @@ async function renderPage(refId, stem) {
   /* Deleting happens at once, without an "are you sure?" -- Ctrl+Z puts
    * the word back. */
   const deleteSelected = () => {
-    if (!selected) return;
-    const w = selected;
-    if (!record({ op: 'delete', index: w.i })) return;
+    const targets = (mode === 'order' ? [...orderSel] : currentPick()).filter(i => !isGone(i));
+    if (!targets.length) return;
+    const first = wordText(targets[0]);
+    if (!recordGroup(targets.map(index => ({ op: 'delete', index })))) return;
     if (mode === 'order') { setOrderSel([], null); edText.blur(); }
-    else step(1);
-    say(`Deleted “${w.text}” (Ctrl+Z puts it back).`);
+    else {
+      // Carry on from where the deleted words were, as after one deletion.
+      selected = page.words[targets[targets.length - 1]];
+      picked = [];
+      step(1);
+    }
+    say(targets.length === 1
+      ? `Deleted “${first}” (Ctrl+Z puts it back).`
+      : `Deleted ${targets.length} words (Ctrl+Z puts them back).`);
   };
 
   $('ed-commit').addEventListener('click', () => commitEdit(true));
@@ -667,10 +843,17 @@ async function renderPage(refId, stem) {
   });
   edText.addEventListener('keydown', (ev) => {
     if (ev.key === 'Enter') { ev.preventDefault(); commitEdit(true); }
-    else if (ev.key === 'Escape') {
+    else if (ev.key === 'Tab' && mode !== 'order' && !ev.ctrlKey && !ev.altKey) {
+      // n and p type here, so Tab / Shift+Tab move between flagged words.
       ev.preventDefault();
-      // Reading order: abandon the typing, keep the selection.
-      if (mode === 'order' && selected) { fillEditor(selected); edText.blur(); }
+      step(ev.shiftKey ? -1 : 1);
+    } else if (ev.key === 'Escape') {
+      ev.preventDefault();
+      // Abandon the typing and hand the keys back to the shortcuts. A word
+      // left untouched is let go too, except in reading order, where the
+      // selection is still wanted.
+      const typed = selected && edText.value.trim() !== wordText(selected.i);
+      if (selected && (mode === 'order' || typed)) { fillEditor(selected); edText.blur(); }
       else select(null);
     }
   });
@@ -730,8 +913,8 @@ async function renderPage(refId, stem) {
     $('order-panel').hidden = mode !== 'order';
     pendingBox = null; draw = null; press = null;
     $('addbar').hidden = true;
-    selected = null;
-    editor.hidden = true;
+    picked = []; pickAnchor = null;
+    emptyEditor();
     // Reading order keeps the word in hand after a correction; elsewhere
     // Enter moves on to the next flagged word.
     $('ed-commit').textContent = mode === 'order' ? 'Apply' : 'Correct & next';
@@ -795,10 +978,10 @@ async function renderPage(refId, stem) {
   const paintOrderPanel = () => {
     const n = orderSel.length;
     $('order-hint').textContent = n
-      ? `${n} word(s) selected. Now click the word they should come after — on the scan or in the transcript. “Page start” puts them first; Ctrl+↑/Ctrl+↓ nudge them one word; Esc clears; Ctrl+Z undoes a move.`
-      : 'Select the words that are out of place: click one (on the scan or in the transcript below), Shift+click to extend to a run, Ctrl+click to add or drop a word, or drag a box around a whole column or caption on the scan. A single selected word can also be corrected in the editor below.';
+      ? `${n} word(s) selected. Now click the word they should come after — on the scan or in the transcript — or drag them onto it (drop on its left half to put them before it). “Page start” puts them first; Ctrl+↑/Ctrl+↓ nudge them one word; Delete removes them; Esc clears; Ctrl+Z undoes.`
+      : 'Select the words that are out of place: click one (on the scan or in the transcript below), Shift+click to extend to a run, Ctrl+click to add or drop a word, double-click for a whole line, or drag a box around a whole column or caption on the scan. A single selected word can also be corrected in the editor below.';
     if (n === 1) $('order-hint').textContent += ' To fix its text, press Enter or F2 (or ✎ Edit word).';
-    for (const id of ['order-earlier', 'order-later', 'order-start', 'order-clear']) $(id).disabled = !n;
+    for (const id of ['order-earlier', 'order-later', 'order-start', 'order-clear', 'order-delete']) $(id).disabled = !n;
     $('order-edit').disabled = n !== 1;
     syncOrderEditor();
     const box = $('order-text');
@@ -835,7 +1018,7 @@ async function renderPage(refId, stem) {
   const syncOrderEditor = () => {
     const w = orderSel.length === 1 && page ? page.words[orderSel[0]] : null;
     if (!w) {
-      if (selected) { selected = null; editor.hidden = true; }
+      if (selected || editor.hidden || !edText.disabled) emptyEditor();
       return;
     }
     if (w === selected && document.activeElement === edText) return;
@@ -879,6 +1062,27 @@ async function renderPage(refId, stem) {
     moveSelection({ op: 'move', indices: [...orderSel], after: i }, `after “${wordText(i)}”`);
   };
 
+  const orderSelectUnit = (i, unit) => {
+    const o = order && order.order.find(v => v.i === i);
+    if (!o) return;
+    const key = unit === 'block' && o.block !== null && o.block !== undefined ? 'block' : 'line';
+    setOrderSel(order.order.filter(v => v.i !== null && v[key] === o[key]).map(v => v.i), i);
+  };
+  /* Move the selection right before word i: right after the word read
+   * before it (once the selection is out of the way), or first. */
+  const placeOrder = (i, before) => {
+    if (!before) {
+      moveSelection({ op: 'move', indices: [...orderSel], after: i }, `after “${wordText(i)}”`);
+      return;
+    }
+    const chosen = new Set(orderSel);
+    const seq = order.order.filter(o => o.i === null || !chosen.has(o.i));
+    const k = seq.findIndex(o => o.i === i);
+    let after = null;
+    for (let j = k - 1; j >= 0; j--) if (seq[j].i !== null) { after = seq[j].i; break; }
+    moveSelection({ op: 'move', indices: [...orderSel], after }, `before “${wordText(i)}”`);
+  };
+
   const orderToggle = (i) => {
     if (i === null || i === undefined || !order) return;
     if (orderSel.includes(i)) {
@@ -918,6 +1122,7 @@ async function renderPage(refId, stem) {
   const moveSelection = async (op, where) => {
     if (!orderSel.length) return;
     const n = orderSel.length;
+    lastClickMoved = true;
     const done = record(op);
     if (!done) return;
     await done;
@@ -935,11 +1140,17 @@ async function renderPage(refId, stem) {
     moveSelection({ op: 'move', indices: [...orderSel], after: null }, 'to the start of the page');
   });
   $('order-clear').addEventListener('click', () => setOrderSel([], null));
+  $('order-delete').addEventListener('click', () => deleteSelected());
   const orderText = $('order-text');
   orderText.addEventListener('mousedown', (ev) => ev.preventDefault());  // no text selection
   orderText.addEventListener('click', (ev) => {
     const span = ev.target.closest('.tw');
     const i = span && span.dataset.i !== undefined ? Number(span.dataset.i) : null;
+    if (ev.detail >= 2) {
+      if (!lastClickMoved && i !== null) orderSelectUnit(i, ev.detail >= 3 ? 'block' : 'line');
+      return;
+    }
+    lastClickMoved = false;
     if (ev.ctrlKey || ev.metaKey) orderToggle(i);
     else orderPick(i, ev.shiftKey);
   });
@@ -947,13 +1158,20 @@ async function renderPage(refId, stem) {
   /* ---- mouse on the scan: add-word drags, reading-order clicks and boxes ---- */
   stage.addEventListener('mousedown', (ev) => {
     if (!page || ev.button !== 0) return;
-    if (mode === 'order') {
-      if (!order) return;
+    if (mode === 'order' || (mode === null && !clearPending)) {
+      if (mode === 'order' && !order) return;
       ev.preventDefault();
+      if (ev.detail === 1) lastClickMoved = false;
       const p = toImage(ev);
+      const mods = ev.shiftKey ? 'shift' : (ev.ctrlKey || ev.metaKey) ? 'ctrl' : '';
+      const hit = mode === 'order' ? orderEntryAt(p.x, p.y) : null;
       press = { x0: p.x, y0: p.y, x1: p.x, y1: p.y, cx: ev.clientX, cy: ev.clientY,
-                mods: ev.shiftKey ? 'shift' : (ev.ctrlKey || ev.metaKey) ? 'ctrl' : '',
-                dragging: false };
+                mods, dragging: false, count: ev.detail,
+                onWord: !!ev.target.closest('.wbox'),
+                // Reading order: a press on a selected word may drag the
+                // selection to its new place.
+                dropping: !mods && !!hit && hit.i !== null && orderSel.includes(hit.i),
+                target: null };
       return;
     }
     if (mode !== 'add') return;
@@ -967,6 +1185,15 @@ async function renderPage(refId, stem) {
       press.x1 = p.x; press.y1 = p.y;
       // A few pixels of wobble is still a click.
       if (!press.dragging && Math.hypot(ev.clientX - press.cx, ev.clientY - press.cy) > 5) press.dragging = true;
+      if (press.dragging && press.dropping) {
+        stage.classList.add('dropping');
+        const hit = orderEntryAt(p.x, p.y);
+        press.target = hit && hit.i !== null && !orderSel.includes(hit.i)
+          ? { i: hit.i, box: hit.box, before: p.x < hit.box[0] + hit.box[2] / 2 } : null;
+        say(press.target
+          ? `Release to move the ${orderSel.length} word(s) ${press.target.before ? 'before' : 'after'} “${wordText(press.target.i)}”.`
+          : `Drop the ${orderSel.length} word(s) on the word they belong beside.`);
+      }
       if (press.dragging) drawOverlay();
       return;
     }
@@ -979,15 +1206,36 @@ async function renderPage(refId, stem) {
     if (press) {
       const p = press;
       press = null;
-      if (p.dragging) {
-        orderBoxSelect([Math.min(p.x0, p.x1), Math.min(p.y0, p.y1),
-                        Math.abs(p.x1 - p.x0), Math.abs(p.y1 - p.y0)], p.mods !== '');
+      stage.classList.remove('dropping');
+      if (p.dragging && p.dropping) {
+        if (p.target) placeOrder(p.target.i, p.target.before);
+        else say('Nothing moved — drop the words on a word outside the selection.');
         drawOverlay();
-      } else {
-        const hit = orderEntryAt(p.x0, p.y0);
-        if (p.mods === 'ctrl') orderToggle(hit && hit.i);
-        else orderPick(hit ? hit.i : null, p.mods === 'shift');
+        return;
       }
+      if (p.dragging) {
+        // The click that follows a drag ending on a word is not a click on it.
+        suppressClick = true;
+        setTimeout(() => { suppressClick = false; }, 0);
+        const box = [Math.min(p.x0, p.x1), Math.min(p.y0, p.y1),
+                     Math.abs(p.x1 - p.x0), Math.abs(p.y1 - p.y0)];
+        if (mode === 'order') orderBoxSelect(box, p.mods !== '');
+        else pickBox(box, p.mods !== '');
+        drawOverlay();
+        return;
+      }
+      if (mode !== 'order') {
+        // Words handle their own clicks; a click on bare scan lets go.
+        if (!p.onWord && !p.mods) select(null);
+        return;
+      }
+      const hit = orderEntryAt(p.x0, p.y0);
+      if (p.count >= 2) {
+        if (!lastClickMoved && hit && hit.i !== null) orderSelectUnit(hit.i, p.count >= 3 ? 'block' : 'line');
+        return;
+      }
+      if (p.mods === 'ctrl') orderToggle(hit && hit.i);
+      else orderPick(hit ? hit.i : null, p.mods === 'shift');
       return;
     }
     if (!draw) return;
@@ -1013,8 +1261,8 @@ async function renderPage(refId, stem) {
       if (log.some(o => o.op !== 'add')) { say('Save or undo the queued corrections first — clear cannot be combined with them.', 'err'); return; }
       if (!confirm(`Remove every word on ${stem}?\n\nFor pages whose OCR is wholly hallucinated — covers, photographs, blank pages where texture read as text. The page skeleton stays, so you can add back any words that were real.`)) return;
       clearPending = true;
-      selected = null;
-      editor.hidden = true;
+      picked = [];
+      emptyEditor();
       say(`${page.words.length} word(s) queued for removal. Save to apply.`, 'err');
     }
     $('clear-page').setAttribute('aria-pressed', String(clearPending));
@@ -1098,8 +1346,8 @@ async function renderPage(refId, stem) {
       const res = await postJSON(pageUrl(refId, stem), { token: page.token, ops: batch(), force: !!force });
       log.length = 0; undoStack.length = 0; clearPending = false;
       $('clear-page').setAttribute('aria-pressed', 'false');
-      selected = null;
-      editor.hidden = true;
+      picked = []; pickAnchor = null;
+      emptyEditor();
       // Word indices are positions in the saved page now: the old ones
       // (and a reading-order selection made of them) are spent.
       orderSel = []; orderAnchor = null;
@@ -1153,8 +1401,15 @@ async function renderPage(refId, stem) {
       return;
     }
     const target = ev.target;
-    const typing = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement
-                || target instanceof HTMLSelectElement;
+    // Only text fields type. A checkbox or dropdown the corrector just
+    // clicked ("All words", zoom, threshold) must not silence n/p/Esc.
+    const typing = target instanceof HTMLTextAreaElement || target.isContentEditable
+                || (target instanceof HTMLInputElement && !NON_TEXT_INPUTS.has(target.type));
+    if (mod && ev.key.toLowerCase() === 'd' && target !== $('add-text')) {
+      ev.preventDefault();
+      deleteSelected();
+      return;
+    }
     // Ctrl+Z undoes the last correction -- except while the corrector has
     // typed into the word box, where it undoes their typing.
     const untouchedEditor = target === edText && selected && edText.value === wordText(selected.i);
@@ -1170,18 +1425,21 @@ async function renderPage(refId, stem) {
       return;
     }
     if (mod || ev.altKey) return;
-    if (mode === 'order' && (ev.key === 'Enter' || ev.key === 'F2') && selected
-        && !(target instanceof HTMLButtonElement)) {
+    if ((ev.key === 'Enter' || ev.key === 'F2')
+        && !(target instanceof HTMLButtonElement) && !(target instanceof HTMLSelectElement)) {
       ev.preventDefault();
-      editOrderWord();
+      editSelected();
       return;
     }
-    if (ev.key === 'n') { ev.preventDefault(); step(1); }
-    else if (ev.key === 'p') { ev.preventDefault(); step(-1); }
-    else if (ev.key === 'a') { ev.preventDefault(); setMode('add'); }
-    else if (ev.key === 'r') { ev.preventDefault(); setMode('order'); }
+    if (ev.key === 'Delete' || ev.key === 'Backspace') { ev.preventDefault(); deleteSelected(); return; }
+    const k = ev.key.length === 1 ? ev.key.toLowerCase() : ev.key;
+    if (k === 'n') { ev.preventDefault(); step(1); }
+    else if (k === 'p') { ev.preventDefault(); step(-1); }
+    else if (k === 'a') { ev.preventDefault(); setMode('add'); }
+    else if (k === 'r') { ev.preventDefault(); setMode('order'); }
     else if (ev.key === 'Escape') {
       if (mode === 'order' && orderSel.length) setOrderSel([], null);
+      else if (mode === 'add' && pendingBox) { pendingBox = null; $('addbar').hidden = true; drawOverlay(); }
       else if (mode === 'add') setMode(null);
       else select(null);
     }
@@ -1252,6 +1510,7 @@ async function renderPage(refId, stem) {
   }
   scan.src = `${pageUrl(refId, stem)}/image`;
   scan.alt = `Scan of ${stem}`;
+  emptyEditor();
   applyScale();
   drawOverlay();
   refreshPending();
