@@ -169,7 +169,7 @@ than something to keep in parallel.
 | 6. OCR | automatic script step (this bridge) | ready |
 | 7. Transcript correction | Goobi's ALTO editor and/or this tool's review GUI | ready |
 | 8. Review to Upload | manual task + script/export step copying `alto_ocr/<RefID>/` to the LibNova ingest point | small variant of this bridge |
-| 9. ReviewToRemove (~1 month) | `plugin-step-delay` — holds a step N days, then auto-closes into a cleanup step | not installed |
+| 9. ReviewToRemove (~1 month) | `plugin-step-delay` — holds a step N days, then auto-closes into a cleanup step | installed (old host) |
 
 OCR is split from correction because an automatic step needs a clean close
 boundary — one task cannot both run unattended and be a human review.
@@ -384,9 +384,8 @@ a workflow definition that can be reviewed in a diff and restored after a
 mistake. Commit each one to `templates/` under the template's exact title;
 `drift_check.sh` re-exports every committed template and diffs it, so an
 edit made in the web interface shows as drift until its new export is
-committed. `templates/` was empty when the kit was built: the only template,
-`Capture_To_Ingest_v1`, lived on the WSL host, which is no longer reachable
-(see `templates/README.md` for the two ways back).
+committed. `Capture_To_Ingest_v1` was harvested from the old WSL host on
+2026-10-15; see `templates/README.md` and the harvest notes in section 11.
 
 **The rest of the host's configuration** follows the same rule: the kit is
 the source of truth and the server is built from it. `config/` holds every
@@ -473,3 +472,49 @@ existing file's mode across writes and OCR always creates the file first as
 `tomcat`, so a corrector with even a `0077` umask cannot produce output Goobi
 is unable to read (verified). Setgid on the OCR directories is optional
 tidiness for consistent group ownership, not a requirement.
+
+## 11. Harvest of the old WSL host (2026-10-15)
+
+`drift_check.sh --stock` was run on the old WSL host against a clone of
+`intranda/goobi-workflow` at `v26.06.1`, which matched the deployed WAR. What
+it reported, and what became of each item:
+
+**Captured into the kit:**
+- `templates/Capture_To_Ingest_v1.sql`, the 10-step workflow (see
+  `templates/README.md`).
+- `dailyDelayJob=0 0 2 * * ?`, the host's actual time.
+- The exact plugin jar names (`plugins.txt`). The installer's own dashboard,
+  statistics and OPAC jars are now listed as `stock`.
+
+**Not captured, on purpose.** None of these is an institutional choice. They
+came from an older copy of Goobi's installer config, and each one is now
+older than stock. A new server should take v26.06.1 stock instead:
+- `goobi_mail.xml`: the old *"the new password is: {password}"* reset mail.
+  Stock has since switched to a one-hour reset link (Goobi commit
+  `40a982247`). **Do not carry it over**, because it mails passwords in
+  plain text.
+- `config_contentServer.xml`: `preferredImageReader="com.twelvemonkeys"`.
+  Stock moved to `com.github` (jaiimageio) because of a twelvemonkeys memory
+  leak (`fee2f3239`).
+- `plugin_intranda_dashboard_extended.xml`: an older default, with a
+  corrupted tail after `</config_plugin>`.
+- `messages_{de-ch,fr,iw,nl}.properties`: older copies of the WAR's own
+  bundles.
+- In `goobi_config.properties`: `dashboardPlugin`, `dir_Users`, the
+  `MessageBroker*`/queue keys, `geonames_account`, `renderAccessibilityCss`,
+  `EnableHeaderLogin`/`SsoHeaderName`, `enableGravatar`, the
+  `script_create*`/`script_*SymLink` keys and the duplicated
+  `historyImageSuffix` (section 2) are installer output. Stock removed them
+  as defaults in `8e177b253`.
+- `script_alto_ocr` / `script_name_alto_ocr` in `goobi_config.properties`
+  are dead keys from early bridge experiments. Goobi 26.06.1 reads scripts
+  only from `goobi_scripts.xml` and never looks at them.
+
+**Per-host secrets, never committed.** `jwtSecret` and the message broker's
+credentials must be generated fresh on each server. The old host's values
+are not in the kit, and they should not be copied from it.
+
+**Host-side drift left alone.** The old host's `import_images.sh` predates
+the kit's mount-namespace diagnostics (the host is behind the kit). Its
+`apache-ocr-review` conf was enabled with no `Require` line. That host
+is being retired rather than repaired.

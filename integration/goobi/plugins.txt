@@ -3,6 +3,9 @@
 #
 # Columns, whitespace-separated, "-" for none or not yet known:
 #   status   required = drift_check.sh fails without a matching jar
+#            stock    = installed by Goobi's installer, not used by the
+#                       workflow; listed so the jars are not reported as
+#                       unknown (information only)
 #            planned  = reported for information only
 #   repo     intranda GitHub repository (github.com/intranda/<repo>)
 #   jar      case-insensitive glob matched against jar file names anywhere
@@ -21,12 +24,21 @@
 # (PROVISIONING.md section 1): re-fetch, do not debug.
 #
 # Jar names below are globs rather than exact names because intranda's
-# naming has varied between releases; tighten them once the new host is
-# built. The delay plugin's title is as recorded in schritte.stepPlugin on
-# the old host (2 Sep 2026); its config file name was not captured there.
+# naming has varied between releases. The names in the comments are the ones
+# installed on the old WSL host (harvested 2026-10-15, Goobi 26.06.1). The
+# file-upload and imageQA configs there were byte-identical to each plugin's
+# v26.06.1 install/ default, so config/ carries no copy; the delay plugin
+# had no config file at all, its title being all the task needs.
 
-# status   repo                           jar              title                    config
-required   goobi-plugin-step-file-upload  *file*upload*    intranda_step_fileUpload plugin_intranda_step_fileUpload.xml
-required   goobi-plugin-step-imageqa      *imageqa*        intranda_step_imageQA    plugin_intranda_step_imageQA.xml
-required   goobi-plugin-step-delay        *delay*          intranda_delay_30_days   -
-planned    goobi-plugin-import-excel      *import*excel*   intranda_import_excel    plugin_intranda_import_excel.xml
+# status   repo                             jar                    title                        config
+# plugin-step-file-upload-base.jar, plugin-step-file-upload-gui.jar
+required   goobi-plugin-step-file-upload    *file*upload*          intranda_step_fileUpload     plugin_intranda_step_fileUpload.xml
+# plugin-step-imageqa-base.jar, plugin-step-imageqa-gui.jar
+required   goobi-plugin-step-imageqa        *imageqa*              intranda_step_imageQA        plugin_intranda_step_imageQA.xml
+# plugin-step-delay-base.jar
+required   goobi-plugin-step-delay          *delay*                intranda_delay_30_days       -
+planned    goobi-plugin-import-excel        *import*excel*         intranda_import_excel        plugin_intranda_import_excel.xml
+stock      goobi-plugin-dashboard-extended  *dashboard-extended*   intranda_dashboard_extended  -
+stock      goobi-plugin-statistics-intranda *statistics-intranda*  -                            -
+stock      goobi-plugin-opac-marc           *opac-marc*            -                            -
+stock      goobi-plugin-opac-pica           *opac-pica*            -                            -
