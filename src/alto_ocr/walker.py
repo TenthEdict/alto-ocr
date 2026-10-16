@@ -32,11 +32,14 @@ from .pdf import PDF_SUFFIXES, count_pages as count_pdf_pages
 logger = logging.getLogger(__name__)
 
 # Raster page formats: one OCR page per file. JPEG is accepted alongside TIF
-# for collections that export both — point a run at the format-specific folder
-# (e.g. .../JPEG for glm-ocr, .../TIFF for Tesseract). A TIF and JPEG of the
-# same page in the *same* folder share an output stem; that's caught by the
-# stem-collision check, so keep the two exports in separate folders.
+# for collections that export both. Capture One writes each object as sibling
+# ``TIFF/`` and ``JPEG/`` exports of the same pages, so a TIF and a JPEG that
+# share a stem are taken to be one page: the TIF (the preservation master)
+# is OCR'd and the JPEG dropped before the stem-collision check — see
+# ``_drop_jpeg_duplicates``. Any other shared stem is still a collision.
 IMAGE_SUFFIXES = {".tif", ".tiff", ".jpg", ".jpeg"}
+TIF_SUFFIXES = {".tif", ".tiff"}
+JPEG_SUFFIXES = {".jpg", ".jpeg"}
 JUNK_NAMES = {"thumbs.db", "thumbs.db:encryptable", ".ds_store"}
 
 # Width of the page-number suffix in the rasterized PDF filenames. Mirrored
@@ -210,6 +213,30 @@ class SkippedRefId:
     page_count: int
 
 
+def _drop_jpeg_duplicates(ref_id: str, sources: list[SourceFile]) -> list[SourceFile]:
+    """Drop each JPEG whose stem a TIF in the same object already has.
+
+    A TIF and a JPEG sharing a stem are two exports of one page (Capture
+    One's sibling ``TIFF/`` + ``JPEG/`` folders), not two pages, so OCR'ing
+    both would only trip the stem-collision check. The TIF wins as the
+    preservation master that ALTO coordinates are drawn over. JPEGs with no
+    TIF twin are kept, and TIF/TIF or JPEG/JPEG stem clashes are left for
+    ``_check_stem_collisions`` to report.
+    """
+    tif_stems = {s.path.stem for s in sources
+                 if s.path.suffix.lower() in TIF_SUFFIXES}
+    kept = [s for s in sources
+            if not (s.path.suffix.lower() in JPEG_SUFFIXES
+                    and s.path.stem in tif_stems)]
+    dropped = len(sources) - len(kept)
+    if dropped:
+        logger.info(
+            "[%s] %d JPEG(s) duplicate a TIF of the same page; using the TIFs",
+            ref_id, dropped,
+        )
+    return kept
+
+
 def _check_stem_collisions(
     ref_id: str, sources: list[SourceFile],
 ) -> list[tuple[str, str, str]]:
@@ -287,6 +314,7 @@ def discover_ref_id(
     sources = _find_sources_in(ref_id_dir)
     if not sources:
         return None
+    sources = _drop_jpeg_duplicates(name, sources)
     collisions = _check_stem_collisions(name, sources)
     if collisions:
         stems = sorted({stem for stem, _prior, _this in collisions})

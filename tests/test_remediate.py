@@ -1028,6 +1028,23 @@ class SourceIndexTests(unittest.TestCase):
         self.assertEqual(set(idx), {"page001", "page002"})
         self.assertEqual(idx["page001"].name, "page001.TIF")  # first hit kept
 
+    def test_tif_beats_its_jpeg_export_in_either_walk_order(self) -> None:
+        # Capture One writes sibling JPEG/ + TIFF/ exports; os.walk order
+        # decides which folder is seen first, so both orders must give the TIF.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for sub in ("JPEG", "TIFF"):
+                (root / sub).mkdir()
+            (root / "JPEG" / "p1.jpg").write_bytes(b"x")
+            (root / "JPEG" / "p2.jpg").write_bytes(b"x")
+            (root / "JPEG" / "p3.jpg").write_bytes(b"x")
+            (root / "TIFF" / "p1.tif").write_bytes(b"x")
+            (root / "TIFF" / "p2.tif").write_bytes(b"x")
+            with self.assertNoLogs("src.alto_ocr.remediate", "WARNING"):
+                idx = index_source_images(root)
+        self.assertEqual({k: v.name for k, v in idx.items()},
+                         {"p1": "p1.tif", "p2": "p2.tif", "p3": "p3.jpg"})
+
 
 if __name__ == "__main__":
     unittest.main()

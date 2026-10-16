@@ -172,8 +172,8 @@ class DiscoverRefIdOverrideTests(unittest.TestCase):
         # Two sources colliding on one output stem: the skip report must be
         # filed under the override, or the object is unfindable in a summary.
         collide = self.root / "images" / "MSP00075_media"
-        _write_tif(collide / "0001.tif")
-        _write_tif(collide / "0001.jpg")
+        _write_tif(collide / "a" / "0001.tif")
+        _write_tif(collide / "b" / "0001.tif")
         found = discover_ref_id(collide, ref_id="MSP00075")
         assert isinstance(found, SkippedRefId)
         self.assertEqual(found.ref_id, "MSP00075")

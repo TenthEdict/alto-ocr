@@ -99,7 +99,7 @@ from .alto_format import (
     serialize_with_tabs,
 )
 from .mets import METS_NS, XLINK_NS, PageEntry, _checksum_md5, build_mets, write_mets
-from .walker import IMAGE_SUFFIXES, natural_chunks, natural_key
+from .walker import IMAGE_SUFFIXES, TIF_SUFFIXES, natural_chunks, natural_key
 
 logger = logging.getLogger(__name__)
 
@@ -1478,11 +1478,18 @@ def repackage_object(
     return result
 
 
+def _is_jpeg_twin(a: Path, b: Path) -> bool:
+    """Whether one of two same-stem page images is a TIF and the other a JPEG."""
+    return (a.suffix.lower() in TIF_SUFFIXES) != (b.suffix.lower() in TIF_SUFFIXES)
+
+
 def index_source_images(source_dir: Path) -> dict[str, Path]:
     """Recursive stem → image-path index of a source (preservation) folder.
 
     Accepts the walker's image suffixes case-insensitively and skips Windows
-    junk. Duplicate stems keep the first hit with a warning — the object
+    junk. A TIF and a JPEG sharing a stem are two exports of one page, and
+    the TIF wins, as it did at OCR time (``walker._drop_jpeg_duplicates``).
+    Other duplicate stems keep the first hit with a warning — the object
     passed the walker's hard collision check at OCR time, so a duplicate
     here usually means the chosen folder is broader than one object.
     """
@@ -1493,6 +1500,11 @@ def index_source_images(source_dir: Path) -> dict[str, Path]:
                 continue
             p = Path(dirpath) / name
             if p.suffix.lower() not in IMAGE_SUFFIXES:
+                continue
+            prior = index.get(p.stem)
+            if prior is not None and _is_jpeg_twin(prior, p):
+                if p.suffix.lower() in TIF_SUFFIXES:
+                    index[p.stem] = p
                 continue
             if p.stem in index:
                 logger.warning("Duplicate image stem %r under %s — keeping %s",
