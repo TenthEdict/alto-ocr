@@ -41,12 +41,13 @@ class DiscoverySkipTests(unittest.TestCase):
         d = self.root / ref
         d.mkdir(parents=True, exist_ok=True)
         for n in names:
+            (d / n).parent.mkdir(parents=True, exist_ok=True)
             (d / n).write_bytes(b"")  # walker never opens image files
         return d
 
     def test_collision_returns_skip_record(self) -> None:
-        # a.tif + a.jpg in the same folder share the output stem "a".
-        d = self._make("RefBad", "a.tif", "a.jpg", "b.tif")
+        # Two TIFs in different sub-folders share the output stem "a".
+        d = self._make("RefBad", "x/a.tif", "y/a.tif", "b.tif")
         item = discover_ref_id(d)
         self.assertIsInstance(item, SkippedRefId)
         self.assertEqual(item.ref_id, "RefBad")
@@ -65,12 +66,28 @@ class DiscoverySkipTests(unittest.TestCase):
         self.assertIsNone(discover_ref_id(d))
 
     def test_collection_separates_skips_from_processables(self) -> None:
-        self._make("RefBad", "a.tif", "a.jpg")
+        self._make("RefBad", "x/a.tif", "y/a.tif")
         self._make("RefGood", "p.tif")
         self._make("notes", "readme.txt")
         items, skipped = discover_collection(self.root)
         self.assertEqual([i.ref_id for i in items], ["RefGood"])
         self.assertEqual([s.ref_id for s in skipped], ["RefBad"])
+
+    def test_jpeg_export_of_a_tif_is_dropped(self) -> None:
+        # Capture One's sibling TIFF/ + JPEG/ exports of the same pages.
+        d = self._make("RefPair", "TIFF/p1.tif", "TIFF/p2.TIFF",
+                       "JPEG/p1.jpg", "JPEG/p2.jpeg", "JPEG/p3.jpg")
+        item = discover_ref_id(d)
+        self.assertIsInstance(item, RefIdInputs)
+        self.assertEqual([s.path.name for s in item.sources],
+                         ["p3.jpg", "p1.tif", "p2.TIFF"],
+                         "TIF twins win; a JPEG with no TIF is kept")
+
+    def test_jpeg_pair_does_not_hide_a_real_collision(self) -> None:
+        d = self._make("RefBad", "x/a.tif", "y/a.tif", "y/a.jpg")
+        item = discover_ref_id(d)
+        self.assertIsInstance(item, SkippedRefId)
+        self.assertIn("'a'", item.reason)
 
     def test_skipped_ref_result_shape(self) -> None:
         skip = SkippedRefId(ref_id="RefBad", reason="stem collision on 'a'",
