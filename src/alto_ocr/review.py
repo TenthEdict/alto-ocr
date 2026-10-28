@@ -433,28 +433,40 @@ class ReviewFrame(ttk.Frame):
                                         command=self._repackage)
         self.btn_repackage.grid(row=0, column=4, rowspan=2, padx=(6, 0), sticky="ns")
 
-        # -- Row 1: page list | page view
-        body = ttk.Frame(self)
-        body.grid(row=1, column=0, sticky="nsew")
-        body.columnconfigure(1, weight=1)
-        body.rowconfigure(0, weight=1)
+        # -- Row 1: page list | page view, split by a draggable sash so long
+        # page stems can be given room (or the list squeezed to give the scan
+        # more); the list's width is remembered as review_pages_width.
+        self.split = ttk.Panedwindow(self, orient="horizontal")
+        self.split.grid(row=1, column=0, sticky="nsew")
 
-        left = ttk.Frame(body)
-        left.grid(row=0, column=0, sticky="ns", padx=(0, 8))
+        left = ttk.Frame(self.split)
+        left.columnconfigure(0, weight=1)
         left.rowconfigure(1, weight=1)
         ttk.Checkbutton(left, text="Worst first", variable=self.var_worst_first,
                         command=self._on_worst_first_toggled).grid(row=0, column=0, sticky="w")
         self.lst_pages = tk.Listbox(left, width=30, exportselection=False)
-        self.lst_pages.grid(row=1, column=0, sticky="ns")
+        self.lst_pages.grid(row=1, column=0, sticky="nsew")
         sb = ttk.Scrollbar(left, orient="vertical", command=self.lst_pages.yview)
         sb.grid(row=1, column=1, sticky="ns")
-        self.lst_pages.configure(yscrollcommand=sb.set)
+        hsb = ttk.Scrollbar(left, orient="horizontal", command=self.lst_pages.xview)
+        hsb.grid(row=2, column=0, sticky="ew")
+        self.lst_pages.configure(yscrollcommand=sb.set, xscrollcommand=hsb.set)
         self.lst_pages.bind("<<ListboxSelect>>", self._on_page_selected)
+
+        # Detachable needs a grid cell to put the page (or its placeholder)
+        # back in, so the right pane is a frame holding one.
+        body = ttk.Frame(self.split, padding=(8, 0, 0, 0))
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
+        self.split.add(left, weight=0)
+        self.split.add(body, weight=1)
+        self.split.bind("<ButtonRelease-1>", self._on_split_moved, add="+")
+        self._restore_split()
 
         # The page view is a classic frame: only those can become a window
         # of their own (widgets.Detachable).
         self.workspace = tk.Frame(body)
-        self.workspace.grid(row=0, column=1, sticky="nsew")
+        self.workspace.grid(row=0, column=0, sticky="nsew")
         self._build_workspace(self.workspace)
 
         placeholder = ttk.Frame(body, padding=24)
@@ -749,6 +761,34 @@ class ReviewFrame(ttk.Frame):
 
     def _on_keyboard_window_changed(self, detached: bool) -> None:
         self.btn_kb_popout.configure(text="⇲ Dock" if detached else "⧉ Pop out")
+
+    def _restore_split(self) -> None:
+        """Put the sash where the corrector last left it. A sash can only be
+        placed once the pane is mapped, so this waits for the first <Map>."""
+        try:
+            width = int(self._settings.get("review_pages_width", 0))
+        except (TypeError, ValueError):
+            width = 0
+        if width <= 0:
+            return
+
+        def place(_event=None) -> None:
+            self.split.unbind("<Map>", bind_id)
+            # Never let a saved width swallow the page view on a smaller screen.
+            room = self.split.winfo_width() - 200
+            if room > 0:
+                self.split.sashpos(0, max(80, min(width, room)))
+
+        bind_id = self.split.bind("<Map>", place, add="+")
+
+    def _on_split_moved(self, _event=None) -> None:
+        try:
+            width = int(self.split.sashpos(0))
+        except tk.TclError:
+            return
+        if width > 0 and self._settings.get("review_pages_width") != width:
+            self._settings["review_pages_width"] = width
+            self._persist()
 
     def _on_symbol_category(self, name: str) -> None:
         if self._settings.get("review_symbols_tab") != name:

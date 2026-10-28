@@ -398,6 +398,22 @@ class ReviewTabTests(ReviewFixture):
         self.assertEqual(self.rv.lbl_wc.cget("text"), "Confidence 40%")
         self.assertIn("flagged below 50%", self.rv.var_status.get())
 
+    def test_page_list_scrolls_sideways_and_its_width_persists(self) -> None:
+        # Long stems run past the list: a horizontal scrollbar reaches them.
+        xscroll = self.rv.lst_pages.cget("xscrollcommand")
+        self.assertTrue(xscroll, "page list has no horizontal scrollbar")
+        self.assertEqual(str(self.rv.split.panes()[0]),
+                         str(self.rv.lst_pages.master))
+        # Dragging the sash remembers the list's width.
+        self.root.deiconify()
+        self.root.geometry("1200x800")
+        self.root.update()
+        self.rv.split.sashpos(0, 340)
+        self.rv._on_split_moved()
+        saved = json.loads(self.settings_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["review_pages_width"], self.rv.split.sashpos(0))
+        self.assertGreater(saved["review_pages_width"], 250)
+
     def test_threshold_dropdown_is_in_percent_and_persists_as_a_fraction(self) -> None:
         self.open("p1")
         self.rv.var_threshold.set("35%")
