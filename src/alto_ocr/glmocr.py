@@ -34,7 +34,6 @@ import os
 import re
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
 
 import cv2
 import numpy as np
@@ -43,28 +42,20 @@ import numpy as np
 # it as a regression canary without pulling in this module's cv2/numpy. Its full
 # precision-first design rationale is documented there.
 from ._util import _CHAT_COMMENTARY_RE
+from .config import (  # noqa: F401 - re-exported; they live in stdlib-only config
+    DEFAULT_HOST,
+    DEFAULT_MAX_EDGE_PX,
+    DEFAULT_MODEL,
+    DEFAULT_NUM_PREDICT,
+    DEFAULT_TIMEOUT_S,
+    GLMOCRConfig,
+)
 
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_HOST = "http://localhost:11434"
-DEFAULT_MODEL = "glm-ocr:q8_0"
-DEFAULT_TIMEOUT_S = 120
-DEFAULT_MAX_EDGE_PX = 1024
-DEFAULT_NUM_PREDICT = 8192
-
-
 class GLMOCRError(RuntimeError):
     """glm-ocr HTTP/protocol failure. The pipeline catches and writes a stub."""
-
-
-@dataclass(frozen=True)
-class GLMOCRConfig:
-    endpoint: str = DEFAULT_HOST
-    model: str = DEFAULT_MODEL
-    timeout_s: int = DEFAULT_TIMEOUT_S
-    max_edge_px: int = DEFAULT_MAX_EDGE_PX
-    num_predict: int = DEFAULT_NUM_PREDICT
 
 
 def resolve_endpoint(override: str | None = None) -> str:

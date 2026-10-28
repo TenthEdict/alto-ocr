@@ -22,8 +22,6 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-import pypdfium2 as pdfium
-
 logger = logging.getLogger(__name__)
 
 # Width of the page-number suffix in the rasterized filenames. Three digits
@@ -39,6 +37,8 @@ def count_pages(pdf_path: Path) -> int:
     discovery so the total page count for progress reporting is accurate
     before any rasterization runs.
     """
+    import pypdfium2 as pdfium  # deferred: the GUI imports this module at startup
+
     pdf = pdfium.PdfDocument(str(pdf_path))
     try:
         return len(pdf)
@@ -62,6 +62,8 @@ def rasterize_pdf(
     → grayscale step in preprocess and keeps the temp-file footprint down.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
+    import pypdfium2 as pdfium  # deferred: the GUI imports this module at startup
+
     pdf = pdfium.PdfDocument(str(pdf_path))
     written: list[Path] = []
     try:
