@@ -159,6 +159,10 @@ _FIT_ZOOMS = ("Fit", "Fit width")
 # "Flag below" choices: whole percentages, the way the tab shows confidence.
 THRESHOLD_CHOICES: tuple[str, ...] = tuple(f"{p}%" for p in range(0, 101, 5))
 
+# Narrowest the page list and the page view can be dragged (screen px).
+_MIN_LIST_PX = 120
+_MIN_PAGE_PX = 480
+
 # WC → outline color. Blue marks words edited this session (WC becomes 1.00
 # on disk, but the corrector should still see what they touched).
 _COLOR_EDITED = "#1f6feb"
@@ -436,7 +440,14 @@ class ReviewFrame(ttk.Frame):
         # -- Row 1: page list | page view, split by a draggable sash so long
         # page stems can be given room (or the list squeezed to give the scan
         # more); the list's width is remembered as review_pages_width.
-        self.split = ttk.Panedwindow(self, orient="horizontal")
+        # A classic PanedWindow, not ttk, for opaqueresize=False: dragging
+        # moves only an outline and the panes resize once, on release. Live
+        # resizing re-laid out the toolbars, the ~300 symbol keys and the
+        # scan on every mouse step, and the page view tore and clipped
+        # until the drag stopped (seen on Windows, 2026-10-28).
+        self.split = tk.PanedWindow(
+            self, orient="horizontal", opaqueresize=False, sashwidth=5,
+            sashrelief="flat", borderwidth=0, sashcursor="sb_h_double_arrow")
         self.split.grid(row=1, column=0, sticky="nsew")
 
         left = ttk.Frame(self.split)
@@ -455,11 +466,11 @@ class ReviewFrame(ttk.Frame):
 
         # Detachable needs a grid cell to put the page (or its placeholder)
         # back in, so the right pane is a frame holding one.
-        body = ttk.Frame(self.split, padding=(8, 0, 0, 0))
+        body = ttk.Frame(self.split, padding=(4, 0, 0, 0))
         body.columnconfigure(0, weight=1)
         body.rowconfigure(0, weight=1)
-        self.split.add(left, weight=0)
-        self.split.add(body, weight=1)
+        self.split.add(left, stretch="never", minsize=_MIN_LIST_PX)
+        self.split.add(body, stretch="always", minsize=_MIN_PAGE_PX)
         self.split.bind("<ButtonRelease-1>", self._on_split_moved, add="+")
         self._restore_split()
 
@@ -775,15 +786,24 @@ class ReviewFrame(ttk.Frame):
         def place(_event=None) -> None:
             self.split.unbind("<Map>", bind_id)
             # Never let a saved width swallow the page view on a smaller screen.
-            room = self.split.winfo_width() - 200
+            room = self.split.winfo_width() - _MIN_PAGE_PX
             if room > 0:
-                self.split.sashpos(0, max(80, min(width, room)))
+                self.split.sash_place(0, max(_MIN_LIST_PX, min(width, room)), 1)
 
         bind_id = self.split.bind("<Map>", place, add="+")
 
+    def list_width(self) -> int:
+        """The page list's width: where the sash sits."""
+        return int(self.split.sash_coord(0)[0])
+
     def _on_split_moved(self, _event=None) -> None:
+        # This widget binding runs before the PanedWindow class binding that
+        # actually drops the sash on release, so read it once that has run.
+        self.after_idle(self._remember_split)
+
+    def _remember_split(self) -> None:
         try:
-            width = int(self.split.sashpos(0))
+            width = self.list_width()
         except tk.TclError:
             return
         if width > 0 and self._settings.get("review_pages_width") != width:

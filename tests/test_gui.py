@@ -408,11 +408,14 @@ class ReviewTabTests(ReviewFixture):
         self.root.deiconify()
         self.root.geometry("1200x800")
         self.root.update()
-        self.rv.split.sashpos(0, 340)
+        self.rv.split.sash_place(0, 340, 1)
         self.rv._on_split_moved()
+        self.root.update()
         saved = json.loads(self.settings_path.read_text(encoding="utf-8"))
-        self.assertEqual(saved["review_pages_width"], self.rv.split.sashpos(0))
+        self.assertEqual(saved["review_pages_width"], self.rv.list_width())
         self.assertGreater(saved["review_pages_width"], 250)
+        # Dragging moves an outline; the panes resize once, on release.
+        self.assertFalse(int(self.rv.split.cget("opaqueresize")))
 
     def test_threshold_dropdown_is_in_percent_and_persists_as_a_fraction(self) -> None:
         self.open("p1")
