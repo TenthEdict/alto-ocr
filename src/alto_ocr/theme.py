@@ -239,8 +239,6 @@ def _configure_dark(style: ttk.Style, pal: Palette) -> None:
                     troughcolor=pal.trough, bordercolor=pal.border,
                     lightcolor=pal.accent, darkcolor=pal.accent)
     style.configure("TSeparator", background=pal.border)
-    style.configure("Sash", background=pal.border, bordercolor=pal.border,
-                    lightcolor=pal.border, darkcolor=pal.border, gripcount=0)
     # The dark theme's stand-in for the native menu bar (gui._build_menu):
     # flat buttons with no drop-down arrow.
     style.configure("Menubar.TFrame", background=pal.surface)
@@ -317,6 +315,8 @@ def _recolor(w: tk.Misc, pal: Palette) -> None:
                         highlightbackground=pal.border, highlightcolor=pal.accent)
             if "chosen" in w.tag_names():
                 w.tag_configure("chosen", background=pal.chosen_bg, foreground=pal.chosen_fg)
+        elif cls == "Panedwindow":  # classic; only the sash gap shows it
+            w.configure(background=pal.border)
         elif cls == "Canvas":
             w.configure(background=pal.canvas, highlightbackground=pal.bg)
         elif cls == "Button":

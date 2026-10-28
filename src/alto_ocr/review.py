@@ -115,6 +115,7 @@ import math
 import queue
 import threading
 import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -151,6 +152,36 @@ _MAX_RENDER_PX = 40_000_000
 
 logger = logging.getLogger("alto_ocr.review")
 
+# Files read at once while loading an object. Loading is file I/O, mostly
+# over SMB, where each read waits on a network round trip: overlapping them
+# is what makes a 300-page object load in a fraction of the serial time.
+_LOAD_WORKERS = 8
+
+PageRow = tuple[str, Optional[float], str]  # (stem, pc, status)
+
+
+def scan_object_pages(
+    alto_dir: Path,
+    source_dir: Path,
+    progress: Optional[Callable[[int, int], None]] = None,
+) -> tuple[dict[str, Path], list[PageRow]]:
+    """Everything "Load object" needs from disk: the source-image index and
+    each page's confidence summary, in natural page order.
+
+    Headless and thread-safe, so the Review tab runs it off the Tk thread.
+    The image walk and the ALTO reads overlap on one pool; ``progress`` is
+    called with (pages scanned, total) from the calling thread.
+    """
+    xmls = sorted(alto_dir.glob("*.xml"), key=natural_key)
+    with ThreadPoolExecutor(max_workers=_LOAD_WORKERS) as pool:
+        index = pool.submit(index_source_images, source_dir)
+        pages: list[PageRow] = []
+        for i, info in enumerate(pool.map(scan_alto_file_safe, xmls), start=1):
+            pages.append((xmls[i - 1].stem, info.pc, info.status))
+            if progress is not None:
+                progress(i, len(xmls))
+        return index.result(), pages
+
 # "Fit" shows the whole page; "Fit width" fills the view's width and
 # scrolls vertically — the useful one in a wide or popped-out window.
 _ZOOMS: tuple[str, ...] = ("Fit", "Fit width", "50%", "75%", "100%", "150%", "200%")
@@ -158,6 +189,10 @@ _FIT_ZOOMS = ("Fit", "Fit width")
 
 # "Flag below" choices: whole percentages, the way the tab shows confidence.
 THRESHOLD_CHOICES: tuple[str, ...] = tuple(f"{p}%" for p in range(0, 101, 5))
+
+# Narrowest the page list and the page view can be dragged (screen px).
+_MIN_LIST_PX = 120
+_MIN_PAGE_PX = 480
 
 # WC → outline color. Blue marks words edited this session (WC becomes 1.00
 # on disk, but the corrector should still see what they touched).
@@ -340,7 +375,7 @@ class ReviewFrame(ttk.Frame):
         self._settings = settings
         self._persist = persist
 
-        self._pages: list[tuple[str, float | None, str]] = []  # (stem, pc, status)
+        self._pages: list[PageRow] = []
         self._sorted_stems: list[str] = []  # listbox row index -> stem
         self._img_index: dict[str, Path] = {}
         self._page: Optional[ReviewPage] = None
@@ -387,6 +422,11 @@ class ReviewFrame(ttk.Frame):
         # through this queue, polled on the Tk main loop (gui.py's model).
         self._repack_worker: Optional[threading.Thread] = None
         self._repack_queue: "queue.Queue[list[RepackageResult]]" = queue.Queue()
+        # "Load object" reads every ALTO in the object, which over SMB took
+        # seconds on a large object with the window frozen; it runs on a
+        # worker too. Each load gets a fresh queue, so a superseded load's
+        # late messages land in a queue nobody polls.
+        self._load_queue: Optional[queue.Queue] = None
 
         self.var_object = tk.StringVar(value=str(settings.get("review_object_dir", "")))
         self.var_source = tk.StringVar(value=str(settings.get("review_source_dir", "")))
@@ -427,8 +467,8 @@ class ReviewFrame(ttk.Frame):
             row=1, column=1, sticky="ew", pady=(4, 0))
         ttk.Button(paths, text="Browse…", command=self._browse_source).grid(
             row=1, column=2, padx=(6, 0), pady=(4, 0))
-        ttk.Button(paths, text="Load object", command=self.load_object).grid(
-            row=0, column=3, rowspan=2, padx=(10, 0), sticky="ns")
+        self.btn_load = ttk.Button(paths, text="Load object", command=self.load_object)
+        self.btn_load.grid(row=0, column=3, rowspan=2, padx=(10, 0), sticky="ns")
         self.btn_repackage = ttk.Button(paths, text="Repackage",
                                         command=self._repackage)
         self.btn_repackage.grid(row=0, column=4, rowspan=2, padx=(6, 0), sticky="ns")
@@ -436,7 +476,14 @@ class ReviewFrame(ttk.Frame):
         # -- Row 1: page list | page view, split by a draggable sash so long
         # page stems can be given room (or the list squeezed to give the scan
         # more); the list's width is remembered as review_pages_width.
-        self.split = ttk.Panedwindow(self, orient="horizontal")
+        # A classic PanedWindow, not ttk, for opaqueresize=False: dragging
+        # moves only an outline and the panes resize once, on release. Live
+        # resizing re-laid out the toolbars, the ~300 symbol keys and the
+        # scan on every mouse step, and the page view tore and clipped
+        # until the drag stopped (seen on Windows, 2026-10-28).
+        self.split = tk.PanedWindow(
+            self, orient="horizontal", opaqueresize=False, sashwidth=5,
+            sashrelief="flat", borderwidth=0, sashcursor="sb_h_double_arrow")
         self.split.grid(row=1, column=0, sticky="nsew")
 
         left = ttk.Frame(self.split)
@@ -455,11 +502,11 @@ class ReviewFrame(ttk.Frame):
 
         # Detachable needs a grid cell to put the page (or its placeholder)
         # back in, so the right pane is a frame holding one.
-        body = ttk.Frame(self.split, padding=(8, 0, 0, 0))
+        body = ttk.Frame(self.split, padding=(4, 0, 0, 0))
         body.columnconfigure(0, weight=1)
         body.rowconfigure(0, weight=1)
-        self.split.add(left, weight=0)
-        self.split.add(body, weight=1)
+        self.split.add(left, stretch="never", minsize=_MIN_LIST_PX)
+        self.split.add(body, stretch="always", minsize=_MIN_PAGE_PX)
         self.split.bind("<ButtonRelease-1>", self._on_split_moved, add="+")
         self._restore_split()
 
@@ -775,15 +822,24 @@ class ReviewFrame(ttk.Frame):
         def place(_event=None) -> None:
             self.split.unbind("<Map>", bind_id)
             # Never let a saved width swallow the page view on a smaller screen.
-            room = self.split.winfo_width() - 200
+            room = self.split.winfo_width() - _MIN_PAGE_PX
             if room > 0:
-                self.split.sashpos(0, max(80, min(width, room)))
+                self.split.sash_place(0, max(_MIN_LIST_PX, min(width, room)), 1)
 
         bind_id = self.split.bind("<Map>", place, add="+")
 
+    def list_width(self) -> int:
+        """The page list's width: where the sash sits."""
+        return int(self.split.sash_coord(0)[0])
+
     def _on_split_moved(self, _event=None) -> None:
+        # This widget binding runs before the PanedWindow class binding that
+        # actually drops the sash on release, so read it once that has run.
+        self.after_idle(self._remember_split)
+
+    def _remember_split(self) -> None:
         try:
-            width = int(self.split.sashpos(0))
+            width = self.list_width()
         except tk.TclError:
             return
         if width > 0 and self._settings.get("review_pages_width") != width:
@@ -847,29 +903,71 @@ class ReviewFrame(ttk.Frame):
                                  parent=main)
             return
 
-        self._img_index = index_source_images(src)
+        # Nothing stays open while the pages load: the old object's list and
+        # page would otherwise invite clicks into an object being replaced.
+        self._clear_view()
+        self._stem = None
         self._pages = []
-        missing = 0
-        for xml in sorted(alto_dir.glob("*.xml"), key=natural_key):
-            info = scan_alto_file_safe(xml)
-            self._pages.append((xml.stem, info.pc, info.status))
-            if xml.stem not in self._img_index:
-                missing += 1
+        self._img_index = {}
+        self._refresh_page_list()
+        self.btn_load.configure(state="disabled")
+        self.var_status.set("Loading pages…")
+        q: queue.Queue = queue.Queue()
+        self._load_queue = q
+
+        def work() -> None:
+            try:
+                q.put(("done", obj, src, scan_object_pages(
+                    alto_dir, src, lambda n, total: q.put(("progress", n, total)))))
+            except Exception as e:  # noqa: BLE001 — report it, never kill the thread silently
+                logger.exception("loading %s failed", obj)
+                q.put(("error", obj, e))
+
+        threading.Thread(target=work, daemon=True).start()
+        self.after(50, self._poll_load, q)
+
+    def _poll_load(self, q: queue.Queue) -> None:
+        if q is not self._load_queue:
+            return  # superseded
+        msg = None
+        try:
+            while True:  # drain: only the newest progress is worth showing
+                msg = q.get_nowait()
+                if msg[0] != "progress":
+                    break
+        except queue.Empty:
+            pass
+        if msg is None or msg[0] == "progress":
+            if msg is not None:
+                self.var_status.set(f"Loading pages… {msg[1]}/{msg[2]}")
+            self.after(100, self._poll_load, q)
+            return
+        self._load_queue = None
+        self.btn_load.configure(state="normal")
+        if msg[0] == "error":
+            self.var_status.set("Loading failed.")
+            messagebox.showerror("Review", f"Could not load {msg[1]}:\n{msg[2]}",
+                                 parent=self.winfo_toplevel())
+            return
+        _, obj, src, (self._img_index, self._pages) = msg
+        missing = sum(1 for stem, _pc, _st in self._pages if stem not in self._img_index)
 
         self._settings["review_object_dir"] = str(obj)
         self._settings["review_source_dir"] = str(src)
         self._persist()
 
-        self._clear_view()
-        self._stem = None
         self._refresh_page_list()
         self._update_window_title()
-        msg = f"{len(self._pages)} page(s) loaded."
+        msg_text = f"{len(self._pages)} page(s) loaded."
         if missing:
-            msg += f"  {missing} page(s) have no matching source image and can't be reviewed."
-        self.var_status.set(msg)
+            msg_text += f"  {missing} page(s) have no matching source image and can't be reviewed."
+        self.var_status.set(msg_text)
 
-    def _page_sort_key(self, entry: tuple[str, float | None, str]) -> tuple:
+    def loading(self) -> bool:
+        """True while "Load object" is still reading the object."""
+        return self._load_queue is not None
+
+    def _page_sort_key(self, entry: PageRow) -> tuple:
         stem, pc, status = entry
         if self.var_worst_first.get():
             rank = STATUS_RANK.get(status, 4)

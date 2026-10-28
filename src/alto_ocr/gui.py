@@ -28,32 +28,22 @@ import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import Mapping, Optional
+from typing import TYPE_CHECKING, Mapping, Optional
 
 from . import __version__, theme
-from .glmocr import (
-    DEFAULT_MODEL,
-    DEFAULT_TIMEOUT_S,
-    GLMOCRConfig,
-    GLMOCRError,
-    resolve_endpoint,
-)
-from .ocr import (
-    OCREngine,
-    OCROptions,
-    TesseractNotFoundError,
-    build_engine,
-)
-from .pipeline import (
-    PageProgressLogger,
-    RefIdResult,
-    failed_ref_result,
-    process_ref_id,
-    skipped_ref_result,
-)
-from .preprocess import PreprocessConfig
+# The OCR stack (ocr, pipeline, preprocess, glmocr) is imported inside the
+# run worker, not here: it loads OpenCV and numpy, ~190 MB of native
+# libraries the window would otherwise wait for on every launch (worst on a
+# cold Windows start, where antivirus scans each DLL as it loads). Measured
+# 2026-10-28: importing this module fell 0.73 s -> 0.09 s on a warm Linux
+# cache. The defaults the window needs come from the stdlib-only config.
+from .config import DEFAULT_MODEL, DEFAULT_TIMEOUT_S, GLMOCRConfig, OCROptions, PreprocessConfig
 from .review import ReviewFrame
 from .walker import SkippedRefId, discover_collection, discover_ref_id
+
+if TYPE_CHECKING:
+    from .ocr import OCREngine
+    from .pipeline import RefIdResult
 
 APP_TITLE = "Alto OCR"
 SETTINGS_PATH = Path.home() / ".alto_ocr.json"
@@ -914,6 +904,13 @@ class AltoOcrApp:
     # ---------- Worker (off the main thread) -----------------------------------
 
     def _worker_main(self, cfg: JobConfig) -> None:
+        from .pipeline import (
+            PageProgressLogger,
+            failed_ref_result,
+            process_ref_id,
+            skipped_ref_result,
+        )
+
         # Discover work first so we know which engines we actually need.
         # Building GLMOCR runs an endpoint check; skip it when no Ref ID needs it.
         skipped: list[SkippedRefId] = []
@@ -995,6 +992,9 @@ class AltoOcrApp:
     def _build_engine(self, name: str, cfg: JobConfig) -> OCREngine:
         """GUI face of ``ocr.build_engine``: shared construction + startup
         checks; failures become RuntimeError for the worker's error path."""
+        from .glmocr import GLMOCRError, resolve_endpoint
+        from .ocr import TesseractNotFoundError, build_engine
+
         try:
             built = build_engine(
                 name,

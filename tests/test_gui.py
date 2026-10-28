@@ -28,6 +28,8 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -360,8 +362,17 @@ class ReviewFixture(_AppFixture):
         self.rv = self.app.review
         self.rv.var_object.set(str(self.obj))
         self.rv.var_source.set(str(src))
-        self.rv.load_object()
+        self.load()
         self.app._nb.select(self.rv)
+
+    def load(self) -> None:
+        """Load the object and wait for its background scan to land."""
+        self.rv.load_object()
+        deadline = time.monotonic() + 10
+        while self.rv.loading():
+            self.assertLess(time.monotonic(), deadline, "object load never finished")
+            self.root.update()
+            time.sleep(0.01)
 
     def open(self, stem: str) -> None:
         self.rv._open_page(stem)
@@ -383,7 +394,7 @@ class ReviewTabTests(ReviewFixture):
         # Truncated ALTO is realistic: Tesseract writes its own ALTO
         # non-atomically, so a crash mid-write leaves half a file.
         (self.obj / "ALTO" / "p4.xml").write_text("<alto><Layout", encoding="utf-8")
-        self.rv.load_object()
+        self.load()
         self.assertEqual(self.rv._sorted_stems[0], "p4")  # failed sorts first
         self.assertEqual(self.rv.lst_pages.get(0),
                          self.rv._page_label("p4", None, "failed"))
@@ -398,6 +409,45 @@ class ReviewTabTests(ReviewFixture):
         self.assertEqual(self.rv.lbl_wc.cget("text"), "Confidence 40%")
         self.assertIn("flagged below 50%", self.rv.var_status.get())
 
+    def test_load_runs_off_the_ui_thread_and_lists_every_page(self) -> None:
+        # Loading reads every ALTO (over SMB in practice), so it must not
+        # block the Tk thread: while it runs, the list is empty, the button
+        # is disabled, and the status says so.
+        gate = threading.Event()
+        real = review.scan_alto_file_safe
+
+        def slow(path, **kw):
+            gate.wait(5)
+            return real(path, **kw)
+
+        with mock.patch.object(review, "scan_alto_file_safe", slow):
+            self.rv.load_object()
+            self.root.update()
+            self.assertTrue(self.rv.loading())
+            self.assertEqual(self.rv.lst_pages.size(), 0)
+            self.assertEqual(str(self.rv.btn_load.cget("state")), "disabled")
+            self.assertTrue(self.rv.var_status.get().startswith("Loading pages"))
+            gate.set()
+            deadline = time.monotonic() + 10
+            while self.rv.loading():
+                self.assertLess(time.monotonic(), deadline)
+                self.root.update()
+                time.sleep(0.01)
+        self.assertEqual(self.rv._sorted_stems, ["p3", "p1", "p2"])
+        self.assertEqual(str(self.rv.btn_load.cget("state")), "normal")
+        self.assertEqual(self.rv.var_status.get(), "3 page(s) loaded.")
+
+    def test_scan_object_pages_keeps_natural_page_order(self) -> None:
+        for n in (10, 2):
+            (self.obj / "ALTO" / f"p{n}.xml").write_text(
+                _ALTO.format(pc="0.5"), encoding="utf-8")
+        seen = []
+        index, pages = review.scan_object_pages(
+            self.obj / "ALTO", self.tmp / "src", lambda n, total: seen.append((n, total)))
+        self.assertEqual([p[0] for p in pages], ["p1", "p2", "p3", "p10"])
+        self.assertEqual(seen[-1], (4, 4))
+        self.assertEqual(sorted(index), ["p1", "p2", "p3"])
+
     def test_page_list_scrolls_sideways_and_its_width_persists(self) -> None:
         # Long stems run past the list: a horizontal scrollbar reaches them.
         xscroll = self.rv.lst_pages.cget("xscrollcommand")
@@ -408,11 +458,14 @@ class ReviewTabTests(ReviewFixture):
         self.root.deiconify()
         self.root.geometry("1200x800")
         self.root.update()
-        self.rv.split.sashpos(0, 340)
+        self.rv.split.sash_place(0, 340, 1)
         self.rv._on_split_moved()
+        self.root.update()
         saved = json.loads(self.settings_path.read_text(encoding="utf-8"))
-        self.assertEqual(saved["review_pages_width"], self.rv.split.sashpos(0))
+        self.assertEqual(saved["review_pages_width"], self.rv.list_width())
         self.assertGreater(saved["review_pages_width"], 250)
+        # Dragging moves an outline; the panes resize once, on release.
+        self.assertFalse(int(self.rv.split.cget("opaqueresize")))
 
     def test_threshold_dropdown_is_in_percent_and_persists_as_a_fraction(self) -> None:
         self.open("p1")

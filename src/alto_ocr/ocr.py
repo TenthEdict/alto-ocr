@@ -68,6 +68,7 @@ from .glmocr import (
 )
 from .line_detect import DetectParams, LineBox, TextBlock, _clean_mask, detect_blocks
 from .markup import normalize_markup
+from .config import OCROptions  # noqa: F401 - re-exported; lives in stdlib-only config
 from .preprocess import PreprocessConfig
 
 logger = logging.getLogger(__name__)
@@ -160,18 +161,6 @@ def check_tesseract_version(binary: Path) -> str:
     # Tesseract prints version to stderr on some builds, stdout on others.
     output = (result.stdout + result.stderr).strip().splitlines()
     return output[0] if output else "unknown"
-
-
-@dataclass(frozen=True)
-class OCROptions:
-    language: str = "eng"
-    psm: int = 3  # fully automatic page segmentation
-    oem: int = 3  # default LSTM engine
-    # Per-page wall-clock limit. A pathological page (gigapixel scan, a
-    # layout analysis that never converges) would otherwise hang the batch
-    # with nothing for per-page isolation to catch; on timeout the page
-    # gets a failure stub and the run moves on.
-    timeout_s: int = 600
 
 
 def _run_tesseract(

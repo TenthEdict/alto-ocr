@@ -5,6 +5,8 @@ Run from the project root::
     python packaging/build.py
 
 What it does:
+  0. Stops, touching nothing, if this Python can't import PyInstaller
+     (usually: run with the system Python instead of the project venv).
   1. Cleans previous build/ and dist/ artefacts.
   2. Runs PyInstaller against ``packaging/alto_ocr.spec``.
   3. Drops ``packaging/dist_README.txt`` into the bundle as ``README.txt``.
@@ -17,6 +19,7 @@ for Linux targets.
 
 from __future__ import annotations
 
+import importlib.util
 import platform
 import shutil
 import subprocess
@@ -46,6 +49,28 @@ def _platform_tag() -> str:
     sysname = platform.system().lower()  # 'windows', 'linux', 'darwin'
     arch = platform.machine().lower() or "x86_64"
     return f"{sysname}-{arch}"
+
+
+def _missing_pyinstaller() -> str | None:
+    """Why this interpreter can't build, or None if it can.
+
+    Checked before ``_clean``: run with the wrong Python (typically the
+    system one rather than the project venv), the old flow deleted the
+    previous dist/ first and only then failed, leaving no bundle at all.
+    """
+    if importlib.util.find_spec("PyInstaller") is not None:
+        return None
+    msg = f"PyInstaller is not installed for this Python:\n  {sys.executable}\n"
+    running = Path(sys.prefix).resolve()
+    for venv in (PROJECT_ROOT / "venv", PROJECT_ROOT / ".venv"):
+        if venv.resolve() == running:
+            break  # already in the project venv: it just lacks the build deps
+        for venv_py in (venv / "Scripts" / "python.exe", venv / "bin" / "python"):
+            if venv_py.is_file():
+                return (msg + "Run the build with the project venv instead:\n"
+                        f"  {venv_py} packaging/build.py")
+    return msg + ("Install the build deps into it first:\n"
+                  f"  {sys.executable} -m pip install -r requirements-dev.txt")
 
 
 def _clean() -> None:
@@ -94,6 +119,10 @@ def main() -> int:
     version = _read_version()
     print(f"alto_ocr version: {version}")
     print(f"platform tag:     {_platform_tag()}")
+    problem = _missing_pyinstaller()
+    if problem:
+        print(f"\n{problem}\n\nNothing was built; dist/ is untouched.", file=sys.stderr)
+        return 1
     _clean()
     _run_pyinstaller()
     if not BUNDLE_DIR.is_dir():

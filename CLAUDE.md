@@ -237,5 +237,8 @@ Alto_OCR/
                             #     headless, shared with webreview), widgets.py (Tk: Detachable
                             #     pop-out windows, SymbolKeyboard, Tooltip),
                             #   alto_format.py (institution ALTO serialization/conversion — the
-                            #   shared layer; remediate/review depend on it, never on ocr.py), …
+                            #   shared layer; remediate/review depend on it, never on ocr.py),
+                            #   config.py (stdlib-only run-config dataclasses; gui.py imports the
+                            #     cv2/numpy OCR stack only inside the run worker, so the window
+                            #     opens without ~190 MB of native libraries — keep it that way), …
 ```
