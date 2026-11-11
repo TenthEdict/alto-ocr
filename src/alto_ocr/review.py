@@ -124,6 +124,7 @@ from typing import Callable, Optional
 from PIL import Image, ImageTk
 
 from . import theme
+from .alto_parse import upright
 from .remediate import (
     ConcurrentEditError,
     Removal,
@@ -1080,7 +1081,8 @@ class ReviewFrame(ttk.Frame):
             self.var_status.set(f"{stem}: no matching source image in the source folder.")
             return
         try:
-            pil = Image.open(img_path).convert("RGB")
+            # upright(): the frame OCR read the page in (see alto_parse).
+            pil = upright(Image.open(img_path)).convert("RGB")
         except OSError as e:
             self.var_status.set(f"{stem}: could not open {img_path.name}: {e}")
             return
