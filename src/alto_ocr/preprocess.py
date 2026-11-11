@@ -42,11 +42,24 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PIL import Image, ImageOps
+from PIL import Image
 
+from .alto_parse import upright
 from .config import PreprocessConfig  # noqa: F401 - re-exported; lives in stdlib-only config
 
 logger = logging.getLogger(__name__)
+
+# Pillow refuses images over 2x its default limit (~179 megapixels) as
+# decompression bombs and warns above half that. Oversize scans legitimately
+# exceed it — a 24x36 inch sheet at 600 DPI is 311 MP — and every file here
+# comes off the institution's own scanners. The review UIs already raised the
+# limit; OCR did not, so the same page failed from the CLI, a batch worker or
+# Goobi while working from the GUI, where importing the Review tab had raised
+# it for the whole process (found 2026-11-11). Raised, not disabled: a
+# corrupt header still cannot demand unbounded memory.
+_MAX_IMAGE_PIXELS = 1_000_000_000
+if Image.MAX_IMAGE_PIXELS is not None and Image.MAX_IMAGE_PIXELS < _MAX_IMAGE_PIXELS:
+    Image.MAX_IMAGE_PIXELS = _MAX_IMAGE_PIXELS
 
 
 @dataclass
@@ -88,12 +101,22 @@ def _load_grayscale(path: Path) -> np.ndarray:
     orientation tag (the common case) or the tag is already upright.
     """
     with Image.open(path) as img:
-        if getattr(img, "n_frames", 1) > 1:
-            # Multi-page TIF — treat the first frame as the page.
+        n_frames = getattr(img, "n_frames", 1)
+        if n_frames > 1:
+            # Multi-page TIF — the first frame is the page. One file is one
+            # page everywhere else (discovery's page count, the output stems,
+            # the review UIs), so the rest are not OCR'd; say so, loudly,
+            # rather than let pages vanish from the transcript unremarked.
+            logger.warning(
+                "%s holds %d frames; only the first is OCR'd, the other %d "
+                "get no ALTO or transcript. If they are pages (not embedded "
+                "thumbnails), split the file into one TIF per page and re-run.",
+                path.name, n_frames, n_frames - 1,
+            )
             img.seek(0)
         # Honor EXIF/TIFF orientation before any pixel processing, so detected
         # line boxes and ALTO coordinates land on the upright page.
-        img = ImageOps.exif_transpose(img)
+        img = upright(img)
         if img.mode == "1":
             img = img.convert("L")
         elif img.mode not in ("L", "LA", "RGB", "RGBA"):
@@ -122,6 +145,16 @@ def _load_grayscale(path: Path) -> np.ndarray:
 # OCR anyway, so below the floor the tag is ignored like a missing one.
 _MIN_PLAUSIBLE_DPI = 50
 
+# The floor above cannot catch a placeholder tag that looks like a real
+# resolution: JPEG exports and camera files routinely carry 72 or 96 whatever
+# they were shot at. A 4000x6000 JPEG tagged 72 would be resized to
+# 16667x25000 (417 MP) — minutes of Lanczos, then a Tesseract run that times
+# out, for a page that reads fine as it is. So an upscale whose result would
+# exceed this many pixels is skipped the same way (found 2026-11-11). 150 MP
+# is a 34x44 inch sheet at 300 DPI; a scan that large made below 300 DPI is
+# rare enough that reading it at its native resolution is the better error.
+_MAX_UPSCALED_PIXELS = 150_000_000
+
 
 def _upscale_for_dpi(img: np.ndarray, source_dpi: int | None, min_dpi: int) -> tuple[np.ndarray, int]:
     """Upscale so effective DPI ≥ min_dpi. Returns (image, effective_dpi).
@@ -129,7 +162,8 @@ def _upscale_for_dpi(img: np.ndarray, source_dpi: int | None, min_dpi: int) -> t
     If source DPI is unknown we trust the image as-is and report ``min_dpi``
     as the effective value (Tesseract needs *something* to pass via --dpi;
     its own auto-detect is unreliable on archival scans). An implausibly
-    small DPI tag (< ``_MIN_PLAUSIBLE_DPI``) is treated the same as unknown.
+    small DPI tag (< ``_MIN_PLAUSIBLE_DPI``) is treated the same as unknown,
+    and so is one whose upscale would exceed ``_MAX_UPSCALED_PIXELS``.
     """
     if source_dpi is None:
         return img, min_dpi
@@ -145,6 +179,15 @@ def _upscale_for_dpi(img: np.ndarray, source_dpi: int | None, min_dpi: int) -> t
     scale = min_dpi / source_dpi
     new_w = int(round(img.shape[1] * scale))
     new_h = int(round(img.shape[0] * scale))
+    if new_w * new_h > _MAX_UPSCALED_PIXELS:
+        logger.warning(
+            "DPI tag %d would upscale this %dx%d image to %dx%d (%.0f MP) — "
+            "the tag is taken to be a placeholder, not the scan resolution; "
+            "image passes through un-upscaled with --dpi %d.",
+            source_dpi, img.shape[1], img.shape[0], new_w, new_h,
+            new_w * new_h / 1e6, min_dpi,
+        )
+        return img, min_dpi
     return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4), min_dpi
 
 
@@ -225,8 +268,9 @@ def preprocess(path: Path, cfg: PreprocessConfig | None = None) -> PreprocessRes
     stages.append("grayscale")
 
     source_dpi = _read_dpi(path)
+    native_shape = img.shape
     img, eff_dpi = _upscale_for_dpi(img, source_dpi, cfg.min_dpi)
-    if source_dpi is not None and source_dpi < cfg.min_dpi:
+    if img.shape != native_shape:  # not for a tag that was ignored
         stages.append(f"upscale({source_dpi}→{eff_dpi}dpi)")
 
     if cfg.do_deskew:

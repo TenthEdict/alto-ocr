@@ -32,6 +32,7 @@ from pathlib import Path
 from PIL import Image
 
 from .._util import atomic_write_bytes
+from ..alto_parse import upright
 
 logger = logging.getLogger("alto_ocr.webreview.imaging")
 
@@ -44,6 +45,11 @@ logger = logging.getLogger("alto_ocr.webreview.imaging")
 _MAX_PIXELS = 900_000_000
 if Image.MAX_IMAGE_PIXELS is not None and Image.MAX_IMAGE_PIXELS < _MAX_PIXELS:
     Image.MAX_IMAGE_PIXELS = _MAX_PIXELS
+
+# Part of every cache key. Bump it when the pixels a working copy holds
+# change for the same scan, so renders cached by an older version are not
+# served. 2: EXIF/TIFF orientation is applied (2026-11-11).
+_RENDER_VERSION = 2
 
 JPEG_QUALITY = 88
 CROP_JPEG_QUALITY = 92      # the corrector reads words off crops; artefacts here cost accuracy
@@ -78,7 +84,7 @@ def _cache_key(image_path: Path, max_px: int) -> str:
         stamp = f"{st.st_mtime_ns}:{st.st_size}"
     except OSError:
         stamp = "0:0"
-    raw = f"{os.fspath(image_path.resolve())}|{stamp}|{max_px}"
+    raw = f"{os.fspath(image_path.resolve())}|{stamp}|{max_px}|{_RENDER_VERSION}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -94,6 +100,7 @@ def _open_source(image_path: Path) -> Image.Image:
         im.seek(0)          # multi-page TIF: page 1 is the object's page
     except (EOFError, ValueError):
         pass
+    im = upright(im)        # the frame OCR read the page in (see alto_parse)
     if im.mode != "RGB":
         im = im.convert("RGB")
     return im

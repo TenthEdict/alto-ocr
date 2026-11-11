@@ -163,6 +163,28 @@ def check_tesseract_version(binary: Path) -> str:
     return output[0] if output else "unknown"
 
 
+def _tesseract_env() -> dict[str, str]:
+    """Environment for a Tesseract child: OpenMP held to one thread.
+
+    Tesseract builds with OpenMP (Ubuntu's apt package is one) run ~4 threads
+    per page for almost no gain, and several such processes at once — ``batch
+    --workers N``, or Goobi running two OCR steps together — oversubscribe
+    the cores and spin-wait against each other. Measured 2026-11-11 on a
+    6-core host, Tesseract 5.3.4, one 2.6 s page: 2 concurrent pages took
+    7.4 s, 3 took 39 s, 4 took 117 s, and 6 had not finished after 327 s —
+    long enough for real pages to hit the per-page timeout and become failure
+    stubs. With ``OMP_THREAD_LIMIT=1`` the same 6 pages took 4-5 s, and a
+    lone page costs 7% more wall time for 2.6x less CPU. Parallelism comes
+    from ``--workers``, not from inside one page.
+
+    An ``OMP_THREAD_LIMIT`` already set in the environment wins, so a host
+    that measures differently can override it without a code change.
+    """
+    env = dict(os.environ)
+    env.setdefault("OMP_THREAD_LIMIT", "1")
+    return env
+
+
 def _run_tesseract(
     binary: Path,
     image_path: Path,
@@ -193,6 +215,7 @@ def _run_tesseract(
             encoding="utf-8", errors="replace",
             creationflags=_NO_WINDOW_FLAGS,
             timeout=options.timeout_s,
+            env=_tesseract_env(),
         )
     except subprocess.TimeoutExpired:
         # subprocess.run has already killed the child; the RuntimeError

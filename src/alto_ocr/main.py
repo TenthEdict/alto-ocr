@@ -472,8 +472,8 @@ def batch(
                                           help="Collection directory containing per-Ref-ID subdirectories."),
     output_root: Path = typer.Argument(..., help="Output root; one subdirectory per Ref ID."),
     workers: int = typer.Option(1, "--workers", "-w",
-                                help="Parallel Ref-ID workers. Tesseract is single-threaded per call; "
-                                     "tune to physical CPU count."),
+                                help="Parallel Ref-ID workers. Each Tesseract call is held to one "
+                                     "thread (OMP_THREAD_LIMIT=1), so tune to physical CPU count."),
     engine: str = EngineOpt,
     tesseract_path: Optional[Path] = TesseractOpt,
     glmocr_endpoint: Optional[str] = GLMOCREndpointOpt,
