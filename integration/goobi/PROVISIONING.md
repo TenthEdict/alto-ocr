@@ -160,7 +160,7 @@ than something to keep in parallel.
 
 | stage | Goobi mechanism | state |
 |---|---|---|
-| 0. Create processes from Ref-IDs | `plugin-import-excel` — mass-creates processes from spreadsheet rows | not installed |
+| 0. Create processes from Ref-IDs | `plugin-import-excel` — mass-creates processes from a sheet made by `tracking_to_goobi.py` (README, *Creating processes from a tracking sheet*) | config + converter in kit; plugin not installed |
 | 1. Capture | manual task; images arrive by upload or direct export (below) | ready |
 | 2. QC1 (+ image count) | manual task; Goobi counts images itself (`sortHelperImages`) — do not re-enter counts by hand | ready |
 | 3. Post-Process | manual check-off; the work itself happens in Capture One | ready |
