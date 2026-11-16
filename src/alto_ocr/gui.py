@@ -1,7 +1,7 @@
 """Tkinter desktop GUI for alto_ocr.
 
 A thin wrapper over the existing pipeline. Two tabs — **Run** (folder
-pickers, output formats, engine choice, Run/Cancel, progress and the live
+pickers, output formats, Run/Cancel, progress and the live
 log) and **Review** (transcript correction, ``review.py``) — under a menu
 bar whose **Tools ▸ Advanced settings…** opens the engine and
 preprocessing options, including the Tesseract location, in a window of
@@ -31,13 +31,13 @@ from tkinter import filedialog, messagebox, ttk
 from typing import TYPE_CHECKING, Mapping, Optional
 
 from . import __version__, theme
-# The OCR stack (ocr, pipeline, preprocess, glmocr) is imported inside the
+# The OCR stack (ocr, pipeline, preprocess) is imported inside the
 # run worker, not here: it loads OpenCV and numpy, ~190 MB of native
 # libraries the window would otherwise wait for on every launch (worst on a
 # cold Windows start, where antivirus scans each DLL as it loads). Measured
 # 2026-10-28: importing this module fell 0.73 s -> 0.09 s on a warm Linux
 # cache. The defaults the window needs come from the stdlib-only config.
-from .config import DEFAULT_MODEL, DEFAULT_TIMEOUT_S, GLMOCRConfig, OCROptions, PreprocessConfig
+from .config import OCROptions, PreprocessConfig
 from .review import ReviewFrame
 from .walker import SkippedRefId, discover_collection, discover_ref_id
 
@@ -60,18 +60,11 @@ class JobConfig:
     write_mets: bool
     write_plaintext: bool
     with_checksums: bool = True
-    # Engine selection. Default matches the CLI + CLAUDE.md (Tesseract is
-    # the default — its confidence output drives the remediation workflow);
-    # GLMOCR remains selectable for handwriting-heavy material.
-    engine: str = "tesseract"  # "tesseract" | "glmocr"
     tesseract_path: Optional[Path] = None
     # Advanced — mirror the upstream dataclasses they configure.
     preprocess_config: PreprocessConfig = field(default_factory=PreprocessConfig)
     debug_preprocessed_dir: Optional[Path] = None
     ocr_options: OCROptions = field(default_factory=OCROptions)
-    glmocr_endpoint: Optional[str] = None
-    glmocr_model: str = DEFAULT_MODEL
-    glmocr_timeout: int = DEFAULT_TIMEOUT_S
 
 
 class SettingsError(ValueError):
@@ -95,7 +88,6 @@ def parse_advanced(raw: Mapping[str, object]) -> dict:
     psm = whole_number("psm", "PSM")
     oem = whole_number("oem", "OEM")
     tess_timeout = whole_number("tesseract_timeout", "Tesseract timeout")
-    glmocr_timeout = whole_number("glmocr_timeout", "GLMOCR timeout")
     if min_dpi <= 0:
         raise SettingsError("Min DPI must be positive.")
     if not 0 <= psm <= 13:
@@ -104,8 +96,6 @@ def parse_advanced(raw: Mapping[str, object]) -> dict:
         raise SettingsError("OEM must be between 0 and 3.")
     if tess_timeout <= 0:
         raise SettingsError("Tesseract timeout must be positive.")
-    if glmocr_timeout <= 0:
-        raise SettingsError("GLMOCR timeout must be positive.")
 
     tess_str = str(raw.get("tesseract_path", "") or "").strip()
     tess_path = Path(tess_str).expanduser() if tess_str else None
@@ -120,7 +110,7 @@ def parse_advanced(raw: Mapping[str, object]) -> dict:
         tesseract_path=tess_path,
         preprocess_config=PreprocessConfig(
             min_dpi=min_dpi,
-            # The frame-changing stages: both engines force them off so
+            # The frame-changing stages: the engine forces them off so
             # word boxes stay on the original scan (ocr.adjust_preprocess),
             # so the GUI offers no switch that would only pretend to.
             do_deskew=False,
@@ -133,10 +123,6 @@ def parse_advanced(raw: Mapping[str, object]) -> dict:
         ocr_options=OCROptions(
             language=str(raw.get("ocr_lang", "") or "").strip() or "eng",
             psm=psm, oem=oem, timeout_s=tess_timeout),
-        glmocr_endpoint=str(raw.get("glmocr_endpoint", "") or "").strip() or None,
-        glmocr_model=(str(raw.get("glmocr_model", "") or "").strip()
-                      or GLMOCRConfig().model),
-        glmocr_timeout=glmocr_timeout,
         with_checksums=bool(raw.get("with_checksums", True)),
     )
 
@@ -161,13 +147,15 @@ def advanced_settings(adv: Mapping[str, object]) -> dict:
         "psm": oo.psm,
         "oem": oo.oem,
         "tesseract_timeout": oo.timeout_s,
-        "glmocr_endpoint": adv["glmocr_endpoint"] or "",
-        "glmocr_model": adv["glmocr_model"],
-        "glmocr_timeout": adv["glmocr_timeout"],
         "with_checksums": adv["with_checksums"],
-        # Retired with their checkboxes (engines force both stages off).
+        # Retired with their checkboxes (the engine forces both stages off).
         "do_deskew": None,
         "do_border_crop": None,
+        # Retired with the GLMOCR engine (v0.11.0).
+        "engine": None,
+        "glmocr_endpoint": None,
+        "glmocr_model": None,
+        "glmocr_timeout": None,
     }
 
 
@@ -257,7 +245,6 @@ class AltoOcrApp:
         s = self._settings
         pp = PreprocessConfig()  # source of truth for preprocessing defaults
         oo = OCROptions()        # source of truth for Tesseract option defaults
-        gc = GLMOCRConfig()      # source of truth for GLMOCR defaults
 
         # ----- Tk variables — model state behind the widgets. -----
         # Run-tab basics
@@ -268,7 +255,6 @@ class AltoOcrApp:
         self.var_recurse = tk.BooleanVar(value=bool(s.get("recurse", False)))
         self.var_mets = tk.BooleanVar(value=bool(s.get("write_mets", True)))
         self.var_plaintext = tk.BooleanVar(value=bool(s.get("write_plaintext", True)))
-        self.var_engine = tk.StringVar(value=str(s.get("engine", "tesseract")))
         self.var_status = tk.StringVar(value="Ready.")
 
         # Advanced settings window. Number fields are StringVars so a
@@ -284,9 +270,6 @@ class AltoOcrApp:
         self.var_oem = tk.StringVar(value=str(s.get("oem", oo.oem)))
         self.var_tess_timeout = tk.StringVar(
             value=str(s.get("tesseract_timeout", oo.timeout_s)))
-        self.var_glmocr_endpoint = tk.StringVar(value=str(s.get("glmocr_endpoint", "")))
-        self.var_glmocr_model = tk.StringVar(value=str(s.get("glmocr_model", gc.model)))
-        self.var_glmocr_timeout = tk.StringVar(value=str(s.get("glmocr_timeout", gc.timeout_s)))
         self.var_with_checksums = tk.BooleanVar(value=bool(s.get("with_checksums", True)))
         self._adv_win: Optional[tk.Toplevel] = None
         # View ▸ Theme: light (native look), dark, or match Windows.
@@ -406,15 +389,8 @@ class AltoOcrApp:
         ttk.Checkbutton(formats, text="Plain text", variable=self.var_plaintext).pack(
             side="left")
 
-        engine_frame = ttk.LabelFrame(tab, text="OCR engine", padding=8)
+        engine_frame = ttk.LabelFrame(tab, text="OCR engine: Tesseract", padding=8)
         engine_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(8, 4))
-        radio_row = ttk.Frame(engine_frame)
-        radio_row.pack(fill="x")
-        ttk.Radiobutton(radio_row, text="Tesseract (default — word confidences)",
-                        variable=self.var_engine, value="tesseract").pack(
-            side="left", padx=(0, 16))
-        ttk.Radiobutton(radio_row, text="GLMOCR (handwriting)",
-                        variable=self.var_engine, value="glmocr").pack(side="left")
         hint = ttk.Label(
             engine_frame, cursor="hand2", style="Link.TLabel",
             text="Tesseract location and other engine options: Tools ▸ Advanced settings…")
@@ -561,30 +537,6 @@ class AltoOcrApp:
             ttk.Label(tess, text=hint, style="Muted.TLabel").grid(
                 row=row, column=2, columnspan=2, sticky="w", padx=(8, 0), pady=(4, 0))
 
-        # ----- GLMOCR (handwriting) -----
-        gl = ttk.LabelFrame(panel, text="GLMOCR (handwriting)", padding=8)
-        gl.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        gl.columnconfigure(2, weight=1)
-        ttk.Label(gl, text="Endpoint:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Entry(gl, textvariable=self.var_glmocr_endpoint).grid(
-            row=0, column=1, columnspan=2, sticky="ew")
-        ttk.Label(
-            gl, text="Leave empty to use OLLAMA_HOST or the built-in default.",
-            style="Muted.TLabel",
-        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 0))
-        ttk.Label(gl, text="Model:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
-        ttk.Entry(gl, textvariable=self.var_glmocr_model, width=24).grid(
-            row=2, column=1, sticky="w", pady=(6, 0))
-        ttk.Label(
-            gl, text="Ollama model tag, e.g. 'glm-ocr:q8_0'.", style="Muted.TLabel",
-        ).grid(row=2, column=2, sticky="w", padx=(8, 0), pady=(6, 0))
-        ttk.Label(gl, text="Timeout (sec):").grid(
-            row=3, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
-        ttk.Spinbox(
-            gl, from_=10, to=900, increment=10,
-            textvariable=self.var_glmocr_timeout, width=8,
-        ).grid(row=3, column=1, sticky="w", pady=(6, 0))
-
         # ----- Preprocessing -----
         pp = ttk.LabelFrame(panel, text="Preprocessing", padding=8)
         pp.grid(row=2, column=0, sticky="ew", pady=(0, 8))
@@ -642,9 +594,6 @@ class AltoOcrApp:
             "psm": self.var_psm.get(),
             "oem": self.var_oem.get(),
             "tesseract_timeout": self.var_tess_timeout.get(),
-            "glmocr_endpoint": self.var_glmocr_endpoint.get(),
-            "glmocr_model": self.var_glmocr_model.get(),
-            "glmocr_timeout": self.var_glmocr_timeout.get(),
             "with_checksums": self.var_with_checksums.get(),
         }
 
@@ -652,7 +601,6 @@ class AltoOcrApp:
         """Restore every Advanced setting to its dataclass default."""
         pp = PreprocessConfig()
         oo = OCROptions()
-        gc = GLMOCRConfig()
         self.var_tesseract.set("")
         self.var_min_dpi.set(str(pp.min_dpi))
         self.var_do_denoise.set(pp.do_denoise)
@@ -663,9 +611,6 @@ class AltoOcrApp:
         self.var_psm.set(str(oo.psm))
         self.var_oem.set(str(oo.oem))
         self.var_tess_timeout.set(str(oo.timeout_s))
-        self.var_glmocr_endpoint.set("")
-        self.var_glmocr_model.set(gc.model)
-        self.var_glmocr_timeout.set(str(gc.timeout_s))
         self.var_with_checksums.set(True)
 
     # ---------- Helpers --------------------------------------------------------
@@ -776,11 +721,11 @@ class AltoOcrApp:
         pc = cfg.preprocess_config
         logger.info(
             "Starting: input=%s output=%s recurse=%s mets=%s plaintext=%s "
-            "checksums=%s engine=%s lang=%s psm=%d oem=%d min_dpi=%d "
+            "checksums=%s lang=%s psm=%d oem=%d min_dpi=%d "
             "stages=[denoise=%s clahe=%s binarize=%s]",
             cfg.input_dir, cfg.output_dir, cfg.recurse,
             cfg.write_mets, cfg.write_plaintext, cfg.with_checksums,
-            cfg.engine, cfg.ocr_options.language, cfg.ocr_options.psm,
+            cfg.ocr_options.language, cfg.ocr_options.psm,
             cfg.ocr_options.oem, pc.min_dpi,
             pc.do_denoise, pc.do_clahe, pc.do_binarize,
         )
@@ -876,7 +821,6 @@ class AltoOcrApp:
             recurse=self.var_recurse.get(),
             write_mets=self.var_mets.get(),
             write_plaintext=self.var_plaintext.get(),
-            engine=self.var_engine.get(),
             **adv,
         )
 
@@ -885,7 +829,6 @@ class AltoOcrApp:
         comes back on the next launch."""
         changes: dict[str, object] = {
             "recurse": cfg.recurse,
-            "engine": cfg.engine,
             "write_mets": cfg.write_mets,
             "write_plaintext": cfg.write_plaintext,
         }
@@ -894,9 +837,6 @@ class AltoOcrApp:
             "preprocess_config": cfg.preprocess_config,
             "debug_preprocessed_dir": cfg.debug_preprocessed_dir,
             "ocr_options": cfg.ocr_options,
-            "glmocr_endpoint": cfg.glmocr_endpoint,
-            "glmocr_model": cfg.glmocr_model,
-            "glmocr_timeout": cfg.glmocr_timeout,
             "with_checksums": cfg.with_checksums,
         }))
         self._update_settings(changes)
@@ -911,8 +851,7 @@ class AltoOcrApp:
             skipped_ref_result,
         )
 
-        # Discover work first so we know which engines we actually need.
-        # Building GLMOCR runs an endpoint check; skip it when no Ref ID needs it.
+        # Discover work first so an empty input fails before engine setup.
         skipped: list[SkippedRefId] = []
         if cfg.recurse:
             items, skipped = discover_collection(cfg.input_dir)
@@ -940,7 +879,7 @@ class AltoOcrApp:
                         single.ref_id, single.page_count)
 
         try:
-            engine = self._build_engine(cfg.engine, cfg)
+            engine = self._build_engine(cfg)
         except Exception as e:
             logger.error("Engine setup failed: %s", e)
             self._signal_done(success=False)
@@ -989,42 +928,24 @@ class AltoOcrApp:
                     verb, ok, n_total, failed_pages)
         self._signal_done(success=(not cancelled and ok == n_total))
 
-    def _build_engine(self, name: str, cfg: JobConfig) -> OCREngine:
+    def _build_engine(self, cfg: JobConfig) -> OCREngine:
         """GUI face of ``ocr.build_engine``: shared construction + startup
         checks; failures become RuntimeError for the worker's error path."""
-        from .glmocr import GLMOCRError, resolve_endpoint
         from .ocr import TesseractNotFoundError, build_engine
 
         try:
             built = build_engine(
-                name,
+                "tesseract",
                 tesseract_path=cfg.tesseract_path,
                 ocr_options=cfg.ocr_options,
-                glmocr_endpoint=cfg.glmocr_endpoint,
-                glmocr_model=cfg.glmocr_model,
-                glmocr_timeout=cfg.glmocr_timeout,
             )
-        except TesseractNotFoundError as e:
+        except (TesseractNotFoundError, ValueError) as e:
             raise RuntimeError(str(e))
-        except GLMOCRError as e:
-            raise RuntimeError(
-                f"GLMOCR endpoint check failed: {e}\n\n"
-                f"Make sure Ollama is running at "
-                f"{resolve_endpoint(cfg.glmocr_endpoint)} and the "
-                f"{cfg.glmocr_model} model is pulled."
-            )
-        except ValueError as e:
-            raise RuntimeError(str(e))
-        if built.kind == "tesseract":
-            logger.info(
-                "Tesseract: %s (%s) lang=%s psm=%d oem=%d",
-                built.tesseract_binary, built.tesseract_version,
-                cfg.ocr_options.language, cfg.ocr_options.psm, cfg.ocr_options.oem,
-            )
-        else:
-            gc = built.glmocr_config
-            logger.info("GLMOCR: %s (model %s, timeout %ds)",
-                        gc.endpoint, gc.model, gc.timeout_s)
+        logger.info(
+            "Tesseract: %s (%s) lang=%s psm=%d oem=%d",
+            built.tesseract_binary, built.tesseract_version,
+            cfg.ocr_options.language, cfg.ocr_options.psm, cfg.ocr_options.oem,
+        )
         return built.engine
 
     def _set_progress(self, current: int, total: int) -> None:

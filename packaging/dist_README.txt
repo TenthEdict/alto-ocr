@@ -5,9 +5,8 @@ Alto OCR turns archival page scans (TIF, and PDF) into METS/ALTO XML +
 plain-text transcripts, then helps you review and correct those
 transcripts before upload.
 
-This bundle contains everything needed EXCEPT the OCR engines themselves
-(Tesseract, and optionally GLMOCR via Ollama), which are separate
-one-time installs — see "One-time setup" below.
+This bundle contains everything needed EXCEPT the OCR engine itself
+(Tesseract), which is a separate one-time install — see "One-time setup" below.
 
 Contents
 --------
@@ -39,8 +38,7 @@ Contents
 
 2. One-time setup (per machine)
 -------------------------------
-1. Install Tesseract 5+ (the default engine — used for everything
-   unless you explicitly pick GLMOCR):
+1. Install Tesseract 5+ (the OCR engine):
 
    - Download the UB-Mannheim Windows installer:
        https://github.com/UB-Mannheim/tesseract/wiki
@@ -52,23 +50,11 @@ Contents
    it under Tools > Advanced settings > "Tesseract program", or pass
    --tesseract-path on the command line.
 
-2. (Optional) Install Ollama and pull the glm-ocr model if you need the
-   GLMOCR engine for handwriting-heavy material — Tesseract tends to
-   produce low-confidence garble on handwriting:
-
-       https://ollama.com/download
-       ollama pull glm-ocr:q8_0
-
-   By default Alto OCR talks to http://localhost:11434. Tools >
-   Advanced settings has an "Endpoint" field if Ollama runs on a
-   different machine.
-
-3. Check the setup. Open a terminal in this folder and run:
+2. Check the setup. Open a terminal in this folder and run:
 
        alto-ocr.exe doctor
 
-   It reports OK / WARN for each engine. A GLMOCR warning is fine if
-   you only use Tesseract.
+   It reports OK / FAIL for each dependency and for Tesseract.
 
 
 3. The workflow at a glance
@@ -76,9 +62,7 @@ Contents
   a. OCR the objects with Tesseract (Run tab). Tesseract records a
      confidence value for every word and every page.
   b. Look at the results worst-first (Review tab page list, or the
-     "triage" command for a whole collection). Objects whose pages are
-     almost all low-confidence are usually handwriting: re-run just
-     those with the GLMOCR engine.
+     "triage" command for a whole collection).
   c. Correct the low-confidence words in the Review tab. You don't have
      to correct everything — work worst pages first, and stop when the
      remaining pages are good enough.
@@ -122,10 +106,6 @@ Contents
     example the collection's documentation\ALTOS-Plain Text\ folder).
   - "Output formats": METS / ALTO and Plain text are both on by
     default. Leave them on unless you've been told otherwise.
-  - "OCR engine": Tesseract (default — records word confidences for
-    review) or GLMOCR (handwriting; needs Ollama). GLMOCR output has no
-    confidence values, so its pages show up as "unscored" and need a
-    full read-through rather than worst-first correction.
   - Click "Run OCR". Progress and the log appear on this tab. "Cancel"
     finishes the object in progress and skips the rest. The window
     title shows progress too, so you can keep correcting on the Review
@@ -155,7 +135,6 @@ Contents
       4 = single column, 6 = one uniform block of text: worth a retry
       on a problem object whose layout confuses the automatic mode.
   - OEM: leave at 3.
-  - GLMOCR: endpoint, model (glm-ocr:q8_0) and timeout.
   - Preprocessing: Min DPI (low-resolution scans are enlarged to at
     least this), Denoise and CLAHE contrast (on), Binarize (OFF —
     turning it on usually makes results worse on toned or grainy
@@ -298,15 +277,13 @@ ALTO/Text output tree by Ref ID externally.
 
   - process: one Ref ID folder. batch: a folder of Ref ID folders.
   - triage: ranks existing output worst-first for review, prints the
-    objects and pages that most need attention, names likely
-    handwriting objects (mean confidence below 60%), and writes
+    objects and pages that most need attention, and writes
     triage_objects.csv / triage_pages.csv (open in Excel) next to the
     outputs. Works on any output folder, old or new.
   - repackage: the same as the Review tab's Repackage button.
-  - doctor: checks that both engines are reachable.
+  - doctor: checks that Tesseract and the libraries are installed.
 
   Useful options for process / batch:
-    --engine glmocr          use GLMOCR (handwriting) instead of Tesseract
     --psm 1                  handle sideways / upside-down pages
     --ocr-lang fra           OCR language (default eng)
     --workers 4              batch only: OCR several objects in parallel
@@ -336,12 +313,6 @@ ALTO/Text output tree by Ref ID externally.
     point at an existing install under Tools > Advanced settings >
     "Tesseract program".
 
-  "GLMOCR endpoint check failed"
-    Only matters when you've selected GLMOCR. Make sure Ollama is
-    running and the glm-ocr:q8_0 model is pulled (see setup step 2).
-    The Endpoint field in Tools > Advanced settings accepts a remote
-    URL like http://other-machine:11434 if Ollama runs elsewhere.
-
   An object fails with "refusing to overwrite human corrections"
     Someone has already corrected pages of that object in the Review
     tab, and a new OCR run would erase their work. If you really want
@@ -365,7 +336,8 @@ ALTO/Text output tree by Ref ID externally.
     object with PSM 1 (Tools > Advanced settings).
 
   A whole object is low confidence (mostly red boxes)
-    Usually handwriting. Re-run that object with the GLMOCR engine.
+    Usually handwriting, which Tesseract reads poorly. Correct it by
+    hand in the Review tab, or set it aside for manual transcription.
 
   A cover, photograph or blank page is full of garbage words
     Use "Clear page..." in the Review tab.

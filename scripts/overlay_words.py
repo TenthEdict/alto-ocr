@@ -1,10 +1,9 @@
 """Render ALTO *word-level* boxes over a source image, for word-box QA.
 
 Companion to ``src/alto_ocr/overlay_alto.py`` (which draws ``TextLine``
-boxes). The GLMOCR engine derives per-word ``<String>`` geometry by
-splitting each detected line box proportionally — line geometry is exact,
-but which word lands where within a line is *approximate*. The failure
-modes to watch for are therefore at the word level:
+boxes). Word geometry is what the public archive's hit boxes and the
+review tools draw, so the failure modes to watch for are at the word
+level:
 
   * a word box whose left/right edge clips the glyphs it names
     (e.g. a column crop starting a couple characters too far right);
@@ -34,7 +33,7 @@ ratio is 1:1 — so the tool works on both.
 Pure stdlib + Pillow on purpose (no OpenCV/lxml), so it runs as a
 standalone QA aid without the pipeline's heavier deps. User-facing strings
 are ASCII only (the legacy Windows cp1252 console can't encode arrows/
-em-dashes — see the GLMOCR machine-setup notes).
+em-dashes).
 """
 
 from __future__ import annotations

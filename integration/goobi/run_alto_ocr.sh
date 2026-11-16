@@ -42,7 +42,6 @@ OCR_BASE="${4:-}"
 # ---- configuration ---------------------------------------------------------
 APP_DIR="${ALTO_OCR_APP_DIR:-/home/schipp0/alto-ocr}"
 VENV_PYTHON="${APP_DIR}/venv/bin/python"
-ENGINE="${ALTO_OCR_ENGINE:-tesseract}"
 OCR_LANG="${ALTO_OCR_LANG:-eng}"
 # psm 1, not Tesseract's psm 3 default: both do fully automatic page
 # segmentation, but only psm 1 runs orientation and script detection. A
@@ -91,7 +90,7 @@ echo "[$(log_ts)] process id    : ${PROCESS_ID}"
 echo "[$(log_ts)] process title : ${PROCESS_TITLE}"
 echo "[$(log_ts)] input images  : ${TIFF_DIR}"
 echo "[$(log_ts)] ocr base      : ${OCR_BASE}"
-echo "[$(log_ts)] engine        : ${ENGINE} (lang ${OCR_LANG}, psm ${PSM})"
+echo "[$(log_ts)] engine        : tesseract (lang ${OCR_LANG}, psm ${PSM})"
 
 # Unreplaced Goobi variables are the classic misconfiguration: a token that
 # still looks like {tifffolder} means the name is not one Goobi knows.
@@ -125,7 +124,6 @@ set +e
     "${TIFF_DIR}" \
     "${VIEW_ROOT}" \
     --ref-id "${PROCESS_TITLE}" \
-    --engine "${ENGINE}" \
     --ocr-lang "${OCR_LANG}" \
     --psm "${PSM}" \
     --summary-json "${SUMMARY_JSON}" \

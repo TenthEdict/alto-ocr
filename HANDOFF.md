@@ -27,6 +27,7 @@ with a `merge:` commit):
 
 | version | what |
 |---|---|
+| 0.11.0 | GLMOCR engine removed; Tesseract is the only engine (`--engine` kept hidden for old scripts) |
 | kit | Goobi provisioning kit: config overlay, idempotent installer, drift check (no version bump; not app code) |
 | 0.10.4 | Review usability fixes: shortcuts no longer die on focus changes, multi-word select + delete, reading-order drag-and-drop, Tk right-click menu, browser editor bar no longer resizes the scan |
 | 0.10.3 | Reading-order path legible on the scan; edit a word without leaving reading-order mode |
@@ -71,7 +72,7 @@ that branch as is: it predates 0.9.2 through 0.10.4.
 `docs/` is in `.gitignore`, so these never reached the remote, although
 `CLAUDE.md` points at the first one:
 
-- `docs/glmocr_handoff.md`: the glm-ocr integration design
+- `docs/glmocr_handoff.md`: the glm-ocr integration design (historical: GLMOCR was removed in 0.11.0)
 - `docs/handoff_audit_2026-10-02.md`: the audit brief behind 0.10.2 (all six findings landed)
 - `docs/ReviewProcedures.txt`: an early corrector walkthrough (outdated: delete no longer asks first)
 
@@ -127,10 +128,6 @@ assumes. Cloning from Purdue's GitHub Enterprise needs your credentials
 
 **Claude Code:** install it in WSL and run `claude` from `~/alto-ocr`;
 `CLAUDE.md` loads automatically. Ask it to read this file first.
-
-**Optional, for handwriting (glm-ocr):** install Ollama (in WSL, or reuse a
-Windows-side Ollama through `OLLAMA_HOST`) and `ollama pull glm-ocr:q8_0`.
-Leave Ollama's `num_ctx` at its default 4096 (see section 7).
 
 **Network shares:** the collections live on SMB shares (`Y:` =
 `\\wl.mydata.purdue.edu\lib_asc\Archives2`, `L:` = collections). In WSL,
@@ -260,9 +257,8 @@ stage 8 (S3 upload to LibSafe) was specified but not built.
    boxes in a rotated frame on skewed pages, and anything before 0.8.8 was
    binarized and is measurably worse.
 6. **Smaller backlog:**
-   - glm-ocr sometimes wraps output in a code fence; `markup.normalize_markup` doesn't strip it yet.
    - Spot-check word boxes in the real public archive viewer when access exists (`scripts/overlay_words.py` was the local stand-in).
-   - Suggested tests never written: `ocr.build_engine` (especially num_predict pass-through), `triage.scan_output_root` edge cases, an anisotropic-DPI `reformat` test.
+   - Suggested tests never written: `ocr.build_engine`, `triage.scan_output_root` edge cases, an anisotropic-DPI `reformat` test.
    - Deferred: merge+convert parses each page twice (1–3%); a METS rebuild that keeps dmdSec if the institution adds metadata sections; a pip lock file for reproducible exe builds.
    - Ideas from 2026-10-15 usability testing: "select all flagged words" for bulk-deleting noise; a click on bare scan clearing the selection in the Tk tab (the browser already does).
 7. **Growth path for handwriting at scale:** pilot eScriptorium/Kraken on one
@@ -277,25 +273,14 @@ Most of these are also in `CLAUDE.md`. They are here because the memory
 files don't travel.
 
 **OCR quality (all measured, don't undo without re-measuring):**
-- Tesseract is the default engine because it emits per-word confidence; glm-ocr is the per-run choice for handwriting.
+- Tesseract is the only engine (0.11.0). GLMOCR was removed as not useful: no word confidences, fluent errors that hide from correctors, and it skipped body text on dense print (9 words vs Tesseract's 1,021 on one SCI00001 page). Handwriting is corrected by hand in Review.
 - **Binarization OFF** (0.8.8): on three collections mean WC rose (0.83→0.91, 0.58→0.78, 0.80→0.92) and review pages fell (28→6, 9→3, 25→6). The words that vanish are speckle artifacts.
-- **Deskew and border-crop are forced OFF** for both engines: ALTO boxes must land on the untouched scan. Deskew fired on 36% of pages and put boxes a line off.
+- **Deskew and border-crop are forced OFF**: ALTO boxes must land on the untouched scan. Deskew fired on 36% of pages and put boxes a line off.
 - **`--psm 1` per collection, not default:** it fixes sideways scans (16 of 82 pages in MSA00018) but manufactures noise on blank pages. Afterwards, check that no blank page became `scored`.
 - MSA00018 pilot (2026-07-30): 82 pages clean; review queue 25 → 6.
 - Low mean WC can mean "no text" (photographs, postcards) rather than handwriting. Check words per page first.
 - Some JPEG exports rotate pages through the EXIF orientation tag; the loader applies `exif_transpose`. Garbled-but-structured OCR on an upright-looking page means: check orientation.
-- Dense printed material: glm-ocr captures only headlines (9 words vs Tesseract's 1,021 on one SCI00001 page).
-- Point Tesseract at the TIFF export and glm-ocr at the JPEG export. Keep the two in separate folders (same stems collide), and keep QC-subset folders out of OCR input trees (duplicate stems abort discovery with a misleading "No TIFs found").
-
-**glm-ocr behavior (`glm-ocr:q8_0` on Ollama):**
-- Whole-page model: single-line crops return nothing, while column crops work. The engine transcribes per column block and spreads words over detected lines.
-- Longest edge must stay at or under ~1024 px (`GGML_ASSERT` above it, content-dependent even inside the limit; the engine retries smaller).
-- Keep `num_ctx` at the default 4096: raising it lets repetition loops run 5× longer. `repeat_penalty` corrupts real repeated text, so it is rejected.
-- Loop collapse is exact-periodic plus intra-line and enumerated shapes only (0.9.1). **Never ratio-based de-dup**: it destroyed roll-calls and ledgers. Thresholds came from replaying 4,844 pages; re-run that replay before changing them.
-- The chat-commentary stripper is precision-first, because a false match deletes real text.
-- A blank verso with show-through can make glm-ocr invent a full page of fluent prose (2,877 words on MSF00327 p. 79). Prefer Tesseract where blank versos are interleaved.
-- Accepted limitations: occasional column doubling, garbled math, left-edge clip on spanning titles.
-- Production settings measured on an A2000: `--workers 6 --glmocr-num-predict 2048` with `OLLAMA_NUM_PARALLEL=6`.
+- Keep QC-subset folders out of OCR input trees (duplicate stems abort discovery with a misleading "No TIFs found").
 
 **Engineering rules:**
 - Canonical writes go through `_util.atomic_write_*`; pipeline XML parses go through `alto_format.hardened_parser()`.
@@ -331,7 +316,6 @@ files don't travel.
 ```bash
 python -m src.alto_ocr.main process <object_dir> <output_root>
 python -m src.alto_ocr.main batch <collection_dir> <output_root> --workers 4
-python -m src.alto_ocr.main batch <collection_dir> <output_root> --engine glmocr
 python -m src.alto_ocr.main triage <output_root>
 python -m src.alto_ocr.main repackage <output_root>
 python -m src.alto_ocr.main serve-review --output-root <out> --source-root <scans>

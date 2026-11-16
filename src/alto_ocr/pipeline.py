@@ -343,9 +343,8 @@ def process_ref_id(
         d.mkdir(parents=True, exist_ok=True)
 
     # Engines may need a different preprocessing recipe than the user's
-    # default — e.g. GLMOCR's vision projector trips a GGML assertion on
-    # binarized inputs and needs continuous grayscale. The hook is a no-op
-    # for engines that don't override it.
+    # default — Tesseract forces the frame-changing stages off. The hook is
+    # a no-op for engines that don't override it.
     effective_preprocess = preprocess_config or PreprocessConfig()
     if hasattr(engine, "adjust_preprocess"):
         adjusted = engine.adjust_preprocess(effective_preprocess)

@@ -152,7 +152,7 @@ class Word:
             return None
 
     def needs_review(self, threshold: float) -> bool:
-        """Below-threshold OR unscored (no WC — e.g. GLMOCR output). A word
+        """Below-threshold OR unscored (no WC — e.g. output from the removed GLMOCR engine). A word
         no engine attached confidence to needs eyes just as much."""
         wc = self.wc
         return wc is None or wc < threshold
@@ -1128,7 +1128,7 @@ class ReviewPage:
     def _recompute_pc(self) -> None:
         """PC = mean of current WCs (human-verified words count as 1.00), so
         triage re-ranks partially corrected pages below untouched ones.
-        Left alone when no word carries WC (unscored GLMOCR pages)."""
+        Left alone when no word carries WC (unscored pages, e.g. legacy GLMOCR output)."""
         wcs = [w.wc for w in self.words if w.wc is not None]
         if wcs:
             self.page.set("PC", f"{sum(wcs) / len(wcs):.2f}")

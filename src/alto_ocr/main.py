@@ -15,15 +15,6 @@ from rich.console import Console
 from rich.logging import RichHandler
 from rich.table import Table
 
-from .glmocr import (
-    DEFAULT_MODEL,
-    DEFAULT_NUM_PREDICT,
-    DEFAULT_TIMEOUT_S,
-    GLMOCRConfig,
-    GLMOCRError,
-    check_endpoint,
-    resolve_endpoint,
-)
 from .alto_format import convert_to_institution_format
 from .ocr import (
     OCREngine,
@@ -82,10 +73,6 @@ def _build_engine(
     *,
     tesseract_path: Path | None,
     ocr_options: OCROptions,
-    glmocr_endpoint: str | None,
-    glmocr_model: str,
-    glmocr_timeout: int,
-    glmocr_num_predict: int = DEFAULT_NUM_PREDICT,
 ) -> OCREngine:
     """CLI face of ``ocr.build_engine``: shared construction + startup
     checks, with failures reported via typer.Exit so the message is
@@ -95,26 +82,13 @@ def _build_engine(
             engine_name,
             tesseract_path=tesseract_path,
             ocr_options=ocr_options,
-            glmocr_endpoint=glmocr_endpoint,
-            glmocr_model=glmocr_model,
-            glmocr_timeout=glmocr_timeout,
-            glmocr_num_predict=glmocr_num_predict,
         )
-    except GLMOCRError as e:
-        console.print(f"[red]glmocr setup error:[/red] {e}")
-        raise typer.Exit(code=2)
     except ValueError as e:
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(code=2)
-    if built.kind == "tesseract":
-        console.print(f"[dim]engine:[/dim] tesseract  "
-                      f"[dim]binary:[/dim] {built.tesseract_binary} "
-                      f"({built.tesseract_version})")
-    else:
-        gc = built.glmocr_config
-        console.print(f"[dim]engine:[/dim] glmocr  "
-                      f"[dim]endpoint:[/dim] {gc.endpoint}  "
-                      f"[dim]model:[/dim] {gc.model}")
+    console.print(f"[dim]engine:[/dim] tesseract  "
+                  f"[dim]binary:[/dim] {built.tesseract_binary} "
+                  f"({built.tesseract_version})")
     return built.engine
 
 
@@ -230,7 +204,7 @@ def _print_triage_hint(
     """One-line pointer to the full triage report after a run."""
     objs = [c for c in conf_by_ref.values() if c is not None]
     if not any(o.scored_pages for o in objs):
-        return  # nothing scored (e.g. a GLMOCR run) — no queue to point at
+        return  # nothing scored (e.g. every page blank) — no queue to point at
     n_review = sum(len(o.review_pages) for o in objs)
     cmd = f'python -m src.alto_ocr.main triage "{output_root}"'
     if n_review:
@@ -248,26 +222,13 @@ def _print_triage_hint(
 # ---------- Common option types -------------------------------------------------
 
 # Typer 0.25 requires Optional[...] (not "X | None") for option types.
-EngineOpt = typer.Option("tesseract", "--engine",
-                         help="OCR engine: 'tesseract' (default; its single pass also "
-                              "emits the per-word confidences written to ALTO as WC/PC "
-                              "for remediation triage) or 'glmocr' (multimodal; better "
-                              "raw accuracy on handwriting but no confidence values; "
-                              "requires local Ollama).")
+# Tesseract is the only engine since v0.11.0 (GLMOCR removed). The flag stays,
+# hidden, so existing scripts passing ``--engine tesseract`` keep running;
+# ``--engine glmocr`` fails with a message saying it was removed.
+EngineOpt = typer.Option("tesseract", "--engine", hidden=True,
+                         help="OCR engine (only 'tesseract' is supported).")
 TesseractOpt = typer.Option(None, "--tesseract-path",
                             help="Path to tesseract binary (overrides PATH/TESSERACT_PATH).")
-GLMOCREndpointOpt = typer.Option(None, "--glmocr-endpoint",
-                                 help="Ollama HTTP endpoint for the glm-ocr engine. "
-                                      "Default: $OLLAMA_HOST or http://localhost:11434.")
-GLMOCRModelOpt = typer.Option(DEFAULT_MODEL, "--glmocr-model",
-                              help="Ollama model tag for the glm-ocr engine.")
-GLMOCRTimeoutOpt = typer.Option(DEFAULT_TIMEOUT_S, "--glmocr-timeout",
-                                help="Per-page glm-ocr request timeout in seconds.")
-GLMOCRNumPredictOpt = typer.Option(
-    DEFAULT_NUM_PREDICT, "--glmocr-num-predict",
-    help="Max tokens glm-ocr may generate per block (default 8192). Raise (e.g. "
-         "16384) if dense pages truncate — look for 'stopped with reason=length' "
-         "in the log; costs proportionally more time only on those dense pages.")
 LangOpt = typer.Option("eng", "--ocr-lang", help="Tesseract language code, e.g. 'eng', 'fra', 'eng+lat'.")
 PsmOpt = typer.Option(3, "--psm", help="Tesseract page segmentation mode (3=auto, 4=column, 6=block).")
 OemOpt = typer.Option(3, "--oem", help="Tesseract OCR engine mode (3=default LSTM).")
@@ -322,10 +283,6 @@ def process(
     ref_id: Optional[str] = RefIdOpt,
     engine: str = EngineOpt,
     tesseract_path: Optional[Path] = TesseractOpt,
-    glmocr_endpoint: Optional[str] = GLMOCREndpointOpt,
-    glmocr_model: str = GLMOCRModelOpt,
-    glmocr_timeout: int = GLMOCRTimeoutOpt,
-    glmocr_num_predict: int = GLMOCRNumPredictOpt,
     ocr_lang: str = LangOpt,
     psm: int = PsmOpt,
     oem: int = OemOpt,
@@ -367,10 +324,6 @@ def process(
         engine,
         tesseract_path=tesseract_path,
         ocr_options=options,
-        glmocr_endpoint=glmocr_endpoint,
-        glmocr_model=glmocr_model,
-        glmocr_timeout=glmocr_timeout,
-        glmocr_num_predict=glmocr_num_predict,
     )
 
     cfg = _build_preprocess_config(min_dpi, no_deskew, no_denoise, no_clahe, binarize, no_border_crop)
@@ -476,10 +429,6 @@ def batch(
                                      "thread (OMP_THREAD_LIMIT=1), so tune to physical CPU count."),
     engine: str = EngineOpt,
     tesseract_path: Optional[Path] = TesseractOpt,
-    glmocr_endpoint: Optional[str] = GLMOCREndpointOpt,
-    glmocr_model: str = GLMOCRModelOpt,
-    glmocr_timeout: int = GLMOCRTimeoutOpt,
-    glmocr_num_predict: int = GLMOCRNumPredictOpt,
     ocr_lang: str = LangOpt,
     psm: int = PsmOpt,
     oem: int = OemOpt,
@@ -516,10 +465,6 @@ def batch(
         engine,
         tesseract_path=tesseract_path,
         ocr_options=options,
-        glmocr_endpoint=glmocr_endpoint,
-        glmocr_model=glmocr_model,
-        glmocr_timeout=glmocr_timeout,
-        glmocr_num_predict=glmocr_num_predict,
     )
 
     cfg = _build_preprocess_config(min_dpi, no_deskew, no_denoise, no_clahe, binarize, no_border_crop)
@@ -637,8 +582,8 @@ def triage(
     Reads the WC/PC attributes Tesseract runs write into the ALTO files.
     Re-runnable any time against any output tree; thresholds are report-time
     dials, not baked into the output. Pages show as: scored (has WC — the
-    correction queue), unscored (GLMOCR output, no confidence — needs full
-    proofread), empty (blank page), or failed (pipeline stub — re-run it).
+    correction queue), unscored (no confidence, e.g. output from an older
+    engine or an external editor — needs full proofread), empty (blank page), or failed (pipeline stub — re-run it).
     """
     _setup_logging(verbose)
 
@@ -695,14 +640,8 @@ def triage(
 
     n_unscored = sum(o.unscored_pages for o in objects)
     if n_unscored:
-        console.print(f"[magenta]{n_unscored} unscored page(s)[/magenta] (no WC — GLMOCR output "
+        console.print(f"[magenta]{n_unscored} unscored page(s)[/magenta] (no WC — older-engine output "
                       f"or pre-confidence runs): no signal to narrow the proofread.")
-    all_scored = [o for o in objects if o.mean_wc is not None]
-    handwriting = [o for o in all_scored if o.mean_wc < 0.60]
-    if handwriting:
-        console.print(f"[yellow]Handwriting candidates (mean WC < 0.60):[/yellow] "
-                      f"{', '.join(o.ref_id for o in handwriting)} — consider re-running "
-                      f"these Ref IDs with --engine glmocr.")
 
     if not no_csv:
         obj_csv, pages_csv = write_csvs(objects, csv_dir or output_root)
@@ -878,14 +817,11 @@ def reformat(
 @app.command()
 def doctor(
     tesseract_path: Optional[Path] = TesseractOpt,
-    glmocr_endpoint: Optional[str] = GLMOCREndpointOpt,
-    glmocr_model: str = GLMOCRModelOpt,
 ) -> None:
-    """Verify the runtime environment: Python deps + both OCR engines."""
+    """Verify the runtime environment: Python deps + Tesseract."""
     _setup_logging(False)
     console.print("[bold]alto_ocr — environment check[/bold]")
 
-    # Python deps are the only hard requirement.
     dep_failed = False
     for dep in ("cv2", "PIL", "numpy", "lxml", "pypdfium2", "typer", "rich"):
         try:
@@ -895,35 +831,16 @@ def doctor(
             console.print(f"[red]FAIL[/red] {dep}: {e}")
             dep_failed = True
 
-    # Tesseract is the DEFAULT engine — its per-word confidences drive the
-    # remediation triage. Absence is still only a warning: glm-ocr alone can
-    # run handwriting-only jobs.
     try:
         binary = find_tesseract(tesseract_path)
-        console.print(f"[green]OK[/green] tesseract (default engine): {binary} "
+        console.print(f"[green]OK[/green] tesseract: {binary} "
                       f"({check_tesseract_version(binary)})")
         tesseract_ok = True
     except Exception as e:
-        console.print(f"[yellow]WARN[/yellow] tesseract (default engine): {e}")
+        console.print(f"[red]FAIL[/red] tesseract: {e}")
         tesseract_ok = False
 
-    # glm-ocr is the optional handwriting engine (--engine glmocr): confirm
-    # Ollama is reachable and the model is pulled. A miss is a warning —
-    # Tesseract runs never touch it.
-    endpoint = resolve_endpoint(glmocr_endpoint)
-    try:
-        model = check_endpoint(GLMOCRConfig(endpoint=endpoint, model=glmocr_model))
-        console.print(f"[green]OK[/green] glm-ocr (handwriting engine): {endpoint}, model {model!r}")
-        glmocr_ok = True
-    except GLMOCRError as e:
-        console.print(f"[yellow]WARN[/yellow] glm-ocr (handwriting engine): {e}")
-        glmocr_ok = False
-
-    if not (glmocr_ok or tesseract_ok):
-        console.print("[red]FAIL[/red] no usable OCR engine "
-                      "(need Tesseract, or Ollama + glm-ocr for handwriting).")
-
-    raise typer.Exit(code=1 if (dep_failed or not (glmocr_ok or tesseract_ok)) else 0)
+    raise typer.Exit(code=1 if (dep_failed or not tesseract_ok) else 0)
 
 
 @app.command()

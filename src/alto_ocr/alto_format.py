@@ -2,8 +2,8 @@
 
 This is the layer every ALTO-writing tool shares — the reference attribute
 order, the tab-indented serialization, px→mm10 conversion, and the
-normalizer that rewrites engine output (Tesseract's ALTO v3, the GLMOCR
-builder's v2) into the institution's reference format. Extracted from
+normalizer that rewrites engine output (Tesseract's ALTO v3, or the ALTO v2
+the since-removed GLMOCR engine wrote) into the institution's reference format. Extracted from
 ``ocr.py`` (2026-07-30) so the remediation layer (review save, repackage)
 depends on this small lxml-only module instead of importing the engine
 module's privates — which also dragged cv2/numpy into every ALTO-editing

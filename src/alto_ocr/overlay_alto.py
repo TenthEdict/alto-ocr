@@ -1,8 +1,8 @@
 """Render ALTO line boxes over a source image, for alignment QA.
 
-The GLMOCR engine derives line geometry itself (glm-ocr returns no
-coordinates), so the failure mode to watch for is a *misaligned* box — one
-whose rectangle doesn't sit on the text it transcribes. This tool overlays
+The failure mode to watch for is a *misaligned* box — one whose rectangle
+doesn't sit on the text it transcribes (e.g. a frame-changing preprocessing
+stage left on). This tool overlays
 every ``TextLine`` box from an ALTO file onto the page image so that
 misalignment shows up immediately. It is the same method used to find the
 original splice defect.

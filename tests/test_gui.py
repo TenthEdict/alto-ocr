@@ -85,8 +85,7 @@ class PureHelperTests(unittest.TestCase):
         raw = {"tesseract_path": "", "min_dpi": "300", "do_denoise": True,
                "do_clahe": True, "do_binarize": False, "debug_preprocessed": "",
                "ocr_lang": "eng", "psm": "3", "oem": "3", "tesseract_timeout": "600",
-               "glmocr_endpoint": "",
-               "glmocr_model": "", "glmocr_timeout": "120", "with_checksums": True}
+               "with_checksums": True}
         raw.update(over)
         return raw
 
@@ -96,7 +95,6 @@ class PureHelperTests(unittest.TestCase):
         self.assertEqual(adv["ocr_options"].psm, 1)
         self.assertEqual(adv["ocr_options"].timeout_s, 600)
         self.assertEqual(adv["ocr_options"].language, "eng")  # blank → default
-        self.assertTrue(adv["glmocr_model"])                   # blank → default
         # The two frame-changing stages are never on, whatever was saved.
         self.assertFalse(adv["preprocess_config"].do_deskew)
         self.assertFalse(adv["preprocess_config"].do_border_crop)
@@ -108,7 +106,6 @@ class PureHelperTests(unittest.TestCase):
                               ({"min_dpi": "0"}, "Min DPI"),
                               ({"psm": "14"}, "PSM"),
                               ({"oem": "x"}, "OEM"),
-                              ({"glmocr_timeout": "-5"}, "GLMOCR timeout"),
                               ({"tesseract_timeout": "0"}, "Tesseract timeout"),
                               ({"tesseract_timeout": "1.5"}, "Tesseract timeout"),
                               ({"tesseract_path": "C:/no/such/tesseract.exe"}, "Tesseract")):
