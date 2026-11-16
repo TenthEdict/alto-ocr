@@ -198,7 +198,7 @@ _MIN_PAGE_PX = 480
 # WC → outline color. Blue marks words edited this session (WC becomes 1.00
 # on disk, but the corrector should still see what they touched).
 _COLOR_EDITED = "#1f6feb"
-_COLOR_UNSCORED = "#c026d3"  # no WC (GLMOCR output): needs eyes everywhere
+_COLOR_UNSCORED = "#c026d3"  # no WC (e.g. legacy GLMOCR output): needs eyes everywhere
 # The selection, outside reading-order mode: one colour for one word or
 # fifty, distinct from every confidence colour and from edited blue.
 _COLOR_SELECTED = "#7c3aed"

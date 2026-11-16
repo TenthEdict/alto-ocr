@@ -9,7 +9,7 @@ worst-first review queue.
 
 Reading from the *output tree* (rather than collecting in-band during OCR)
 is deliberate: the same scan works on a batch that just finished, on last
-month's outputs, and after handwriting objects were re-run with GLMOCR —
+month's outputs, and on trees touched by external editors —
 one implementation, identical numbers everywhere.
 
 Page classification:
@@ -19,7 +19,7 @@ Page classification:
   proofreading. Sorts first in the review queue.
 * ``scored``   — has words carrying ``WC`` (a Tesseract page). Ranked by
   ``PC`` ascending; this is the main correction queue.
-* ``unscored`` — has words but no ``WC`` (a GLMOCR page; glm-ocr emits no
+* ``unscored`` — has words but no ``WC`` (legacy GLMOCR output or an external editor; no
   confidences). Needs full proofreading — there is no signal to narrow it.
 * ``empty``    — a well-formed page with zero words (blank page). Nothing
   to correct; sorts last.
@@ -261,7 +261,7 @@ def scan_output_root(
     contract, or ``<root>/ALTO/`` when pointed directly at one object.
 
     Returns objects sorted worst-first: lowest mean WC first, objects with
-    no confidence data (all-GLMOCR / all-empty) after the scored ones.
+    no confidence data (all-unscored / all-empty) after the scored ones.
     """
     objects = []
     for obj_dir in iter_object_dirs(output_root):
@@ -280,7 +280,7 @@ def scan_output_root(
 def worst_pages(objects: list[ObjectConfidence]) -> list[tuple[str, PageConfidence]]:
     """Flatten to ``(ref_id, page)`` in review-queue order: failure stubs
     first (no transcript at all), then scored pages by PC ascending, then
-    unscored (GLMOCR — full proofread), then empty pages last."""
+    unscored (no WC — full proofread), then empty pages last."""
     rows = [(o.ref_id, p) for o in objects for p in o.pages]
     rows.sort(key=lambda rp: (
         STATUS_RANK.get(rp[1].status, 9),

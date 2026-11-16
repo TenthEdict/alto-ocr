@@ -29,7 +29,7 @@ import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 from PIL import Image  # noqa: E402
 
-from src.alto_ocr.ocr import GLMOCREngine, TesseractEngine  # noqa: E402
+from src.alto_ocr.ocr import TesseractEngine  # noqa: E402
 from src.alto_ocr.preprocess import PreprocessConfig, preprocess  # noqa: E402
 
 
@@ -51,14 +51,6 @@ class AdjustPreprocessTests(unittest.TestCase):
         self.assertFalse(cfg.do_binarize)
         self.assertFalse(cfg.do_clahe)
         self.assertTrue(cfg.do_denoise, "untouched stages keep their setting")
-
-    def test_both_engines_agree_on_frame_policy(self) -> None:
-        # Drift guard: any engine that emits ALTO geometry must keep the
-        # frame identical to the original image (uniform upscale excepted).
-        for engine in (_tesseract_engine(), GLMOCREngine()):
-            cfg = engine.adjust_preprocess(PreprocessConfig())
-            self.assertFalse(cfg.do_deskew, engine.name)
-            self.assertFalse(cfg.do_border_crop, engine.name)
 
 
 class FramePreservationTests(unittest.TestCase):

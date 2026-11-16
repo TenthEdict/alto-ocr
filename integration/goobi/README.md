@@ -275,7 +275,6 @@ Tuning knobs, all read from the environment (set them in
 | variable | default | |
 |---|---|---|
 | `ALTO_OCR_APP_DIR` | `/home/schipp0/alto-ocr` | where the app + venv live |
-| `ALTO_OCR_ENGINE` | `tesseract` | `glmocr` for handwriting (needs Ollama) |
 | `ALTO_OCR_LANG` | `eng` | Tesseract language code |
 | `ALTO_OCR_LOG_DIR` | `/opt/digiverso/logs` | per-process logs + summary JSON |
 | `ALTO_OCR_EXTRA_ARGS` | — | e.g. `--psm 4 --binarize`, or `--no-mets` |

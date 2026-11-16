@@ -1,7 +1,7 @@
 """Run-configuration dataclasses, kept dependency-free (stdlib only).
 
 The GUI needs these defaults to build its window, but their historic homes
-(``preprocess``, ``ocr``, ``glmocr``) import OpenCV and numpy at module
+(``preprocess``, ``ocr``) import OpenCV and numpy at module
 level: ~190 MB of native libraries that made the window wait for them on
 every launch, though the Review tab never touches them and the Run tab only
 does once a run starts. Living here, they load in milliseconds; the old
@@ -64,19 +64,3 @@ class OCROptions:
     # with nothing for per-page isolation to catch; on timeout the page
     # gets a failure stub and the run moves on.
     timeout_s: int = 600
-
-
-DEFAULT_HOST = "http://localhost:11434"
-DEFAULT_MODEL = "glm-ocr:q8_0"
-DEFAULT_TIMEOUT_S = 120
-DEFAULT_MAX_EDGE_PX = 1024
-DEFAULT_NUM_PREDICT = 8192
-
-
-@dataclass(frozen=True)
-class GLMOCRConfig:
-    endpoint: str = DEFAULT_HOST
-    model: str = DEFAULT_MODEL
-    timeout_s: int = DEFAULT_TIMEOUT_S
-    max_edge_px: int = DEFAULT_MAX_EDGE_PX
-    num_predict: int = DEFAULT_NUM_PREDICT
