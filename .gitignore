@@ -22,6 +22,8 @@ temp-ocr*/
 output/*
 !output/.gitkeep
 ocr-output-local/
+# Goobi mass-import files made by integration/goobi/tracking_to_goobi.py
+goobi_import/
 
 # Editor / OS junk
 .vscode/

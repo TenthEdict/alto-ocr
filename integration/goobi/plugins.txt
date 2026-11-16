@@ -37,6 +37,9 @@ required   goobi-plugin-step-file-upload    *file*upload*          intranda_step
 required   goobi-plugin-step-imageqa        *imageqa*              intranda_step_imageQA        plugin_intranda_step_imageQA.xml
 # plugin-step-delay-base.jar
 required   goobi-plugin-step-delay          *delay*                intranda_delay_30_days       -
+# Stage 0, process creation from tracking sheets: tracking_to_goobi.py makes
+# the upload, config/plugin_intranda_import_excel.xml maps it. Import plugin:
+# the -base.jar goes in plugins/import/. Promote to required once installed.
 planned    goobi-plugin-import-excel        *import*excel*         intranda_import_excel        plugin_intranda_import_excel.xml
 stock      goobi-plugin-dashboard-extended  *dashboard-extended*   intranda_dashboard_extended  -
 stock      goobi-plugin-statistics-intranda *statistics-intranda*  -                            -

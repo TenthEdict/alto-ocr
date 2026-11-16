@@ -1,0 +1,2 @@
+# Goobi kit helpers (tracking_to_goobi.py). Not needed by the OCR pipeline.
+openpyxl>=3.1

@@ -144,6 +144,48 @@ as a reference for what Goobi does, and a shallow clone at the pinned tag
 answers that without vendoring a few thousand files that would drift from
 upstream.
 
+## Creating processes from a tracking sheet
+
+Processes are mass-created from the digitization tracking spreadsheets
+with Goobi's Excel import plugin (`goobi-plugin-import-excel`, see
+`plugins.txt`). The tracking sheets cannot be uploaded as they are: their
+Ref ID column has no collection prefix, their headers vary from sheet to
+sheet, and the plugin turns *any* non-empty row, a totals row included,
+into a process. `tracking_to_goobi.py` converts them:
+
+```sh
+pip install -r integration/goobi/requirements.txt     # openpyxl
+python integration/goobi/tracking_to_goobi.py --collection MSA00005 \
+    msa5-box_103-105_digitization_tracking.xlsx \
+    msa5-box_106-108_digitization_tracking.xlsx \
+    -o goobi_import/MSA00005_goobi_import.xlsx
+```
+
+- **Process title** is `<collection>_<RefID>`, the name `import_images.sh`
+  and the OCR step key on. The collection is given per run, never guessed
+  from a file name.
+- **Skipped, and listed:** Ref IDs that already have a process on this host
+  (read from the metadata tree), rows with a *Date Digitized* (already past
+  Capture; `--include-started` keeps them), repeated Ref IDs, rows without
+  a Title or a folder-safe Ref ID, rows without a Ref ID at all.
+- **Flagged, not skipped:** a Ref ID shaped unlike the rest of its sheet,
+  e.g. `16354` among 32-character hashes. Check it before importing.
+- `--dry-run` prints the report and writes nothing.
+
+Then in Goobi: **Processes → Mass import**, pick the collection's
+production template, *Upload file*, plugin `intranda_import_excel`, upload.
+`config/plugin_intranda_import_excel.xml` (installed by `install.sh
+--config`) maps the columns: Title to `TitleDocMain`, the title to
+`CatalogIDDigital`, the Ref ID to `CatalogIDSource`, and Box, Folder,
+Series, Subseries, SubGroup, TN, Notes and Collection to process
+properties. Import runs as a GoobiScript; existing processes are never
+replaced.
+
+**Project = template.** The plugin has no per-row project: every process
+lands in the project of the template picked for the import. For a project
+per collection, give each project its own copy of the template and import
+each collection's sheet against its own template.
+
 ## Task configuration in Goobi
 
 Workflow → Process templates → edit the template → the OCR task:

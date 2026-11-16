@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Excel mass import (goobi-plugin-import-excel) for files made by
+    integration/goobi/tracking_to_goobi.py. Install to
+    /opt/digiverso/goobi/config/ (install.sh with the config option does it).
+
+    Use: Processes > Mass import, pick the collection's production template,
+    tab "Upload file", plugin intranda_import_excel, upload the .xlsx.
+
+    The PROJECT of every process created is the project of the template
+    picked on that screen; the plugin has no per-row project. One project
+    per collection means one template copy per project and one import per
+    collection, which is what one tracking sheet is anyway.
+
+    Column names here must match tracking_to_goobi.FIELDS. The plugin reads
+    only the first worksheet.
+-->
+<config_plugin>
+    <config>
+        <!-- Any production template. A block whose <template> is a
+             template's exact title would win over this one for that template. -->
+        <template>*</template>
+
+        <!-- Matches the existing processes on this host (Monograph,
+             DefaultCollection) and the stock ruleset. -->
+        <publicationType>Monograph</publicationType>
+        <anchorPublicationType></anchorPublicationType>
+        <collection>DefaultCollection</collection>
+
+        <!-- No catalogue: everything comes from the sheet. -->
+        <useOpac>false</useOpac>
+
+        <rowHeader>1</rowHeader>
+        <rowDataStart>2</rowDataStart>
+        <rowDataEnd>20000</rowDataEnd>
+        <identifierHeaderName>RefID</identifierHeaderName>
+
+        <!-- The process title is <collection>_<RefID>, composed by the
+             converter. It must be exactly that: import_images.sh finds the
+             staged images as 04_ImportImages/<title>/ and the OCR step names
+             its outputs after it. -->
+        <processTitleRule>ProcessTitle</processTitleRule>
+
+        <metadatasplitallowed>false</metadatasplitallowed>
+        <runAsGoobiScript>true</runAsGoobiScript>
+        <!-- Never overwrite: a re-imported sheet must not reset a process
+             that is part-way through the workflow. -->
+        <replaceExistingProcesses>false</replaceExistingProcesses>
+
+        <!-- Identifiers, as the existing processes carry them: the full
+             title in CatalogIDDigital, the bare archival Ref ID in
+             CatalogIDSource.
+
+             The property= names copy a value into a process property as
+             well. The "Create new process" form does that by itself for
+             every goobi_projects.xml field marked property="true" (Title,
+             Identifier digital (a), ...); mass import bypasses the form, so
+             without these the Properties box of an imported process shows
+             no Title even though TitleDocMain is set. -->
+        <metadata ugh="CatalogIDDigital" headerName="ProcessTitle" property="Identifier digital (a)"
+                  required="true"
+                  requiredErrorMessage="ProcessTitle is empty; regenerate the file with tracking_to_goobi.py" />
+        <metadata ugh="CatalogIDSource" headerName="RefID" property="Ref ID" required="true"
+                  requiredErrorMessage="RefID is empty" />
+        <metadata ugh="TitleDocMain" headerName="Title" property="Title" required="true"
+                  requiredErrorMessage="Title is empty" />
+        <metadata ugh="Note" headerName="Notes" property="Notes" />
+
+        <!-- Shown on the task screen as process properties (searchable in
+             the process list); no ruleset field fits them. -->
+        <metadata headerName="Collection" property="Collection" />
+        <metadata headerName="Box" property="Box" />
+        <metadata headerName="Folder" property="Folder" />
+        <metadata headerName="Series" property="Series" />
+        <metadata headerName="Subseries" property="Subseries" />
+        <metadata headerName="SubGroup" property="SubGroup" />
+        <metadata headerName="TN" property="TN" />
+    </config>
+</config_plugin>
