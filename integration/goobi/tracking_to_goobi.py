@@ -47,10 +47,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 
+# A column only this script writes, required by the plugin config. Uploading
+# a raw tracking sheet then fails with Goobi's own "column '<name>' ... does
+# not exist in the Excel file" -- which, with this name, says what to do.
+MARKER = "Made by tracking_to_goobi.py"
+
 # Output columns, in order, and the tracking-sheet headers each one accepts.
 # Header matching ignores case, spacing and punctuation, so "Ref ID", "RefID"
-# and "Ref-ID" are the same header. ProcessTitle and Collection are made
-# here, never read. Keep the output names in step with
+# and "Ref-ID" are the same header. ProcessTitle, Collection and MARKER
+# are made here, never read. Keep the output names in step with
 # config/plugin_intranda_import_excel.xml.
 FIELDS: dict[str, tuple[str, ...]] = {
     "ProcessTitle": (),
@@ -64,6 +69,7 @@ FIELDS: dict[str, tuple[str, ...]] = {
     "SubGroup": ("SubGroup", "Sub Group"),
     "TN": ("TN",),
     "Notes": ("Notes", "Archivist's Notes", "Notes to Digital Programs (pre-imaging)"),
+    MARKER: (),
 }
 # A row with a value here has been through capture: Goobi's Capture task
 # would be a step behind the work.
@@ -194,6 +200,7 @@ def read_sheet(path: Path, sheet: Optional[str], collection: str, report: Report
             values["RefID"] = ref_id
             values["Collection"] = collection
             values["ProcessTitle"] = f"{collection}_{ref_id}"
+            values[MARKER] = "yes"
             started = any(i < len(raw) and cell_text(raw[i]) for i in started_cols)
             report.rows.append(Row(path.name, number, values, started))
     finally:
@@ -317,7 +324,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--collection", required=True,
                     help="collection prefix for the process titles, e.g. MSA00005")
     ap.add_argument("-o", "--output", type=Path,
-                    help="import file to write (default: <collection>_goobi_import.xlsx here)")
+                    help="import file to write (default: <collection>_goobi_import.xlsx next to "
+                         "the first sheet, where Windows Explorer already has it open)")
     ap.add_argument("--sheet", default=DEFAULT_SHEET,
                     help=f"worksheet to read (default {DEFAULT_SHEET}, else the first sheet)")
     ap.add_argument("--include-started", action="store_true",
@@ -349,7 +357,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 1
 
     kept = select(report, existing_titles(args.goobi_metadata_root), args.include_started)
-    out = None if args.dry_run else (args.output or Path(f"{args.collection}_goobi_import.xlsx"))
+    out = None if args.dry_run else (args.output or args.sheets[0].parent / f"{args.collection}_goobi_import.xlsx")
     if kept and out is not None:
         write_import(kept, out)
     print_report(report, kept, out)

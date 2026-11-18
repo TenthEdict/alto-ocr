@@ -172,6 +172,14 @@ python integration/goobi/tracking_to_goobi.py --collection MSA00005 \
   e.g. `16354` among 32-character hashes. Check it before importing.
 - `--dry-run` prints the report and writes nothing.
 
+**Upload the converter's output, never the tracking sheet itself.** A
+raw sheet is refused with *"The column 'Made by tracking_to_goobi.py' is
+defined as a required field … but it does not exist in the Excel file"*:
+that column is written only by the converter, so its name is the
+instruction. Without `-o`, the output lands next to the first input sheet as
+`<collection>_goobi_import.xlsx`, so a sheet converted from
+`/mnt/c/Users/<you>/Downloads` is beside it in Windows Explorer.
+
 Then in Goobi: **Processes → Mass import**, pick the collection's
 production template, *Upload file*, plugin `intranda_import_excel`, upload.
 `config/plugin_intranda_import_excel.xml` (installed by `install.sh
