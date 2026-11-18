@@ -47,6 +47,14 @@
              that is part-way through the workflow. -->
         <replaceExistingProcesses>false</replaceExistingProcesses>
 
+        <!-- First, so it is the first error a raw tracking sheet produces:
+             "The column 'Made by tracking_to_goobi.py' is defined as a
+             required field in the configuration, but it does not exist in
+             the Excel file." Goobi's header-missing message cannot be
+             customized, so the column name carries the instruction. -->
+        <metadata headerName="Made by tracking_to_goobi.py" required="true"
+                  requiredErrorMessage="not a converted file; run tracking_to_goobi.py on the tracking sheet and upload its output" />
+
         <!-- Identifiers, as the existing processes carry them: the full
              title in CatalogIDDigital, the bare archival Ref ID in
              CatalogIDSource.

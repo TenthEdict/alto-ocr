@@ -96,6 +96,7 @@ class TrackingToGoobiTests(unittest.TestCase):
         self.assertEqual(rows[1]["Box"], "108")  # 108.0 loses its ".0"
         self.assertEqual(rows[1]["Notes"], "bound")
         self.assertEqual(rows[1]["Collection"], "MSA00005")
+        self.assertEqual({r[t2g.MARKER] for r in rows}, {"yes"})
         self.assertIn("Folder", log)  # sheet b lacks it: reported, left blank
 
     def test_every_cell_is_text_even_formula_lookalikes(self):
@@ -153,6 +154,14 @@ class TrackingToGoobiTests(unittest.TestCase):
         self.assertIn("16354", log.split("CHECK")[1])
         self.assertEqual(len(self.read_out(out)[1]), 4)
 
+    def test_default_output_sits_next_to_the_first_sheet(self):
+        sub = self.tmp / "Downloads"
+        sub.mkdir()
+        a = _sheet(sub / "a.xlsx", ["Ref ID", "Title"], [[HASH_A, "x"]])
+        code, log = self.run_main(a, "--collection", "MSA00005")
+        self.assertEqual(code, 0, log)
+        self.assertTrue((sub / "MSA00005_goobi_import.xlsx").is_file())
+
     def test_named_sheet_preferred_over_first(self):
         a = _sheet(self.tmp / "a.xlsx", ["Ref ID", "Title"], [[HASH_A, "x"]], extra_first="Notes")
         out = self.tmp / "out.xlsx"
@@ -183,6 +192,16 @@ class PluginConfigTests(unittest.TestCase):
         self.assertEqual(tree.findtext(".//processTitleRule"), "ProcessTitle")
         self.assertEqual(tree.findtext(".//useOpac"), "false")
         self.assertEqual(tree.findtext(".//replaceExistingProcesses"), "false")
+
+    def test_raw_tracking_sheet_fails_on_the_marker_first(self):
+        # Goobi's missing-column message can't be customized, so the first
+        # required column's *name* has to tell the user to run the converter.
+        tree = etree.parse(str(KIT / "config" / "plugin_intranda_import_excel.xml"))
+        first = tree.xpath("//metadata")[0]
+        self.assertEqual(first.get("headerName"), t2g.MARKER)
+        self.assertEqual(first.get("required"), "true")
+        self.assertIsNone(first.get("ugh"))
+        self.assertIsNone(first.get("property"))
 
     def test_title_also_lands_as_property(self):
         # Mass import skips the creation form, which is what normally copies
