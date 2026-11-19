@@ -28,6 +28,7 @@ with a `merge:` commit):
 | version | what |
 |---|---|
 | 0.11.0 | GLMOCR engine removed; Tesseract is the only engine (`--engine` kept hidden for old scripts) |
+| 1.0.0 | Final release from the original maintainer. Embedded thumbnail frames in TIFs (e.g. Capture One previews) no longer trigger the multi-frame warning; it fires only for frames that look like pages |
 | kit | Goobi provisioning kit: config overlay, idempotent installer, drift check (no version bump; not app code) |
 | 0.10.4 | Review usability fixes: shortcuts no longer die on focus changes, multi-word select + delete, reading-order drag-and-drop, Tk right-click menu, browser editor bar no longer resizes the scan |
 | 0.10.3 | Reading-order path legible on the scan; edit a word without leaving reading-order mode |

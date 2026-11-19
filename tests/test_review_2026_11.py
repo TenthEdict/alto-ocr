@@ -153,6 +153,16 @@ class MultiFrameTifTests(_TmpCase):
         self.assertIn("minutes.tif holds 3 frames", logs.output[0])
         self.assertIn("other 2", logs.output[0])
 
+    def test_thumbnail_frame_is_quiet(self) -> None:
+        # Capture One embeds a reduced-size preview as frame 2.
+        tif = self.root / "scan.tif"
+        page = Image.new("L", (400, 600), 255)
+        page.save(tif, save_all=True,
+                  append_images=[Image.new("L", (40, 60), 255)], dpi=(300, 300))
+        with self.assertNoLogs(preprocess.logger, level="WARNING"):
+            img = preprocess.preprocess(tif, _PLAIN).image
+        self.assertEqual(img.shape, (600, 400))
+
     def test_single_frame_is_quiet(self) -> None:
         tif = self.root / "p1.tif"
         Image.new("L", (40, 60), 255).save(tif, dpi=(300, 300))

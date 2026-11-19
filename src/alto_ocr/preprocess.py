@@ -86,6 +86,28 @@ def _read_dpi(path: Path) -> int | None:
     return None
 
 
+def _extra_page_frames(img: Image.Image) -> int:
+    """Count frames after the first that look like real pages.
+
+    A frame is a thumbnail, not a page, when its TIFF NewSubfileType marks
+    it reduced-resolution (bit 0) or it is at most half the first frame's
+    size in both dimensions. Reads frame headers only, no pixel decode.
+    """
+    base_w, base_h = img.size
+    pages = 0
+    try:
+        for i in range(1, img.n_frames):
+            img.seek(i)
+            subfile = getattr(img, "tag_v2", {}).get(254, 0) or 0
+            w, h = img.size
+            if subfile & 1 or (w * 2 <= base_w and h * 2 <= base_h):
+                continue
+            pages += 1
+    finally:
+        img.seek(0)
+    return pages
+
+
 def _load_grayscale(path: Path) -> np.ndarray:
     """Load any TIF/JPEG flavor as 8-bit grayscale, honoring orientation.
 
@@ -105,14 +127,22 @@ def _load_grayscale(path: Path) -> np.ndarray:
         if n_frames > 1:
             # Multi-page TIF — the first frame is the page. One file is one
             # page everywhere else (discovery's page count, the output stems,
-            # the review UIs), so the rest are not OCR'd; say so, loudly,
-            # rather than let pages vanish from the transcript unremarked.
-            logger.warning(
-                "%s holds %d frames; only the first is OCR'd, the other %d "
-                "get no ALTO or transcript. If they are pages (not embedded "
-                "thumbnails), split the file into one TIF per page and re-run.",
-                path.name, n_frames, n_frames - 1,
-            )
+            # the review UIs), so the rest are not OCR'd. Capture One and
+            # other scanner software routinely embed a preview thumbnail as
+            # a second frame; those are skipped quietly. Only extra frames
+            # that look like pages are reported, so real pages never vanish
+            # from the transcript unremarked.
+            pages = _extra_page_frames(img)
+            if pages:
+                logger.warning(
+                    "%s holds %d frames; only the first is OCR'd, the other "
+                    "%d look like pages and get no ALTO or transcript. Split "
+                    "the file into one TIF per page and re-run.",
+                    path.name, n_frames, pages,
+                )
+            else:
+                logger.debug("%s: %d thumbnail frame(s) ignored",
+                             path.name, n_frames - 1)
             img.seek(0)
         # Honor EXIF/TIFF orientation before any pixel processing, so detected
         # line boxes and ALTO coordinates land on the upright page.
